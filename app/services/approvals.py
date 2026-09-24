@@ -1,0 +1,272 @@
+"""Generic approval engine: one engine, not one per module.
+
+Sensitive changes are either applied directly (Super Admin) or serialised into an
+approval_requests row with the business table left untouched. On approval, a handler
+registry (one function per request_type) replays the change with the approver's
+authority and writes the audit row in the same transaction.
+
+Approvals re-validate on apply: if the underlying record has moved since the request
+was created, the handler marks the request 'stale' instead of silently applying an
+outdated value.
+"""
+
+import uuid
+from collections.abc import Awaitable, Callable
+from datetime import datetime, timezone
+
+from fastapi import HTTPException, status
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.api.deps import CurrentUser
+from app.models.models import ApprovalRequest, Product
+from app.services.audit import write_audit
+
+HandlerFn = Callable[[AsyncSession, ApprovalRequest], Awaitable[None]]
+_HANDLERS: dict[str, HandlerFn] = {}
+
+
+def register_handler(request_type: str):
+    def wrapper(fn: HandlerFn) -> HandlerFn:
+        _HANDLERS[request_type] = fn
+        return fn
+
+    return wrapper
+
+
+async def submit_or_apply(
+    db: AsyncSession,
+    *,
+    current: CurrentUser,
+    request_type: str,
+    entity_type: str,
+    entity_id: uuid.UUID | None,
+    old_value: dict | None,
+    new_value: dict,
+    reason: str | None,
+    store_id: uuid.UUID | None,
+) -> ApprovalRequest:
+    request = ApprovalRequest(
+        request_type=request_type,
+        entity_type=entity_type,
+        entity_id=entity_id,
+        old_value=old_value,
+        new_value=new_value,
+        reason=reason,
+        requested_by=current.user_id,
+        store_id=store_id,
+        status="pending",
+    )
+    db.add(request)
+    await db.flush()
+
+    if current.role_code == "super_admin":
+        await _apply(db, request, approver_id=current.user_id)
+    else:
+        await write_audit(
+            db,
+            user_id=current.user_id,
+            role_code=current.role_code,
+            store_id=store_id,
+            device_id=current.device_id,
+            action=f"{request_type}.requested",
+            entity_type=entity_type,
+            entity_id=entity_id,
+            new_value=new_value,
+            approval_id=request.id,
+        )
+    return request
+
+
+async def decide(
+    db: AsyncSession, *, request_id: uuid.UUID, approver: CurrentUser, approve: bool, note: str | None
+) -> ApprovalRequest:
+    request = await db.get(ApprovalRequest, request_id)
+    if request is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Approval request not found")
+    if request.status != "pending":
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Request already decided")
+
+    request.reviewed_by = approver.user_id
+    request.review_note = note
+    request.reviewed_at = datetime.now(timezone.utc)
+
+    if approve:
+        await _apply(db, request, approver_id=approver.user_id)
+    else:
+        request.status = "rejected"
+        await write_audit(
+            db,
+            user_id=approver.user_id,
+            role_code=approver.role_code,
+            store_id=request.store_id,
+            device_id=None,
+            action=f"{request.request_type}.rejected",
+            entity_type=request.entity_type,
+            entity_id=request.entity_id,
+            approval_id=request.id,
+        )
+    return request
+
+
+async def _apply(db: AsyncSession, request: ApprovalRequest, *, approver_id: uuid.UUID) -> None:
+    handler = _HANDLERS.get(request.request_type)
+    if handler is None:
+        raise HTTPException(status_code=500, detail=f"No handler registered for {request.request_type}")
+    await handler(db, request)
+    if request.status == "pending":
+        request.status = "approved"
+    await write_audit(
+        db,
+        user_id=approver_id,
+        role_code=None,
+        store_id=request.store_id,
+        device_id=None,
+        action=f"{request.request_type}.applied",
+        entity_type=request.entity_type,
+        entity_id=request.entity_id,
+        old_value=request.old_value,
+        new_value=request.new_value,
+        approval_id=request.id,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Handlers
+# ---------------------------------------------------------------------------
+
+
+@register_handler("price_change")
+async def _handle_price_change(db: AsyncSession, request: ApprovalRequest) -> None:
+    product = await db.get(Product, request.entity_id)
+    if product is None:
+        request.status = "stale"
+        return
+    expected_price = request.old_value.get("selling_price") if request.old_value else None
+    if expected_price is not None and float(product.selling_price) != float(expected_price):
+        request.status = "stale"
+        return
+    if "selling_price" in request.new_value:
+        product.selling_price = request.new_value["selling_price"]
+    if "mrp" in request.new_value:
+        product.mrp = request.new_value["mrp"]
+    product.revision = product.revision + 1 if product.revision else 1
+
+
+@register_handler("product_deactivation")
+async def _handle_product_deactivation(db: AsyncSession, request: ApprovalRequest) -> None:
+    product = await db.get(Product, request.entity_id)
+    if product is None:
+        request.status = "stale"
+        return
+    product.is_active = False
+
+
+@register_handler("high_discount")
+async def _handle_high_discount_noop(db: AsyncSession, request: ApprovalRequest) -> None:
+    """High discounts on live bills use a manager-override PIN at the counter (no
+    approval round-trip — the customer is standing there). This handler exists for
+    the case where a discount RULE itself (not a single sale) is being approved."""
+    from app.models.models import DiscountRule
+
+    rule_id = request.entity_id
+    if rule_id is None:
+        return
+    rule = await db.get(DiscountRule, rule_id)
+    if rule is None:
+        request.status = "stale"
+        return
+    for field in ("percent", "flat_amount", "active"):
+        if field in request.new_value:
+            setattr(rule, field, request.new_value[field])
+    rule.revision = rule.revision + 1 if rule.revision else 1
+
+
+@register_handler("loyalty_rule_change")
+async def _handle_loyalty_rule_change(db: AsyncSession, request: ApprovalRequest) -> None:
+    from app.models.models import LoyaltyConfig
+
+    config = await db.get(LoyaltyConfig, True)
+    for field in ("earn_rate", "redeem_value", "min_balance_to_redeem", "max_redeem_share"):
+        if field in request.new_value:
+            setattr(config, field, request.new_value[field])
+
+
+@register_handler("high_stock_adjustment")
+async def _handle_high_stock_adjustment(db: AsyncSession, request: ApprovalRequest) -> None:
+    from app.services.inventory import apply_movement
+
+    payload = request.new_value
+    await apply_movement(
+        db,
+        product_id=uuid.UUID(payload["product_id"]),
+        store_id=uuid.UUID(payload["store_id"]),
+        delta=payload["delta"],
+        reason_code="adjustment",
+        source_type="approval",
+        source_id=request.id,
+        created_by=request.requested_by,
+        device_id=None,
+    )
+
+
+@register_handler("user_permission_change")
+async def _handle_user_permission_change(db: AsyncSession, request: ApprovalRequest) -> None:
+    from app.models.models import Role, User
+
+    user = await db.get(User, request.entity_id)
+    if user is None:
+        request.status = "stale"
+        return
+    if "role_code" in request.new_value:
+        result = await db.execute(select(Role).where(Role.code == request.new_value["role_code"]))
+        role = result.scalar_one_or_none()
+        if role is None:
+            raise HTTPException(status_code=400, detail="Unknown role_code")
+        user.role_id = role.id
+
+
+@register_handler("config_change")
+async def _handle_config_change_noop(db: AsyncSession, request: ApprovalRequest) -> None:
+    """Generic configuration changes are recorded via audit only in Phase 1;
+    specific config tables get their own handler as they're introduced."""
+    return
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 handlers
+# ---------------------------------------------------------------------------
+
+
+@register_handler("return_approval")
+async def _handle_return_approval(db: AsyncSession, request: ApprovalRequest) -> None:
+    from app.models.models_phase2 import Return
+    from app.services.returns import finalize_return
+
+    ret = await db.get(Return, request.entity_id)
+    if ret is None or ret.status != "pending":
+        request.status = "stale"
+        return
+    await finalize_return(db, ret)
+
+
+@register_handler("purchase_order_approval")
+async def _handle_purchase_order_approval(db: AsyncSession, request: ApprovalRequest) -> None:
+    from app.models.models_phase2 import PurchaseOrder
+
+    po = await db.get(PurchaseOrder, request.entity_id)
+    if po is None or po.status != "pending_approval":
+        request.status = "stale"
+        return
+    po.status = "approved"
+
+
+@register_handler("expense_approval")
+async def _handle_expense_approval(db: AsyncSession, request: ApprovalRequest) -> None:
+    from app.models.models_phase2 import Expense
+
+    expense = await db.get(Expense, request.entity_id)
+    if expense is None or expense.status != "pending":
+        request.status = "stale"
+        return
+    expense.status = "approved"

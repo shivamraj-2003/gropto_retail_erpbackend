@@ -1,0 +1,231 @@
+"""Sync push: applies a batch of offline-created sales idempotently, returning one
+verdict per item so a single bad row never blocks the rows behind it. Safe under
+replay because of three layers of dedup: unique client_idempotency_key on sales,
+device-generated primary keys, and unique bill numbers per store+device.
+"""
+
+
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.models.models import Customer, Device, Payment, Role, Sale, SaleItem, SyncFailure, User
+from app.schemas.schemas import SaleIn, SyncItemVerdict
+from app.services.audit import write_audit
+from app.services.inventory import DuplicateMovement, apply_movement, get_balance as get_stock_balance
+from app.services.loyalty import DuplicateLedgerEntry, apply_ledger_entry, get_balance, get_config
+
+
+async def _get_or_create_customer(db: AsyncSession, phone: str | None) -> Customer | None:
+    if not phone:
+        return None
+    result = await db.execute(select(Customer).where(Customer.phone == phone))
+    customer = result.scalar_one_or_none()
+    if customer is None:
+        customer = Customer(phone=phone)
+        db.add(customer)
+        await db.flush()
+    return customer
+
+
+async def process_sale(db: AsyncSession, sale_in: SaleIn) -> SyncItemVerdict:
+    existing = await db.get(Sale, sale_in.id)
+    if existing is not None:
+        return SyncItemVerdict(client_id=sale_in.id, verdict="duplicate", server_id=existing.id)
+
+    existing_by_key = (
+        await db.execute(select(Sale).where(Sale.client_idempotency_key == sale_in.client_idempotency_key))
+    ).scalar_one_or_none()
+    if existing_by_key is not None:
+        return SyncItemVerdict(client_id=sale_in.id, verdict="duplicate", server_id=existing_by_key.id)
+
+    savepoint = await db.begin_nested()
+    try:
+        cashier = await db.get(User, sale_in.cashier_id)
+        if cashier is None:
+            raise ValueError("Unknown cashier")
+        role = await db.get(Role, cashier.role_id)
+        device = await db.get(Device, sale_in.device_id)
+        if device is None or device.status != "active":
+            raise ValueError("Device not active")
+
+        subtotal = sum(item.quantity * item.unit_price for item in sale_in.items)
+        line_discounts = sum(item.line_discount for item in sale_in.items)
+        discount_total = sale_in.discount_total + line_discounts
+        tax_total = sum(
+            (item.quantity * item.unit_price - item.line_discount) * (item.tax_rate_snapshot / 100)
+            for item in sale_in.items
+        )
+        grand_total = subtotal - discount_total + tax_total
+
+        # Role-based discount limit; above it requires a manager override PIN, stamped
+        # on the sale immediately rather than a pending-approval round trip, because
+        # the customer is standing at the till.
+        max_allowed = max(float(role.max_discount_value), subtotal * float(role.max_discount_percent) / 100)
+        if discount_total > max_allowed and sale_in.override_user_id is None:
+            await savepoint.rollback()
+            return SyncItemVerdict(
+                client_id=sale_in.id,
+                verdict="rejected",
+                error="Discount exceeds role limit; manager override required",
+            )
+        override_user_id = None
+        override_reason = None
+        if discount_total > max_allowed:
+            overrider = await db.get(User, sale_in.override_user_id)
+            if overrider is None:
+                await savepoint.rollback()
+                return SyncItemVerdict(client_id=sale_in.id, verdict="rejected", error="Unknown override user")
+            overrider_role = await db.get(Role, overrider.role_id)
+            if float(overrider_role.max_discount_value) < discount_total and float(
+                overrider_role.max_discount_percent
+            ) / 100 * subtotal < discount_total:
+                await savepoint.rollback()
+                return SyncItemVerdict(
+                    client_id=sale_in.id, verdict="rejected", error="Override user lacks sufficient discount authority"
+                )
+            override_user_id = overrider.id
+            override_reason = sale_in.override_reason
+
+        customer = await _get_or_create_customer(db, sale_in.customer_phone)
+
+        sale = Sale(
+            id=sale_in.id,
+            store_id=sale_in.store_id,
+            device_id=sale_in.device_id,
+            bill_number=sale_in.bill_number,
+            cashier_id=sale_in.cashier_id,
+            customer_id=customer.id if customer else None,
+            subtotal=subtotal,
+            discount_total=discount_total,
+            tax_total=tax_total,
+            grand_total=grand_total,
+            override_user_id=override_user_id,
+            override_reason=override_reason,
+            client_idempotency_key=sale_in.client_idempotency_key,
+            billed_at=sale_in.billed_at,
+        )
+        db.add(sale)
+        await db.flush()
+
+        for item in sale_in.items:
+            db.add(
+                SaleItem(
+                    sale_id=sale.id,
+                    product_id=item.product_id,
+                    product_name_snapshot=item.product_name_snapshot,
+                    tax_rate_snapshot=item.tax_rate_snapshot,
+                    quantity=item.quantity,
+                    unit_price=item.unit_price,
+                    line_discount=item.line_discount,
+                    line_total=item.quantity * item.unit_price - item.line_discount,
+                )
+            )
+            try:
+                await apply_movement(
+                    db,
+                    product_id=item.product_id,
+                    store_id=sale_in.store_id,
+                    delta=-item.quantity,
+                    reason_code="sale",
+                    source_type="sale_item",
+                    source_id=sale.id,
+                    created_by=sale_in.cashier_id,
+                    device_id=sale_in.device_id,
+                )
+                # A sale is a fact — the goods physically left the shop — so it always
+                # applies even if it drives stock negative; negative stock is flagged,
+                # never blocked, and surfaced for review.
+                resulting = await get_stock_balance(db, product_id=item.product_id, store_id=sale_in.store_id)
+                if resulting < 0:
+                    db.add(
+                        SyncFailure(
+                            device_id=sale_in.device_id,
+                            payload={
+                                "sale_id": str(sale.id),
+                                "product_id": str(item.product_id),
+                                "resulting_quantity": resulting,
+                            },
+                            error="negative_stock_flagged_for_review",
+                            resolved=False,
+                        )
+                    )
+            except DuplicateMovement:
+                pass  # already applied for this sale — safe to ignore under replay
+
+        for payment in sale_in.payments:
+            db.add(Payment(sale_id=sale.id, mode=payment.mode, amount=payment.amount, reference=payment.reference))
+
+        # Loyalty: earn on net billed value; redeem against the till's cached balance.
+        # Offline the cached balance may be stale — redemption still applies and a
+        # resulting negative balance is flagged for review rather than blocked at
+        # the counter (a rare write-off beats refusing a customer at checkout).
+        if customer:
+            config = await get_config(db)
+            earn_points = round(float(grand_total) * float(config.earn_rate), 2)
+            if earn_points > 0:
+                try:
+                    await apply_ledger_entry(
+                        db,
+                        customer_id=customer.id,
+                        delta_points=earn_points,
+                        reason="earn",
+                        source_type="sale",
+                        source_id=sale.id,
+                    )
+                    sale.loyalty_points_earned = earn_points
+                except DuplicateLedgerEntry:
+                    pass
+
+            if sale_in.loyalty_points_redeemed > 0:
+                try:
+                    await apply_ledger_entry(
+                        db,
+                        customer_id=customer.id,
+                        delta_points=-sale_in.loyalty_points_redeemed,
+                        reason="redeem",
+                        source_type="sale",
+                        source_id=sale.id,
+                    )
+                    sale.loyalty_points_redeemed = sale_in.loyalty_points_redeemed
+                    balance = await get_balance(db, customer_id=customer.id)
+                    if balance < 0:
+                        db.add(
+                            SyncFailure(
+                                device_id=sale_in.device_id,
+                                payload={"sale_id": str(sale.id), "customer_id": str(customer.id), "balance": balance},
+                                error="negative_loyalty_balance_flagged_for_review",
+                                resolved=False,
+                            )
+                        )
+                except DuplicateLedgerEntry:
+                    pass
+
+        await write_audit(
+            db,
+            user_id=sale_in.cashier_id,
+            role_code=role.code,
+            store_id=sale_in.store_id,
+            device_id=sale_in.device_id,
+            action="sale.created",
+            entity_type="sale",
+            entity_id=sale.id,
+            new_value={"grand_total": float(grand_total), "bill_number": sale_in.bill_number},
+            source="sync",
+        )
+
+        await savepoint.commit()
+        return SyncItemVerdict(client_id=sale_in.id, verdict="applied", server_id=sale.id)
+
+    except IntegrityError:
+        await savepoint.rollback()
+        # Most likely the unique (store_id, device_id, bill_number) constraint —
+        # two tills should never collide, so surface this as a conflict for review.
+        return SyncItemVerdict(client_id=sale_in.id, verdict="conflict", error="Duplicate or conflicting bill_number")
+    except ValueError as exc:
+        await savepoint.rollback()
+        return SyncItemVerdict(client_id=sale_in.id, verdict="rejected", error=str(exc))
+    except Exception as exc:  # noqa: BLE001 — quarantine, never let one bad row break the batch
+        await savepoint.rollback()
+        db.add(SyncFailure(device_id=sale_in.device_id, payload=sale_in.model_dump(mode="json"), error=str(exc)))
+        return SyncItemVerdict(client_id=sale_in.id, verdict="rejected", error="Internal error — quarantined")

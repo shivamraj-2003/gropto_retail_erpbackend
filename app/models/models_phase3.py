@@ -1,0 +1,138 @@
+"""Phase 3 — Enterprise & Omnichannel Expansion: OMS, CRM/customer intelligence,
+HR/workforce, enterprise scalability support tables. Additive to Phase 1 + Phase 2."""
+
+import uuid
+from datetime import date, datetime
+
+from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Numeric, String, Text, UniqueConstraint, func
+from sqlalchemy.dialects.postgresql import JSONB, UUID
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+
+from app.core.database import Base
+from app.models.models import uuid_pk
+
+# ---------------------------------------------------------------------------
+# Omnichannel OMS
+# ---------------------------------------------------------------------------
+
+
+class Order(Base):
+    __tablename__ = "orders"
+    id: Mapped[uuid.UUID] = uuid_pk()
+    channel: Mapped[str] = mapped_column(String, nullable=False)  # app, web, marketplace
+    customer_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("customers.id"))
+    allocated_store_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("stores.id"))
+    status: Mapped[str] = mapped_column(
+        String, default="placed"
+    )  # placed, reserved, allocated, picking, packed, dispatched, delivered, cancelled, refunded
+    subtotal: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False)
+    delivery_fee: Mapped[float] = mapped_column(Numeric(12, 2), default=0)
+    grand_total: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False)
+    delivery_address: Mapped[str | None] = mapped_column(Text)
+    rider_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"))
+    delivery_otp: Mapped[str | None] = mapped_column(String)
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    items: Mapped[list["OrderItem"]] = relationship(cascade="all, delete-orphan", lazy="selectin")
+
+
+class OrderItem(Base):
+    __tablename__ = "order_items"
+    id: Mapped[uuid.UUID] = uuid_pk()
+    order_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("orders.id", ondelete="CASCADE"))
+    product_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("products.id"), nullable=False)
+    quantity: Mapped[float] = mapped_column(Numeric(12, 3), nullable=False)
+    unit_price: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False)
+    substituted_product_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("products.id"))
+    picked_qty: Mapped[float | None] = mapped_column(Numeric(12, 3))
+
+
+# ---------------------------------------------------------------------------
+# CRM & customer intelligence
+# ---------------------------------------------------------------------------
+
+
+class CustomerEvent(Base):
+    """Feeds RFM/cohort views: one row per meaningful customer touchpoint."""
+
+    __tablename__ = "customer_events"
+    id: Mapped[uuid.UUID] = uuid_pk()
+    customer_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("customers.id"), nullable=False)
+    event_type: Mapped[str] = mapped_column(String, nullable=False)  # purchase, return, complaint, campaign_click
+    source_type: Mapped[str | None] = mapped_column(String)
+    source_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    value: Mapped[float | None] = mapped_column(Numeric(12, 2))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class CustomerConsent(Base):
+    __tablename__ = "customer_consent"
+    customer_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("customers.id"), primary_key=True)
+    whatsapp_opt_in: Mapped[bool] = mapped_column(Boolean, default=False)
+    sms_opt_in: Mapped[bool] = mapped_column(Boolean, default=False)
+    email_opt_in: Mapped[bool] = mapped_column(Boolean, default=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class Campaign(Base):
+    __tablename__ = "campaigns"
+    id: Mapped[uuid.UUID] = uuid_pk()
+    name: Mapped[str] = mapped_column(String, nullable=False)
+    channel: Mapped[str] = mapped_column(String, nullable=False)  # whatsapp, sms, push, email
+    segment_query: Mapped[dict] = mapped_column(JSONB, nullable=False)  # audience builder criteria
+    status: Mapped[str] = mapped_column(String, default="draft")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+# ---------------------------------------------------------------------------
+# HR & workforce
+# ---------------------------------------------------------------------------
+
+
+class Employee(Base):
+    __tablename__ = "employees"
+    id: Mapped[uuid.UUID] = uuid_pk()
+    user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"))
+    store_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("stores.id"), nullable=False)
+    designation: Mapped[str] = mapped_column(String, nullable=False)
+    reporting_manager_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("employees.id"))
+    joined_at: Mapped[date | None] = mapped_column(Date)
+    exited_at: Mapped[date | None] = mapped_column(Date)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+
+
+class Shift(Base):
+    __tablename__ = "shifts"
+    id: Mapped[uuid.UUID] = uuid_pk()
+    store_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("stores.id"), nullable=False)
+    name: Mapped[str] = mapped_column(String, nullable=False)
+    start_time: Mapped[str] = mapped_column(String, nullable=False)  # HH:MM
+    end_time: Mapped[str] = mapped_column(String, nullable=False)
+
+
+class Attendance(Base):
+    __tablename__ = "attendance"
+    id: Mapped[uuid.UUID] = uuid_pk()
+    employee_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("employees.id"), nullable=False)
+    shift_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("shifts.id"))
+    attendance_date: Mapped[date] = mapped_column(Date, nullable=False)
+    status: Mapped[str] = mapped_column(String, nullable=False)  # present, absent, late, leave, weekly_off
+    check_in: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    check_out: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (UniqueConstraint("employee_id", "attendance_date"),)
+
+
+# ---------------------------------------------------------------------------
+# Enterprise scalability & reliability
+# ---------------------------------------------------------------------------
+
+
+class DeviceConfig(Base):
+    """Centralized configuration pushed to every device."""
+
+    __tablename__ = "device_config"
+    device_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("devices.id"), primary_key=True)
+    config: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
