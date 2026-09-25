@@ -27,6 +27,17 @@ class RefreshRequest(BaseModel):
     device_fingerprint: str
 
 
+class StoreCredentialRow(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: uuid.UUID
+    email: str | None
+    phone: str | None
+    full_name: str
+    password_hash: str
+    role_code: str
+    is_active: bool
+
+
 # ---------------------------------------------------------------------------
 # Products
 # ---------------------------------------------------------------------------

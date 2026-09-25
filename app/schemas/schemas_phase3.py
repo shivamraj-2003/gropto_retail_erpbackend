@@ -26,10 +26,29 @@ class OrderOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: uuid.UUID
     channel: str
+    customer_id: uuid.UUID | None
     allocated_store_id: uuid.UUID | None
     status: str
     subtotal: float
     grand_total: float
+    delivery_address: str | None
+    rider_id: uuid.UUID | None
+    created_at: datetime
+
+
+class OrderItemOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: uuid.UUID
+    product_id: uuid.UUID
+    quantity: float
+    unit_price: float
+    substituted_product_id: uuid.UUID | None
+    picked_qty: float | None
+
+
+class OrderDetailOut(OrderOut):
+    items: list[OrderItemOut]
+    delivery_otp: str | None
 
 
 class OrderPickItem(BaseModel):
@@ -66,6 +85,16 @@ class CampaignCreate(BaseModel):
     segment_query: dict
 
 
+class CampaignOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: uuid.UUID
+    name: str
+    channel: str
+    segment_query: dict
+    status: str
+    created_at: datetime
+
+
 # ---------------------------------------------------------------------------
 # HR
 # ---------------------------------------------------------------------------
@@ -78,7 +107,26 @@ class EmployeeCreate(BaseModel):
     joined_at: date | None = None
 
 
+class EmployeeOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: uuid.UUID
+    user_id: uuid.UUID | None
+    store_id: uuid.UUID
+    designation: str
+    joined_at: date | None
+    is_active: bool
+
+
 class ShiftCreate(BaseModel):
+    store_id: uuid.UUID
+    name: str
+    start_time: str
+    end_time: str
+
+
+class ShiftOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: uuid.UUID
     store_id: uuid.UUID
     name: str
     start_time: str
@@ -92,3 +140,8 @@ class AttendanceMark(BaseModel):
     status: str
     check_in: datetime | None = None
     check_out: datetime | None = None
+
+
+class AttendanceOut(BaseModel):
+    date: date
+    status: str

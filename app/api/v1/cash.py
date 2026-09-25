@@ -1,6 +1,7 @@
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser, require_permission, require_store_access
@@ -10,6 +11,23 @@ from app.schemas.schemas_phase2 import CashMovementIn, DayCloseRequest, ShiftClo
 from app.services import cash as cash_service
 
 router = APIRouter(prefix="/cash", tags=["cash"])
+
+
+@router.get("/shifts/current")
+async def current_shift(
+    device_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    _current: CurrentUser = Depends(require_permission("sale.create")),
+) -> dict | None:
+    """The device needs to know its own open shift (if any) to record cash
+    movements/close without the cashier having to remember a shift id."""
+    result = await db.execute(
+        select(CashierShift).where(CashierShift.device_id == device_id, CashierShift.status == "open")
+    )
+    shift = result.scalar_one_or_none()
+    if shift is None:
+        return None
+    return {"shift_id": str(shift.id), "opening_float": float(shift.opening_float), "opened_at": shift.opened_at.isoformat()}
 
 
 @router.post("/shifts/open")

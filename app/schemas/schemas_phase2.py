@@ -69,6 +69,18 @@ class TransferOut(BaseModel):
     status: str
 
 
+class TransferItemOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: uuid.UUID
+    product_id: uuid.UUID
+    dispatched_qty: float
+    received_qty: float | None
+
+
+class TransferDetailOut(TransferOut):
+    items: list[TransferItemOut]
+
+
 # ---------------------------------------------------------------------------
 # Cash operations
 # ---------------------------------------------------------------------------
@@ -136,6 +148,75 @@ class GrnCreate(BaseModel):
     items: list[GrnItemIn]
 
 
+class RequisitionItemOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: uuid.UUID
+    product_id: uuid.UUID
+    quantity: float
+
+
+class RequisitionOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: uuid.UUID
+    store_id: uuid.UUID
+    status: str
+    created_at: datetime
+    items: list[RequisitionItemOut]
+
+
+class PurchaseOrderItemOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: uuid.UUID
+    product_id: uuid.UUID
+    quantity: float
+    unit_cost: float
+
+
+class PurchaseOrderOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: uuid.UUID
+    vendor_id: uuid.UUID
+    store_id: uuid.UUID | None
+    status: str
+    total_amount: float
+    created_at: datetime
+    items: list[PurchaseOrderItemOut]
+
+
+class RoleOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    code: str
+    name: str
+    max_discount_percent: float
+    max_discount_value: float
+
+
+class WarehouseOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: uuid.UUID
+    code: str
+    name: str
+    city: str | None
+
+
+class StoreOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: uuid.UUID
+    code: str
+    name: str
+    city: str | None
+    cluster: str | None
+
+
+class GrnOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: uuid.UUID
+    purchase_order_id: uuid.UUID | None
+    store_id: uuid.UUID | None
+    status: str
+    created_at: datetime
+
+
 # ---------------------------------------------------------------------------
 # Reorder points / finance / fraud
 # ---------------------------------------------------------------------------
@@ -153,6 +234,48 @@ class ExpenseCreate(BaseModel):
     category: str
     amount: float
     description: str | None = None
+
+
+class LoyaltyConfigOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    earn_rate: float
+    redeem_value: float
+    min_balance_to_redeem: float
+    max_redeem_share: float
+
+
+class LoyaltyConfigChange(BaseModel):
+    earn_rate: float | None = None
+    redeem_value: float | None = None
+    min_balance_to_redeem: float | None = None
+    max_redeem_share: float | None = None
+    reason: str | None = None
+
+
+class DiscountRuleCreate(BaseModel):
+    name: str
+    scope: str  # product, category, bill
+    target_id: uuid.UUID | None = None
+    percent: float | None = None
+    flat_amount: float | None = None
+
+
+class DiscountRuleOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: uuid.UUID
+    name: str
+    scope: str
+    target_id: uuid.UUID | None
+    percent: float | None
+    flat_amount: float | None
+    active: bool
+
+
+class DiscountRuleChange(BaseModel):
+    percent: float | None = None
+    flat_amount: float | None = None
+    active: bool | None = None
+    reason: str | None = None
 
 
 class FraudAlertOut(BaseModel):

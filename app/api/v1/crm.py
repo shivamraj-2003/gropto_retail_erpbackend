@@ -1,15 +1,25 @@
 import uuid
 
 from fastapi import APIRouter, Depends
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser, require_permission
 from app.core.database import get_db
 from app.models.models_phase3 import Campaign
-from app.schemas.schemas_phase3 import CampaignCreate, ConsentUpdate
+from app.schemas.schemas_phase3 import CampaignCreate, CampaignOut, ConsentUpdate
 from app.services import crm as crm_service
 
 router = APIRouter(prefix="/crm", tags=["crm"])
+
+
+@router.get("/campaigns", response_model=list[CampaignOut])
+async def list_campaigns(
+    db: AsyncSession = Depends(get_db),
+    _current: CurrentUser = Depends(require_permission("report.export")),
+) -> list[Campaign]:
+    result = await db.execute(select(Campaign).order_by(Campaign.created_at.desc()))
+    return list(result.scalars().all())
 
 
 @router.get("/customers/{customer_id}/360")

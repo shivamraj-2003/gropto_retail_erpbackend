@@ -29,7 +29,7 @@ async def stage_products_file(db: AsyncSession, *, file_bytes: bytes, filename: 
     rows = list(ws.iter_rows(values_only=True))
     header, *data_rows = rows
 
-    batch = ImportBatch(import_type="products", uploaded_by=uploaded_by, file_name=filename, status="staged")
+    batch = ImportBatch(import_type="products", uploaded_by=uploaded_by, file_name=filename, file_bytes=file_bytes, status="staged")
     db.add(batch)
     await db.flush()
 
@@ -143,7 +143,10 @@ async def stage_opening_stock_file(db: AsyncSession, *, file_bytes: bytes, filen
     rows = list(ws.iter_rows(values_only=True))
     header, *data_rows = rows
 
-    batch = ImportBatch(import_type="opening_stock", store_id=store_id, uploaded_by=uploaded_by, file_name=filename, status="staged")
+    batch = ImportBatch(
+        import_type="opening_stock", store_id=store_id, uploaded_by=uploaded_by, file_name=filename,
+        file_bytes=file_bytes, status="staged",
+    )
     db.add(batch)
     await db.flush()
 

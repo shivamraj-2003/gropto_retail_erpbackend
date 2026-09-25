@@ -16,7 +16,9 @@ router = APIRouter(tags=["vendors-purchases"])
 @router.get("/vendors", response_model=list[VendorOut])
 async def list_vendors(
     db: AsyncSession = Depends(get_db),
-    _current: CurrentUser = Depends(require_permission("vendor.manage")),
+    # Read access is broader than write: anyone entering a purchase needs to see
+    # the vendor list, but only vendor.manage holders can create/edit a vendor.
+    _current: CurrentUser = Depends(require_permission("purchase.manage")),
 ) -> list[Vendor]:
     result = await db.execute(select(Vendor).where(Vendor.is_active.is_(True)))
     return list(result.scalars().all())

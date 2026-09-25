@@ -13,6 +13,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.models import InventoryBalance, InventoryMovement
+from app.models.models_phase2 import WarehouseBalance
 
 
 class DuplicateMovement(Exception):
@@ -80,6 +81,32 @@ async def get_available_to_promise(db: AsyncSession, *, product_id: uuid.UUID, s
     if row is None:
         return 0.0
     return float(row.quantity) - float(row.reserved)
+
+
+async def adjust_warehouse_balance(db: AsyncSession, *, product_id: uuid.UUID, warehouse_id: uuid.UUID, delta: float) -> None:
+    """Warehouse-side counterpart to apply_movement's store balance update. A full
+    warehouse movement ledger (mirroring inventory_movements' audit trail) is a
+    further refinement once put-away/picking is built out — this closes the more
+    pressing gap, where a warehouse transfer leg didn't move any balance at all."""
+    stmt = (
+        pg_insert(WarehouseBalance)
+        .values(product_id=product_id, warehouse_id=warehouse_id, quantity=delta)
+        .on_conflict_do_update(
+            index_elements=[WarehouseBalance.product_id, WarehouseBalance.warehouse_id],
+            set_={"quantity": WarehouseBalance.quantity + delta},
+        )
+    )
+    await db.execute(stmt)
+
+
+async def get_warehouse_balance(db: AsyncSession, *, product_id: uuid.UUID, warehouse_id: uuid.UUID) -> float:
+    result = await db.execute(
+        select(WarehouseBalance.quantity).where(
+            WarehouseBalance.product_id == product_id, WarehouseBalance.warehouse_id == warehouse_id
+        )
+    )
+    value = result.scalar_one_or_none()
+    return float(value) if value is not None else 0.0
 
 
 async def adjust_reserved(db: AsyncSession, *, product_id: uuid.UUID, store_id: uuid.UUID, delta: float) -> None:

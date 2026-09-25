@@ -1,11 +1,9 @@
 """Warehouse-to-store, store-to-store and store-to-warehouse transfers (Phase 2).
 Two-sided document: dispatch decrements the source, receive increments the
 destination — deliberately two separate calls so in-transit stock is a real gap,
-not assumed. Store-leg stock effects use the Phase 1 inventory_balances table
-(keyed by store_id); a dedicated warehouse balance table is a Phase 2 follow-up
-once warehouse-side put-away/picking is built out — dispatch/receive from a
-warehouse leg is recorded on the transfer document but does not yet move a
-warehouse balance.
+not assumed. Store legs use the Phase 1 inventory_balances table; warehouse legs
+use warehouse_balances (see services/inventory.py's adjust_warehouse_balance) —
+both sides now actually move a balance, not just record the transfer document.
 """
 
 from datetime import datetime, timezone
@@ -17,18 +15,22 @@ from app.api.deps import CurrentUser
 from app.models.models_phase2 import Transfer, TransferItem
 from app.schemas.schemas_phase2 import TransferCreate, TransferReceive
 from app.services.audit import write_audit
-from app.services.inventory import apply_movement, get_balance
+from app.services.inventory import adjust_warehouse_balance, apply_movement, get_balance, get_warehouse_balance
 
 
 async def dispatch_transfer(db: AsyncSession, *, current: CurrentUser, payload: TransferCreate) -> Transfer:
-    if payload.source_type == "store":
-        for item in payload.items:
+    for item in payload.items:
+        if payload.source_type == "store":
             balance = await get_balance(db, product_id=item.product_id, store_id=payload.source_id)
-            if balance < item.dispatched_qty:
-                raise HTTPException(
-                    status_code=409,
-                    detail=f"Insufficient stock for product {item.product_id}: have {balance}, dispatching {item.dispatched_qty}",
-                )
+        elif payload.source_type == "warehouse":
+            balance = await get_warehouse_balance(db, product_id=item.product_id, warehouse_id=payload.source_id)
+        else:
+            raise HTTPException(status_code=400, detail=f"Unknown source_type {payload.source_type}")
+        if balance < item.dispatched_qty:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Insufficient stock for product {item.product_id}: have {balance}, dispatching {item.dispatched_qty}",
+            )
 
     transfer = Transfer(
         source_type=payload.source_type,
@@ -54,6 +56,10 @@ async def dispatch_transfer(db: AsyncSession, *, current: CurrentUser, payload: 
                 source_id=transfer.id,
                 created_by=current.user_id,
                 device_id=current.device_id,
+            )
+        else:
+            await adjust_warehouse_balance(
+                db, product_id=item.product_id, warehouse_id=payload.source_id, delta=-item.dispatched_qty
             )
 
     await write_audit(
@@ -94,6 +100,10 @@ async def receive_transfer(db: AsyncSession, *, current: CurrentUser, transfer: 
                 source_id=item.id,
                 created_by=current.user_id,
                 device_id=current.device_id,
+            )
+        else:
+            await adjust_warehouse_balance(
+                db, product_id=item.product_id, warehouse_id=transfer.dest_id, delta=received.received_qty
             )
 
     transfer.status = "discrepancy" if discrepancy else "received"

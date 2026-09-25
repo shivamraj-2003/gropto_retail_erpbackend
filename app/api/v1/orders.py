@@ -1,6 +1,7 @@
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser, require_permission
@@ -9,6 +10,7 @@ from app.models.models_phase3 import Order
 from app.schemas.schemas_phase3 import (
     OrderCreate,
     OrderDeliverRequest,
+    OrderDetailOut,
     OrderDispatchRequest,
     OrderOut,
     OrderPickRequest,
@@ -23,6 +25,33 @@ async def _get_order(db: AsyncSession, order_id: uuid.UUID) -> Order:
     if order is None:
         raise HTTPException(status_code=404, detail="Order not found")
     return order
+
+
+@router.get("", response_model=list[OrderOut])
+async def list_orders(
+    status_filter: str | None = None,
+    store_id: uuid.UUID | None = None,
+    db: AsyncSession = Depends(get_db),
+    _current: CurrentUser = Depends(require_permission("sale.create")),
+) -> list[Order]:
+    """The order queue: every online order, optionally filtered by status/store —
+    the packer/dispatcher screen's main list."""
+    stmt = select(Order)
+    if status_filter:
+        stmt = stmt.where(Order.status == status_filter)
+    if store_id:
+        stmt = stmt.where(Order.allocated_store_id == store_id)
+    result = await db.execute(stmt.order_by(Order.created_at.desc()).limit(200))
+    return list(result.scalars().all())
+
+
+@router.get("/{order_id}", response_model=OrderDetailOut)
+async def get_order(
+    order_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    _current: CurrentUser = Depends(require_permission("sale.create")),
+) -> Order:
+    return await _get_order(db, order_id)
 
 
 @router.post("", response_model=OrderOut, status_code=201)

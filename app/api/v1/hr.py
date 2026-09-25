@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import CurrentUser, require_permission, require_store_access
 from app.core.database import get_db
 from app.models.models_phase3 import Attendance, Employee, Shift
-from app.schemas.schemas_phase3 import AttendanceMark, EmployeeCreate, ShiftCreate
+from app.schemas.schemas_phase3 import AttendanceMark, AttendanceOut, EmployeeCreate, EmployeeOut, ShiftCreate, ShiftOut
 from app.services.audit import write_audit
 
 router = APIRouter(prefix="/hr", tags=["hr"])
@@ -39,15 +39,15 @@ async def create_employee(
     return {"employee_id": str(employee.id)}
 
 
-@router.get("/employees")
+@router.get("/employees", response_model=list[EmployeeOut])
 async def list_employees(
     store_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
     current: CurrentUser = Depends(require_permission("user.manage")),
-) -> list[dict]:
+) -> list[Employee]:
     require_store_access(store_id, current)
-    rows = (await db.execute(select(Employee).where(Employee.store_id == store_id, Employee.is_active.is_(True)))).scalars().all()
-    return [{"id": str(e.id), "designation": e.designation, "joined_at": e.joined_at.isoformat() if e.joined_at else None} for e in rows]
+    result = await db.execute(select(Employee).where(Employee.store_id == store_id, Employee.is_active.is_(True)))
+    return list(result.scalars().all())
 
 
 @router.post("/shifts", status_code=201)
@@ -62,6 +62,17 @@ async def create_shift(
     await db.commit()
     await db.refresh(shift)
     return {"shift_id": str(shift.id)}
+
+
+@router.get("/shifts", response_model=list[ShiftOut])
+async def list_shifts(
+    store_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(require_permission("user.manage")),
+) -> list[Shift]:
+    require_store_access(store_id, current)
+    result = await db.execute(select(Shift).where(Shift.store_id == store_id))
+    return list(result.scalars().all())
 
 
 @router.put("/attendance")
@@ -83,13 +94,14 @@ async def mark_attendance(
     return {"status": "ok"}
 
 
-@router.get("/attendance")
+@router.get("/attendance", response_model=list[AttendanceOut])
 async def list_attendance(
     employee_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
     _current: CurrentUser = Depends(require_permission("user.manage")),
-) -> list[dict]:
-    rows = (
-        await db.execute(select(Attendance).where(Attendance.employee_id == employee_id).order_by(Attendance.attendance_date.desc()))
-    ).scalars().all()
-    return [{"date": a.attendance_date.isoformat(), "status": a.status} for a in rows]
+) -> list[Attendance]:
+    result = await db.execute(
+        select(Attendance).where(Attendance.employee_id == employee_id).order_by(Attendance.attendance_date.desc())
+    )
+    rows = list(result.scalars().all())
+    return [AttendanceOut(date=a.attendance_date, status=a.status) for a in rows]

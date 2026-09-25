@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import CurrentUser, get_current_user, require_permission
+from app.api.deps import CurrentUser, get_current_user, require_permission, require_store_access
 from app.core.database import get_db
 from app.core.security import (
     create_access_token,
@@ -15,9 +15,10 @@ from app.core.security import (
     refresh_token_expiry,
     verify_password,
 )
-from app.models.models import Device, RefreshToken, Role, User, UserStore
-from app.schemas.schemas import LoginRequest, RefreshRequest, TokenResponse
+from app.models.models import Device, RefreshToken, Role, Store, User, UserStore
+from app.schemas.schemas import LoginRequest, RefreshRequest, StoreCredentialRow, TokenResponse
 from app.services.audit import write_audit
+from app.services.rate_limit import is_login_locked, record_login_failure, record_login_success
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -32,12 +33,22 @@ async def login(payload: LoginRequest, db: AsyncSession = Depends(get_db)) -> To
     if not payload.email and not payload.phone:
         raise HTTPException(status_code=400, detail="email or phone required")
 
+    identifier = payload.email or payload.phone or ""
+    remaining = is_login_locked(identifier, payload.device_fingerprint)
+    if remaining is not None:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"Too many failed attempts. Try again in {int(remaining // 60) + 1} minute(s).",
+        )
+
     stmt = select(User).where(
         (User.email == payload.email) if payload.email else (User.phone == payload.phone)
     )
     user = (await db.execute(stmt)).scalar_one_or_none()
     if user is None or not user.is_active or not verify_password(payload.password, user.password_hash):
+        record_login_failure(identifier, payload.device_fingerprint)
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
+    record_login_success(identifier, payload.device_fingerprint)
 
     role = await db.get(Role, user.role_id)
 
@@ -210,11 +221,60 @@ async def revoke_device(
     await db.commit()
 
 
+@router.get("/store-credentials", response_model=list[StoreCredentialRow])
+async def store_credentials(
+    store_id: uuid.UUID,
+    current: CurrentUser = Depends(require_permission("inventory.view")),
+    db: AsyncSession = Depends(get_db),
+) -> list[User]:
+    """The password-hash mirror an activated device caches locally so login still
+    works with no connectivity — the offline counterpart to online /auth/login.
+    Scoped to one store: any authenticated user with access to that store can
+    pull it (a device needs to serve every cashier who might work that till, not
+    just whoever last logged in online), never cross-store. The hash itself is
+    Argon2id, identical to what the device verifies against offline — this
+    endpoint ships the hash, never the plaintext password."""
+    require_store_access(store_id, current)
+    stmt = (
+        select(User, Role.code)
+        .join(UserStore, UserStore.user_id == User.id)
+        .join(Role, Role.id == User.role_id)
+        .where(UserStore.store_id == store_id, User.is_active.is_(True))
+    )
+    rows = (await db.execute(stmt)).all()
+    return [
+        StoreCredentialRow(
+            id=u.id,
+            email=u.email,
+            phone=u.phone,
+            full_name=u.full_name,
+            password_hash=u.password_hash,
+            role_code=role_code,
+            is_active=u.is_active,
+        )
+        for u, role_code in rows
+    ]
+
+
 @router.get("/me")
-async def me(current: CurrentUser = Depends(get_current_user)) -> dict:
+async def me(current: CurrentUser = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> dict:
+    device_code = None
+    if current.device_id:
+        device = await db.get(Device, current.device_id)
+        device_code = device.code if device else None
+
+    primary_store_code = None
+    if current.store_ids:
+        store = await db.get(Store, current.store_ids[0])
+        primary_store_code = store.code if store else None
+
     return {
         "user_id": str(current.user_id),
         "role": current.role_code,
         "stores": [str(s) for s in current.store_ids],
         "device_id": str(current.device_id) if current.device_id else None,
+        # Needed on-device to format bill numbers as store_code-device_code-seq
+        # (§4 of the plan) rather than an opaque sequence.
+        "device_code": device_code,
+        "primary_store_code": primary_store_code,
     }

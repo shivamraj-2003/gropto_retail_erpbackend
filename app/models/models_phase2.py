@@ -47,6 +47,19 @@ class WarehouseLocation(Base):
     __table_args__ = (UniqueConstraint("warehouse_id", "zone", "rack", "bin"),)
 
 
+class WarehouseBalance(Base):
+    """Mirrors inventory_balances' shape (product × location, cached quantity) but
+    for warehouses — closes the gap noted in services/transfers.py where a
+    warehouse leg used to only record the transfer document without moving a
+    balance anywhere."""
+
+    __tablename__ = "warehouse_balances"
+    product_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("products.id"), primary_key=True)
+    warehouse_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("warehouses.id"), primary_key=True)
+    quantity: Mapped[float] = mapped_column(Numeric(14, 3), default=0)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 class Grn(Base):
     """Goods Receipt Note against a purchase order — variance vs expected captured on lines."""
 

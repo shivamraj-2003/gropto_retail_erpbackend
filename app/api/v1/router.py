@@ -11,6 +11,7 @@ from app.api.v1 import (
     hr,
     imports,
     inventory,
+    loyalty,
     orders,
     phase2_misc,
     procurement,
@@ -18,6 +19,7 @@ from app.api.v1 import (
     purchases,
     reports,
     returns,
+    stores,
     sync,
     transfers,
 )
@@ -35,6 +37,8 @@ api_router.include_router(reports.router)
 api_router.include_router(ai.router)
 api_router.include_router(imports.router)
 api_router.include_router(dashboard.router)
+api_router.include_router(loyalty.router)
+api_router.include_router(stores.router)
 
 # Phase 2
 api_router.include_router(returns.router)
