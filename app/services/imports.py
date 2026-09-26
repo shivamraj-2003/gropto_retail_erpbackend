@@ -12,6 +12,7 @@ import uuid
 import openpyxl
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.api.deps import CurrentUser
 from app.models.models import ImportBatch, ImportStagingRow, InventoryBalance, Product
@@ -21,6 +22,15 @@ from app.services.inventory import apply_movement
 
 PRODUCT_COLUMNS = ["sku", "name", "barcode", "uom", "purchase_price", "selling_price", "mrp", "tax_rate"]
 OPENING_STOCK_COLUMNS = ["sku", "store_code", "quantity"]
+
+
+async def get_batch_with_rows(db: AsyncSession, batch_id: uuid.UUID) -> ImportBatch | None:
+    """`db.get()` + a later `batch.rows` access raises MissingGreenlet under async
+    SQLAlchemy — the relationship's lazy="selectin" loader only fires as part of a
+    query, not on a plain attribute access of an already-identity-mapped object.
+    Load rows eagerly, in the same query, instead."""
+    stmt = select(ImportBatch).where(ImportBatch.id == batch_id).options(selectinload(ImportBatch.rows))
+    return (await db.execute(stmt)).scalar_one_or_none()
 
 
 async def stage_products_file(db: AsyncSession, *, file_bytes: bytes, filename: str, uploaded_by: uuid.UUID) -> ImportBatch:
@@ -72,7 +82,7 @@ async def stage_products_file(db: AsyncSession, *, file_bytes: bytes, filename: 
 
 
 async def preview_batch(db: AsyncSession, batch_id: uuid.UUID) -> dict:
-    batch = await db.get(ImportBatch, batch_id)
+    batch = await get_batch_with_rows(db, batch_id)
     counts = {"create": 0, "update": 0, "error": 0, "skip": 0}
     for row in batch.rows:
         counts[row.computed_action or "error"] = counts.get(row.computed_action or "error", 0) + 1
@@ -80,7 +90,7 @@ async def preview_batch(db: AsyncSession, batch_id: uuid.UUID) -> dict:
 
 
 async def commit_products_batch(db: AsyncSession, batch_id: uuid.UUID, current: CurrentUser) -> dict:
-    batch = await db.get(ImportBatch, batch_id)
+    batch = await get_batch_with_rows(db, batch_id)
     if batch is None or batch.status != "staged":
         raise ValueError("Batch not found or already applied")
 
@@ -184,7 +194,7 @@ async def stage_opening_stock_file(db: AsyncSession, *, file_bytes: bytes, filen
 
 
 async def commit_opening_stock_batch(db: AsyncSession, batch_id: uuid.UUID, current: CurrentUser) -> dict:
-    batch = await db.get(ImportBatch, batch_id)
+    batch = await get_batch_with_rows(db, batch_id)
     if batch is None or batch.status != "staged":
         raise ValueError("Batch not found or already applied")
 

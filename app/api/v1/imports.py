@@ -98,7 +98,7 @@ async def download_result_report(
 ) -> StreamingResponse:
     """A downloadable result report showing exactly what was applied, skipped and
     rejected, with row numbers (§10)."""
-    batch = await db.get(ImportBatch, batch_id)
+    batch = await import_service.get_batch_with_rows(db, batch_id)
     if batch is None:
         raise HTTPException(status_code=404, detail="Batch not found")
 

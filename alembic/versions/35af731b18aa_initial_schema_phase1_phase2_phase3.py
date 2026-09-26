@@ -116,4 +116,9 @@ def _seed(bind) -> None:
                 {"r": role_ids[role_code], "p": perm_ids[perm_code]},
             )
 
-    conn.execute(sa.text("insert into loyalty_config (id) values (true)"))
+    conn.execute(
+        sa.text(
+            "insert into loyalty_config (id, earn_rate, redeem_value, min_balance_to_redeem, max_redeem_share) "
+            "values (true, 0.01, 0.5, 50, 0.5)"
+        )
+    )
