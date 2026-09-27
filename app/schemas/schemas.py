@@ -13,13 +13,23 @@ class LoginRequest(BaseModel):
     phone: str | None = None
     password: str
     device_fingerprint: str
-    device_activation_code: str | None = None
 
 
 class TokenResponse(BaseModel):
     access_token: str
     refresh_token: str
     token_type: str = "bearer"
+
+
+class DeviceOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: uuid.UUID
+    store_id: uuid.UUID
+    code: str
+    fingerprint: str
+    status: str
+    last_seen_at: datetime | None
+    created_at: datetime
 
 
 class RefreshRequest(BaseModel):

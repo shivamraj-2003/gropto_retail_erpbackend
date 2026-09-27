@@ -3,7 +3,6 @@ Run after migrations: `python -m scripts.seed`
 """
 
 import asyncio
-import secrets
 
 from sqlalchemy import select
 
@@ -38,13 +37,17 @@ async def main() -> None:
         await db.flush()
         db.add(UserStore(user_id=user.id, store_id=store.id))
 
-        activation_code = secrets.token_hex(4)
+        # The bootstrap device is created already-active rather than pending —
+        # there is by definition no one logged in yet who could click
+        # "approve" on it. Every device after this one goes through the
+        # normal pending -> Super Admin approves flow (POST
+        # /auth/devices/{id}/approve), same as any device that just shows up
+        # and tries to log in for the first time.
         device = Device(
             store_id=store.id,
             code="TILL1",
             fingerprint="seed-bootstrap-device",
-            status="pending",
-            activation_code=activation_code,
+            status="active",
         )
         db.add(device)
 
@@ -53,8 +56,7 @@ async def main() -> None:
         print("Seed complete.")
         print(f"  Store:            {store.code} ({store.id})")
         print(f"  Super Admin:      {SUPER_ADMIN_EMAIL} / {SUPER_ADMIN_PASSWORD}")
-        print("  Device fingerprint: seed-bootstrap-device")
-        print(f"  Device activation code: {activation_code}")
+        print("  Device fingerprint: seed-bootstrap-device (pre-activated)")
 
 
 if __name__ == "__main__":

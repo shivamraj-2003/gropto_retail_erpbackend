@@ -16,7 +16,7 @@ from app.core.security import (
     verify_password,
 )
 from app.models.models import Device, RefreshToken, Role, Store, User, UserStore
-from app.schemas.schemas import LoginRequest, RefreshRequest, StoreCredentialRow, TokenResponse
+from app.schemas.schemas import DeviceOut, LoginRequest, RefreshRequest, StoreCredentialRow, TokenResponse
 from app.services.audit import write_audit
 from app.services.rate_limit import is_login_locked, record_login_failure, record_login_success
 
@@ -56,21 +56,35 @@ async def login(payload: LoginRequest, db: AsyncSession = Depends(get_db)) -> To
     device = (await db.execute(device_stmt)).scalar_one_or_none()
 
     if device is None:
-        # A device must be pre-registered by a Super Admin (POST /auth/devices/register)
-        # before it can ever log in — logging in never silently creates a device.
+        # First time this device has ever tried to log in: it's recorded as
+        # pending rather than rejected outright, so a Super Admin sees it
+        # waiting in the device list and can approve it with one click — no
+        # activation code to relay back to the cashier over the phone.
+        store_ids = await _load_user_store_ids(db, user.id)
+        target_store_id = store_ids[0] if store_ids else (await db.execute(select(Store.id).limit(1))).scalar_one_or_none()
+        if target_store_id is None:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No store exists to register this device against")
+        device = Device(
+            store_id=target_store_id,
+            code=f"AUTO-{secrets.token_hex(2).upper()}",
+            fingerprint=payload.device_fingerprint,
+            status="pending",
+        )
+        db.add(device)
+        await db.commit()
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Device not registered. Ask a Super Admin to register this device first.",
+            detail="Device pending approval. Ask a Super Admin to approve it, then try again.",
         )
 
     if device.status == "revoked":
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Device has been revoked")
 
     if device.status == "pending":
-        if not payload.device_activation_code or payload.device_activation_code != device.activation_code:
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid activation code")
-        device.status = "active"
-        device.activation_code = None
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Device pending approval. Ask a Super Admin to approve it, then try again.",
+        )
 
     if role.code != "super_admin":
         store_ids = await _load_user_store_ids(db, user.id)
@@ -177,8 +191,11 @@ async def register_device(
     current: CurrentUser = Depends(require_permission("device.manage")),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    activation_code = secrets.token_hex(4)
-    device = Device(store_id=store_id, code=code, fingerprint=fingerprint, status="pending", activation_code=activation_code)
+    """Pre-registers a device before it ever logs in. Still lands as 'pending'
+    — a Super Admin approves it the same way as a device that self-registered
+    on first login attempt (POST /devices/{id}/approve), no activation code
+    involved either way."""
+    device = Device(store_id=store_id, code=code, fingerprint=fingerprint, status="pending")
     db.add(device)
     await write_audit(
         db,
@@ -192,7 +209,48 @@ async def register_device(
         new_value={"code": code, "fingerprint": fingerprint},
     )
     await db.commit()
-    return {"device_id": str(device.id), "activation_code": activation_code}
+    return {"device_id": str(device.id)}
+
+
+@router.get("/devices", response_model=list[DeviceOut])
+async def list_devices(
+    status_filter: str | None = None,
+    current: CurrentUser = Depends(require_permission("device.manage")),
+    db: AsyncSession = Depends(get_db),
+) -> list[Device]:
+    stmt = select(Device)
+    if status_filter:
+        stmt = stmt.where(Device.status == status_filter)
+    if current.role_code != "super_admin":
+        stmt = stmt.where(Device.store_id.in_(current.store_ids))
+    result = await db.execute(stmt.order_by(Device.created_at.desc()))
+    return list(result.scalars().all())
+
+
+@router.post("/devices/{device_id}/approve", status_code=204)
+async def approve_device(
+    device_id: uuid.UUID,
+    current: CurrentUser = Depends(require_permission("device.manage")),
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    """One click, no code exchange — the whole point of removing the
+    activation-code step while keeping the same guarantee: a device can't
+    sync or log in until someone holding device.manage has looked at it."""
+    device = await db.get(Device, device_id)
+    if device is None:
+        raise HTTPException(status_code=404, detail="Device not found")
+    device.status = "active"
+    await write_audit(
+        db,
+        user_id=current.user_id,
+        role_code=current.role_code,
+        store_id=device.store_id,
+        device_id=device.id,
+        action="device.approved",
+        entity_type="device",
+        entity_id=device.id,
+    )
+    await db.commit()
 
 
 @router.post("/devices/{device_id}/revoke", status_code=204)

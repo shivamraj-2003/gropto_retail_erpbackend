@@ -127,6 +127,25 @@ backend/
      "device_fingerprint": "seed-bootstrap-device", "device_activation_code": "<from seed output>" }
    ```
 
+## Dev/pilot login credentials
+
+Seeded by `python -m scripts.seed` (Super Admin) and `python -m scripts.seed_test_users` (one
+account per other role, all sharing store scope with the Super Admin). **Change every one of
+these before any real go-live** — they exist purely so each role can be tested without creating
+users by hand.
+
+| Role | Email | Password |
+|---|---|---|
+| Super Admin | `admin@gropto.local` | `ChangeMe!123` |
+| Admin | `admin.test@gropto.local` | `Test@123` |
+| Store Manager | `manager@gropto.local` | `Test@123` |
+| Cashier | `cashier@gropto.local` | `Test@123` |
+
+Every login also needs a registered device (`device_fingerprint` + a one-time
+`device_activation_code` from a Super Admin on first use — see `POST /auth/devices/register`).
+The Electron frontend generates and remembers its own device fingerprint automatically; these
+credentials alone are not enough to call the API directly without also registering a device.
+
 ## Making future schema changes
 
 Edit the SQLAlchemy models (or add a new `models_phaseN.py` and register it in
@@ -138,6 +157,24 @@ alembic upgrade head
 Autogenerate needs a live DB to diff against — this only works once `DATABASE_URL` points at a
 real Postgres instance. Review the generated migration before applying it, same as any Alembic
 project.
+
+## Running the test suite
+
+```
+pip install -r requirements.txt   # includes pytest + pytest-asyncio
+pytest -v
+```
+
+`tests/` runs against a real `uvicorn` subprocess the fixtures spin up automatically against
+your configured `DATABASE_URL` — not a mock. It needs the dev/pilot credentials above to be
+seeded and the `seed-bootstrap-device` device already activated (true once anyone has logged
+into the app at least once). Covers: login success/failure/lockout paths, device-registration
+enforcement, `/me`, negative authorization (a cashier token hitting `approval.decide`- or
+`user.manage`-gated routes gets a real 403, not just a hidden button), and a full real sale
+through `POST /api/v1/sync/push` including idempotency-key deduplication on replay. This is a
+smoke/integration suite, not exhaustive coverage — the sync engine's concurrent-device and
+conflict-resolution paths (§5 of the plan) and the full order lifecycle still need a dedicated
+run before production.
 
 ## Notes on the hard gates from the delivery plan
 
@@ -151,11 +188,16 @@ project.
 
 ## Verification status
 
-Import-checked (`python -c "import app.main"`) and linted (`ruff check --select F,E9` — no
-undefined names, no syntax errors) in this environment. The Alembic migration has been verified
-to load and resolve all 60 tables across Phase 1/2/3 with no foreign-key ordering errors
-(`alembic history` / model metadata resolution), but **has not been run against a live database**
-in this environment (none was available). Once you provide a `DATABASE_URL`, run `alembic
-upgrade head`, then `python -m scripts.seed`, then exercise `POST /api/v1/sync/push` with a
-couple of offline-style bills and `POST /api/v1/orders` → `/pick` → `/dispatch` → `/deliver` to
-confirm the ledger and reservation logic end-to-end before relying on this in production.
+`alembic upgrade head` has been run against a real Supabase Postgres instance (all Phase
+1/2/3 tables + seed data landed with no FK ordering errors), `python -m scripts.seed` and
+`python -m scripts.seed_test_users` have populated one user per role, and `uvicorn app.main:app`
+boots cleanly against that live database. The Electron frontend has logged in, billed, and
+synced against this same backend.
+
+**Not yet exercised end-to-end and worth doing before production**: `POST /api/v1/sync/push`
+with a real batch of offline-created bills from two devices (the plan's own hard gate — fifty
+bills, zero duplicates); the full order lifecycle `POST /api/v1/orders` → `/pick` → `/dispatch`
+→ `/deliver`; the approval engine's re-validate-on-apply path under real concurrent edits; and a
+tested backup/restore. `tests/` (see below) covers the read paths and auth/authorization with
+automated tests — the sync and order lifecycle gates still need a manual or scripted run against
+real data.
