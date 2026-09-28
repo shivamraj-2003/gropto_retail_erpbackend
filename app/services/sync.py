@@ -49,14 +49,26 @@ async def process_sale(db: AsyncSession, sale_in: SaleIn) -> SyncItemVerdict:
         if device is None or device.status != "active":
             raise ValueError("Device not active")
 
-        subtotal = sum(item.quantity * item.unit_price for item in sale_in.items)
+        # GST-inclusive pricing (per Indian law, MRP already includes GST — tax is
+        # backed OUT of unit_price here, never added on top). subtotal ends up
+        # meaning "taxable value" (pre-GST), not the old exclusive-pricing gross.
+        subtotal = 0.0
+        tax_total = 0.0
+        line_tax_breakdown: dict[int, tuple[float, float]] = {}
+        for idx, item in enumerate(sale_in.items):
+            line_net = item.quantity * item.unit_price - item.line_discount  # GST-inclusive
+            rate = float(item.tax_rate_snapshot)
+            line_taxable = line_net / (1 + rate / 100) if rate else line_net
+            line_tax = line_net - line_taxable
+            subtotal += line_taxable
+            tax_total += line_tax
+            line_tax_breakdown[idx] = (line_taxable, line_tax)
+
         line_discounts = sum(item.line_discount for item in sale_in.items)
         discount_total = sale_in.discount_total + line_discounts
-        tax_total = sum(
-            (item.quantity * item.unit_price - item.line_discount) * (item.tax_rate_snapshot / 100)
-            for item in sale_in.items
-        )
-        grand_total = subtotal - discount_total + tax_total
+        # Only the bill-level discount reduces the final total here — line
+        # discounts are already netted into subtotal/tax_total above.
+        grand_total = subtotal + tax_total - sale_in.discount_total
 
         # Role-based discount limit; above it requires a manager override PIN, stamped
         # on the sale immediately rather than a pending-approval round trip, because
@@ -108,17 +120,22 @@ async def process_sale(db: AsyncSession, sale_in: SaleIn) -> SyncItemVerdict:
         db.add(sale)
         await db.flush()
 
-        for item in sale_in.items:
+        for idx, item in enumerate(sale_in.items):
+            line_taxable, line_tax = line_tax_breakdown[idx]
             db.add(
                 SaleItem(
                     sale_id=sale.id,
                     product_id=item.product_id,
                     product_name_snapshot=item.product_name_snapshot,
                     tax_rate_snapshot=item.tax_rate_snapshot,
+                    hsn_code_snapshot=item.hsn_code_snapshot,
                     quantity=item.quantity,
                     unit_price=item.unit_price,
                     line_discount=item.line_discount,
                     line_total=item.quantity * item.unit_price - item.line_discount,
+                    taxable_value=line_taxable,
+                    cgst_amount=line_tax / 2,
+                    sgst_amount=line_tax / 2,
                 )
             )
             try:

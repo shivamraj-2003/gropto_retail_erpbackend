@@ -148,7 +148,12 @@ class Product(Base):
     purchase_price: Mapped[float] = mapped_column(Numeric(12, 2), default=0)
     selling_price: Mapped[float] = mapped_column(Numeric(12, 2), default=0)
     mrp: Mapped[float] = mapped_column(Numeric(12, 2), default=0)
+    # GST rate as a percentage (e.g. 18 for 18%). selling_price/mrp are
+    # GST-INCLUSIVE — per Indian law the MRP printed on a product already
+    # includes tax, so billing backs the tax out of this price rather than
+    # adding it on top. See app/services/sync.py's process_sale for the split.
     tax_rate: Mapped[float] = mapped_column(Numeric(5, 2), default=0)
+    hsn_code: Mapped[str | None] = mapped_column(String)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     revision: Mapped[int] = revision_column()
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
@@ -260,10 +265,17 @@ class SaleItem(Base):
     product_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("products.id"), nullable=False)
     product_name_snapshot: Mapped[str] = mapped_column(String, nullable=False)
     tax_rate_snapshot: Mapped[float] = mapped_column(Numeric(5, 2), nullable=False)
+    hsn_code_snapshot: Mapped[str | None] = mapped_column(String)
     quantity: Mapped[float] = mapped_column(Numeric(12, 3), nullable=False)
     unit_price: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False)
     line_discount: Mapped[float] = mapped_column(Numeric(12, 2), default=0)
     line_total: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False)
+    # Taxable value (line_total with GST backed out) and the GST amount,
+    # split evenly into CGST+SGST — every walk-in POS sale is intra-state
+    # (the customer is standing in the store), so IGST never applies here.
+    taxable_value: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False, default=0)
+    cgst_amount: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False, default=0)
+    sgst_amount: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False, default=0)
 
 
 class Payment(Base):

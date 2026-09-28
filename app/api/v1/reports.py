@@ -45,17 +45,24 @@ async def sales_register(
     wb = Workbook()
     ws = wb.active
     ws.title = "Sales"
-    ws.append(["Bill Number", "Store", "Cashier", "Billed At", "Subtotal", "Discount", "Tax", "Grand Total", "Status"])
+    ws.append(["Bill Number", "Store", "Cashier", "Billed At", "Taxable Value", "Discount", "GST (CGST+SGST)", "Grand Total", "Status"])
     for s in sales:
         ws.append(
             [s.bill_number, str(s.store_id), str(s.cashier_id), s.billed_at.isoformat(), float(s.subtotal), float(s.discount_total), float(s.tax_total), float(s.grand_total), s.status]
         )
 
     items_ws = wb.create_sheet("Line Items")
-    items_ws.append(["Bill Number", "Product", "Qty", "Unit Price", "Line Discount", "Line Total"])
+    items_ws.append(
+        ["Bill Number", "Product", "HSN/SAC", "Qty", "Unit Price (incl. GST)", "Line Discount", "Line Total",
+         "Taxable Value", "GST Rate %", "CGST", "SGST"]
+    )
     for s in sales:
         for item in s.items:
-            items_ws.append([s.bill_number, item.product_name_snapshot, float(item.quantity), float(item.unit_price), float(item.line_discount), float(item.line_total)])
+            items_ws.append(
+                [s.bill_number, item.product_name_snapshot, item.hsn_code_snapshot or "", float(item.quantity),
+                 float(item.unit_price), float(item.line_discount), float(item.line_total),
+                 float(item.taxable_value), float(item.tax_rate_snapshot), float(item.cgst_amount), float(item.sgst_amount)]
+            )
 
     await write_audit(
         db,

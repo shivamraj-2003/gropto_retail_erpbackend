@@ -138,6 +138,7 @@ class ProductOut(BaseModel):
     selling_price: float
     mrp: float
     tax_rate: float
+    hsn_code: str | None
     is_active: bool
     revision: int
 
@@ -153,6 +154,7 @@ class ProductCreate(BaseModel):
     selling_price: float = 0
     mrp: float = 0
     tax_rate: float = 0
+    hsn_code: str | None = None
 
 
 class ProductPriceChangeRequest(BaseModel):
@@ -196,6 +198,7 @@ class SaleItemIn(BaseModel):
     product_id: uuid.UUID
     product_name_snapshot: str
     tax_rate_snapshot: float
+    hsn_code_snapshot: str | None = None
     quantity: float
     unit_price: float
     line_discount: float = 0

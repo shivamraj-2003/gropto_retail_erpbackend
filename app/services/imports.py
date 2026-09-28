@@ -20,7 +20,7 @@ from app.services.approvals import submit_or_apply
 from app.services.audit import write_audit
 from app.services.inventory import apply_movement
 
-PRODUCT_COLUMNS = ["sku", "name", "barcode", "uom", "purchase_price", "selling_price", "mrp", "tax_rate"]
+PRODUCT_COLUMNS = ["sku", "name", "barcode", "uom", "purchase_price", "selling_price", "mrp", "tax_rate", "hsn_code"]
 OPENING_STOCK_COLUMNS = ["sku", "store_code", "quantity"]
 
 
@@ -106,7 +106,7 @@ async def commit_products_batch(db: AsyncSession, batch_id: uuid.UUID, current: 
             product = Product(
                 sku=v["sku"], name=v.get("name") or v["sku"], barcode=v.get("barcode"),
                 uom=v.get("uom") or "EA", selling_price=v["selling_price"], mrp=v.get("mrp") or v["selling_price"],
-                tax_rate=v["tax_rate"], purchase_price=v.get("purchase_price") or 0,
+                tax_rate=v["tax_rate"], hsn_code=v.get("hsn_code"), purchase_price=v.get("purchase_price") or 0,
             )
             db.add(product)
             created += 1
@@ -115,6 +115,7 @@ async def commit_products_batch(db: AsyncSession, batch_id: uuid.UUID, current: 
                 price_deltas.append({"sku": v["sku"], "old": float(product.selling_price), "new": v["selling_price"]})
             product.name = v.get("name") or product.name
             product.tax_rate = v["tax_rate"]
+            product.hsn_code = v.get("hsn_code") or product.hsn_code
             updated += 1
 
     # Bulk repricing becomes one approval request holding every delta, not a silent change.
