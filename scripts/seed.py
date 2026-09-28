@@ -37,12 +37,11 @@ async def main() -> None:
         await db.flush()
         db.add(UserStore(user_id=user.id, store_id=store.id))
 
-        # The bootstrap device is created already-active rather than pending —
-        # there is by definition no one logged in yet who could click
-        # "approve" on it. Every device after this one goes through the
-        # normal pending -> Super Admin approves flow (POST
-        # /auth/devices/{id}/approve), same as any device that just shows up
-        # and tries to log in for the first time.
+        # Every device is created active — login is email+password only,
+        # with no pending/approval gate. This bootstrap device is no
+        # different from any other device's first login, just seeded ahead
+        # of time so `alembic upgrade head` + this script leaves a working
+        # login on the first try.
         device = Device(
             store_id=store.id,
             code="TILL1",

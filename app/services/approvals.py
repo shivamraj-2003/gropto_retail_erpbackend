@@ -229,6 +229,43 @@ async def _handle_user_permission_change(db: AsyncSession, request: ApprovalRequ
         user.role_id = role.id
 
 
+@register_handler("user_create")
+async def _handle_user_create(db: AsyncSession, request: ApprovalRequest) -> None:
+    """Applies for both paths: a Super Admin's create-user call goes through
+    submit_or_apply -> _apply immediately (this handler runs once, right
+    away); an Admin's call queues here and this same handler runs only once
+    a Super Admin approves it. The new user's id is generated up front by
+    the endpoint and carried as both entity_id and new_value['user_id'] so
+    it's stable across the pending window."""
+    from app.models.models import Role, User, UserStore
+
+    payload = request.new_value
+    email = payload.get("email")
+    existing = await db.execute(select(User).where(User.email == email))
+    if existing.scalar_one_or_none() is not None:
+        request.status = "rejected"
+        return
+
+    result = await db.execute(select(Role).where(Role.code == payload["role_code"]))
+    role = result.scalar_one_or_none()
+    if role is None:
+        raise HTTPException(status_code=400, detail="Unknown role_code")
+
+    user = User(
+        id=uuid.UUID(payload["user_id"]),
+        email=email,
+        phone=payload.get("phone"),
+        full_name=payload["full_name"],
+        password_hash=payload["password_hash"],
+        role_id=role.id,
+        is_active=True,
+    )
+    db.add(user)
+    await db.flush()
+    for store_id in payload.get("store_ids", []):
+        db.add(UserStore(user_id=user.id, store_id=uuid.UUID(store_id)))
+
+
 @register_handler("config_change")
 async def _handle_config_change_noop(db: AsyncSession, request: ApprovalRequest) -> None:
     """Generic configuration changes are recorded via audit only in Phase 1;

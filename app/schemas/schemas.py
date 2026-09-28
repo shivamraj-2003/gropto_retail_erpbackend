@@ -57,6 +57,53 @@ class RefreshRequest(BaseModel):
     device_fingerprint: str
 
 
+class ChangePasswordIn(BaseModel):
+    current_password: str
+    new_password: str = Field(min_length=6)
+
+
+class ForgotPasswordIn(BaseModel):
+    email: str
+
+
+class ResetPasswordIn(BaseModel):
+    new_password: str = Field(min_length=6)
+
+
+# ---------------------------------------------------------------------------
+# User management
+# ---------------------------------------------------------------------------
+
+ASSIGNABLE_ROLES = {"admin", "cashier", "store_manager"}
+
+
+class UserCreateIn(BaseModel):
+    email: str
+    full_name: str
+    phone: str | None = None
+    password: str = Field(min_length=6)
+    role_code: str
+    store_ids: list[uuid.UUID] = Field(default_factory=list)
+
+
+class UserOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: uuid.UUID
+    email: str | None
+    phone: str | None
+    full_name: str
+    role_code: str
+    is_active: bool
+    store_ids: list[uuid.UUID]
+    created_at: datetime
+
+
+class UserCreateResult(BaseModel):
+    status: str  # "created" | "pending_approval"
+    user_id: uuid.UUID | None = None
+    request_id: uuid.UUID | None = None
+
+
 class StoreCredentialRow(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: uuid.UUID

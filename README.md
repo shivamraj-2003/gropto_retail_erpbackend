@@ -126,9 +126,9 @@ backend/
    { "email": "admin@gropto.local", "password": "ChangeMe!123",
      "device_fingerprint": "seed-bootstrap-device" }
    ```
-   (The seed script's bootstrap device is created already-active — no approval step needed for
-   that one specific device. Every device after it goes through the pending → approve flow
-   below.)
+   (Login is email+password only — any device fingerprint works on the first try, no
+   approval step. `device_fingerprint` is still recorded for per-counter bill numbering,
+   cash sessions, and sync, but it never blocks login.)
 
 ## Dev/pilot login credentials
 
@@ -144,15 +144,15 @@ users by hand.
 | Store Manager | `manager@gropto.local` | `Test@123` |
 | Cashier | `cashier@gropto.local` | `Test@123` |
 
-Every login also needs an **approved** device. There is no activation code anywhere in this
-flow — a device that has never logged in before is recorded as `pending` automatically on its
-first login attempt (still refused with 403 until approved, so this changes nothing about the
-security guarantee), and a Super Admin approves it with one click: `GET /auth/devices` lists
-pending devices, `POST /auth/devices/{id}/approve` approves one. `POST /auth/devices/register`
-still exists for pre-registering a device before it ever shows up (also no code — same one-click
-`approve` call finishes it). The Electron frontend generates and remembers its own device
-fingerprint automatically; these credentials alone are not enough to call the API directly
-without an approved device.
+Login is **email + password only** — no activation code, no pending/approval gate. A device
+that has never logged in before is recorded and active from its very first attempt; there's
+nothing to click before it can be used. The `Device` row still exists underneath (bill
+numbering, cash sessions, and sync are all scoped to it), it's just never a login blocker.
+`GET /auth/devices` lists every device for visibility, and `POST /auth/devices/{id}/revoke`
+is the one real control left — revoke a lost or compromised till and it's refused on its next
+login attempt. `POST /auth/devices/register` still exists for pre-registering a device (also
+active immediately). The Electron frontend generates and remembers its own device fingerprint
+automatically, purely for that per-counter identity — it's never required for login to succeed.
 
 ## Audit trail (edit log)
 

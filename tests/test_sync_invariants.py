@@ -73,10 +73,10 @@ async def test_two_devices_selling_same_sku_offline_both_apply_stock_falls_by_su
     products = (await client.get("/api/v1/products", headers=cashier_headers)).json()
     product = products[0]
 
-    # Register and approve a second till for this store, mirroring the real
-    # device flow (not a DB shortcut): a Super Admin registers it, one-click
-    # approves it (no activation code to relay anywhere), then the store's
-    # cashier logs in on it — exactly what a brand-new physical till does.
+    # Register a second till for this store, mirroring the real device flow
+    # (not a DB shortcut): a Super Admin registers it — active immediately,
+    # no approval step — then the store's cashier logs in on it, exactly
+    # what a brand-new physical till does.
     suffix = uuid.uuid4().hex[:8]
     second_fingerprint = f"pytest-second-till-{suffix}"
     register_resp = await client.post(
@@ -86,9 +86,6 @@ async def test_two_devices_selling_same_sku_offline_both_apply_stock_falls_by_su
     )
     assert register_resp.status_code == 201
     second_device_row_id = register_resp.json()["device_id"]
-
-    approve_resp = await client.post(f"/api/v1/auth/devices/{second_device_row_id}/approve", headers=super_headers)
-    assert approve_resp.status_code == 204
 
     cashier_email, cashier_password = CREDENTIALS["cashier"]
     activate_resp = await client.post(

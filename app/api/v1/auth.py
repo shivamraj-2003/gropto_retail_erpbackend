@@ -10,13 +10,22 @@ from app.api.deps import CurrentUser, get_current_user, require_permission, requ
 from app.core.database import get_db
 from app.core.security import (
     create_access_token,
+    hash_password,
     hash_refresh_token,
     new_refresh_token,
     refresh_token_expiry,
     verify_password,
 )
 from app.models.models import Device, RefreshToken, Role, Store, User, UserStore
-from app.schemas.schemas import DeviceOut, LoginRequest, RefreshRequest, StoreCredentialRow, TokenResponse
+from app.schemas.schemas import (
+    ChangePasswordIn,
+    DeviceOut,
+    ForgotPasswordIn,
+    LoginRequest,
+    RefreshRequest,
+    StoreCredentialRow,
+    TokenResponse,
+)
 from app.services.audit import write_audit
 from app.services.rate_limit import is_login_locked, record_login_failure, record_login_success
 
@@ -56,10 +65,10 @@ async def login(payload: LoginRequest, db: AsyncSession = Depends(get_db)) -> To
     device = (await db.execute(device_stmt)).scalar_one_or_none()
 
     if device is None:
-        # First time this device has ever tried to log in: it's recorded as
-        # pending rather than rejected outright, so a Super Admin sees it
-        # waiting in the device list and can approve it with one click — no
-        # activation code to relay back to the cashier over the phone.
+        # Login is email+password only — a device new to the system is
+        # recorded and activated in the same step, not held pending. The
+        # Device row still exists (bill numbering, cash sessions, and sync
+        # are all scoped to it), it's just no longer a login gate.
         store_ids = await _load_user_store_ids(db, user.id)
         target_store_id = store_ids[0] if store_ids else (await db.execute(select(Store.id).limit(1))).scalar_one_or_none()
         if target_store_id is None:
@@ -68,23 +77,13 @@ async def login(payload: LoginRequest, db: AsyncSession = Depends(get_db)) -> To
             store_id=target_store_id,
             code=f"AUTO-{secrets.token_hex(2).upper()}",
             fingerprint=payload.device_fingerprint,
-            status="pending",
+            status="active",
         )
         db.add(device)
-        await db.commit()
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Device pending approval. Ask a Super Admin to approve it, then try again.",
-        )
+        await db.flush()
 
     if device.status == "revoked":
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Device has been revoked")
-
-    if device.status == "pending":
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Device pending approval. Ask a Super Admin to approve it, then try again.",
-        )
 
     if role.code != "super_admin":
         store_ids = await _load_user_store_ids(db, user.id)
@@ -183,6 +182,59 @@ async def logout(payload: RefreshRequest, db: AsyncSession = Depends(get_db)) ->
     await db.commit()
 
 
+@router.post("/change-password", status_code=204)
+async def change_password(
+    payload: ChangePasswordIn,
+    current: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    user = await db.get(User, current.user_id)
+    if user is None or not verify_password(payload.current_password, user.password_hash):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Current password is incorrect")
+    user.password_hash = hash_password(payload.new_password)
+    # Every other device/session must re-login with the new password.
+    await db.execute(
+        RefreshToken.__table__.update().where(RefreshToken.user_id == user.id).values(revoked=True)
+    )
+    await write_audit(
+        db,
+        user_id=current.user_id,
+        role_code=current.role_code,
+        store_id=None,
+        device_id=current.device_id,
+        action="user.password_changed",
+        entity_type="user",
+        entity_id=user.id,
+    )
+    await db.commit()
+
+
+@router.post("/forgot-password", status_code=200)
+async def forgot_password(payload: ForgotPasswordIn, db: AsyncSession = Depends(get_db)) -> dict:
+    """No email/SMS delivery is configured in this deployment, so this can't
+    send a reset link — what it CAN safely do is flag the request so an
+    Admin/Super Admin sees it (Audit Trail, action=auth.forgot_password_requested)
+    and resets the password directly (POST /users/{id}/reset-password), then
+    relays it to the account holder. Always returns the same generic message
+    regardless of whether the email exists, so this can't be used to enumerate
+    accounts."""
+    stmt = select(User).where(User.email == payload.email)
+    user = (await db.execute(stmt)).scalar_one_or_none()
+    if user is not None:
+        await write_audit(
+            db,
+            user_id=user.id,
+            role_code=None,
+            store_id=None,
+            device_id=None,
+            action="auth.forgot_password_requested",
+            entity_type="user",
+            entity_id=user.id,
+        )
+        await db.commit()
+    return {"message": "If that account exists, your store's Admin or Super Admin has been notified to reset your password."}
+
+
 @router.post("/devices/register", status_code=201)
 async def register_device(
     store_id: uuid.UUID,
@@ -191,11 +243,10 @@ async def register_device(
     current: CurrentUser = Depends(require_permission("device.manage")),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    """Pre-registers a device before it ever logs in. Still lands as 'pending'
-    — a Super Admin approves it the same way as a device that self-registered
-    on first login attempt (POST /devices/{id}/approve), no activation code
-    involved either way."""
-    device = Device(store_id=store_id, code=code, fingerprint=fingerprint, status="pending")
+    """Pre-registers a device before it ever logs in. Created active
+    immediately — login is email+password only, there's no approval gate to
+    clear afterward."""
+    device = Device(store_id=store_id, code=code, fingerprint=fingerprint, status="active")
     db.add(device)
     await write_audit(
         db,
@@ -225,32 +276,6 @@ async def list_devices(
         stmt = stmt.where(Device.store_id.in_(current.store_ids))
     result = await db.execute(stmt.order_by(Device.created_at.desc()))
     return list(result.scalars().all())
-
-
-@router.post("/devices/{device_id}/approve", status_code=204)
-async def approve_device(
-    device_id: uuid.UUID,
-    current: CurrentUser = Depends(require_permission("device.manage")),
-    db: AsyncSession = Depends(get_db),
-) -> None:
-    """One click, no code exchange — the whole point of removing the
-    activation-code step while keeping the same guarantee: a device can't
-    sync or log in until someone holding device.manage has looked at it."""
-    device = await db.get(Device, device_id)
-    if device is None:
-        raise HTTPException(status_code=404, detail="Device not found")
-    device.status = "active"
-    await write_audit(
-        db,
-        user_id=current.user_id,
-        role_code=current.role_code,
-        store_id=device.store_id,
-        device_id=device.id,
-        action="device.approved",
-        entity_type="device",
-        entity_id=device.id,
-    )
-    await db.commit()
 
 
 @router.post("/devices/{device_id}/revoke", status_code=204)

@@ -15,7 +15,9 @@ async def test_login_with_wrong_password_is_rejected(client: AsyncClient):
     assert resp.status_code == 401
 
 
-async def test_login_from_unregistered_device_is_rejected(client: AsyncClient):
+async def test_login_from_a_brand_new_device_succeeds_immediately(client: AsyncClient):
+    # Login is email+password only — a device nobody pre-registered still
+    # logs in on the first try, no pending/approval gate.
     resp = await client.post(
         "/api/v1/auth/login",
         json={
@@ -24,7 +26,8 @@ async def test_login_from_unregistered_device_is_rejected(client: AsyncClient):
             "device_fingerprint": "a-device-nobody-registered",
         },
     )
-    assert resp.status_code == 403
+    assert resp.status_code == 200
+    assert "access_token" in resp.json()
 
 
 async def test_successful_login_returns_tokens(client: AsyncClient, super_admin_token: str):

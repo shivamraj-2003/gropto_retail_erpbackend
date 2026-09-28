@@ -99,8 +99,7 @@ class Device(Base):
     store_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("stores.id"), nullable=False)
     code: Mapped[str] = mapped_column(String, nullable=False)
     fingerprint: Mapped[str] = mapped_column(String, unique=True, nullable=False)
-    status: Mapped[str] = mapped_column(String, default="pending")
-    activation_code: Mapped[str | None] = mapped_column(String)
+    status: Mapped[str] = mapped_column(String, default="active")
     last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
