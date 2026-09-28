@@ -4,7 +4,7 @@ HR/workforce, enterprise scalability support tables. Additive to Phase 1 + Phase
 import uuid
 from datetime import date, datetime
 
-from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Numeric, String, Text, UniqueConstraint, func
+from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Integer, Numeric, String, Text, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -81,7 +81,24 @@ class Campaign(Base):
     name: Mapped[str] = mapped_column(String, nullable=False)
     channel: Mapped[str] = mapped_column(String, nullable=False)  # whatsapp, sms, push, email
     segment_query: Mapped[dict] = mapped_column(JSONB, nullable=False)  # audience builder criteria
-    status: Mapped[str] = mapped_column(String, default="draft")
+    # WhatsApp marketing sends outside the 24h service window must use a
+    # pre-approved Meta message template — created in Business Manager, only
+    # referenced by name here.
+    template_name: Mapped[str | None] = mapped_column(String)
+    status: Mapped[str] = mapped_column(String, default="draft")  # draft, sending, sent, failed
+    sent_count: Mapped[int] = mapped_column(Integer, default=0)
+    failed_count: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class CampaignRecipient(Base):
+    __tablename__ = "campaign_recipients"
+    id: Mapped[uuid.UUID] = uuid_pk()
+    campaign_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("campaigns.id", ondelete="CASCADE"), nullable=False)
+    customer_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("customers.id"), nullable=False)
+    status: Mapped[str] = mapped_column(String, nullable=False)  # sent, failed, skipped_no_consent
+    provider_message_id: Mapped[str | None] = mapped_column(String)
+    error: Mapped[str | None] = mapped_column(String)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 

@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import CurrentUser, require_permission
 from app.core.database import get_db
 from app.models.models_phase3 import Campaign
-from app.schemas.schemas_phase3 import CampaignCreate, CampaignOut, ConsentUpdate
+from app.schemas.schemas_phase3 import CampaignCreate, CampaignOut, CampaignSendResult, ConsentUpdate
 from app.services import crm as crm_service
 
 router = APIRouter(prefix="/crm", tags=["crm"])
@@ -66,8 +66,21 @@ async def create_campaign(
     """Audience is defined via segment_query (consumed by the messaging integration
     layer, e.g. WhatsApp/SMS/email provider) — consent is enforced by crm_service
     joining against customer_consent before any send, not at campaign creation."""
-    campaign = Campaign(name=payload.name, channel=payload.channel, segment_query=payload.segment_query)
+    campaign = Campaign(
+        name=payload.name, channel=payload.channel, segment_query=payload.segment_query, template_name=payload.template_name
+    )
     db.add(campaign)
     await db.commit()
     await db.refresh(campaign)
     return {"campaign_id": str(campaign.id)}
+
+
+@router.post("/campaigns/{campaign_id}/send", response_model=CampaignSendResult)
+async def send_campaign(
+    campaign_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    _current: CurrentUser = Depends(require_permission("report.export")),
+) -> dict:
+    """WhatsApp only for now — see app/services/crm.send_campaign for why
+    every other channel is refused rather than pretending to send."""
+    return await crm_service.send_campaign(db, campaign_id=campaign_id)

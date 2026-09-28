@@ -83,6 +83,7 @@ class CampaignCreate(BaseModel):
     name: str
     channel: str
     segment_query: dict
+    template_name: str | None = None
 
 
 class CampaignOut(BaseModel):
@@ -91,8 +92,18 @@ class CampaignOut(BaseModel):
     name: str
     channel: str
     segment_query: dict
+    template_name: str | None
     status: str
+    sent_count: int
+    failed_count: int
     created_at: datetime
+
+
+class CampaignSendResult(BaseModel):
+    status: str
+    sent_count: int
+    failed_count: int
+    skipped_no_consent: int
 
 
 # ---------------------------------------------------------------------------

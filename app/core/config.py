@@ -21,6 +21,12 @@ class Settings(BaseSettings):
     razorpay_key_secret: str = ""
     razorpay_webhook_secret: str = ""
 
+    # WhatsApp Business Cloud API (Meta) — left blank in dev; campaign sending
+    # reports "not configured" and refuses to send until these are set.
+    whatsapp_phone_number_id: str = ""
+    whatsapp_access_token: str = ""
+    whatsapp_api_version: str = "v21.0"
+
     cors_origins: str = "http://localhost:5173"
     environment: str = "development"
 
