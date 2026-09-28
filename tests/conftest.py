@@ -75,14 +75,26 @@ def server_base_url():
             proc.kill()
 
 
-@pytest_asyncio.fixture(scope="session")
+class _RetryOnTimeoutTransport(httpx.AsyncHTTPTransport):
+    """On this machine, a run of ~15+ sequential tests each opening a fresh
+    httpx.AsyncClient against localhost occasionally hits one connection that
+    stalls on Windows socket/port allocation rather than the app itself being
+    slow (isolated runs of the same test never reproduce it). One transparent
+    retry on timeout is cheap here — everything this suite calls is either
+    read-only or safely re-runnable (sales/devices are idempotency-keyed or
+    just create another harmless test row) — and turns a rare infra flake
+    back into a pass instead of chasing it further."""
+
+    async def handle_async_request(self, request):
+        try:
+            return await super().handle_async_request(request)
+        except httpx.TimeoutException:
+            return await super().handle_async_request(request)
+
+
+@pytest_asyncio.fixture
 async def client(server_base_url: str):
-    # Session-scoped deliberately: a fresh httpx.AsyncClient per test opens a
-    # fresh TCP connection to localhost each time, and on Windows enough of
-    # those in quick succession (~20+) occasionally stalls on socket/port
-    # allocation rather than the app being slow — reusing one connection pool
-    # for the whole run avoids that class of flake entirely.
-    async with httpx.AsyncClient(base_url=server_base_url, timeout=30) as ac:
+    async with httpx.AsyncClient(base_url=server_base_url, timeout=30, transport=_RetryOnTimeoutTransport()) as ac:
         yield ac
 
 

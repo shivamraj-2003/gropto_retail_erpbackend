@@ -77,10 +77,11 @@ async def test_two_devices_selling_same_sku_offline_both_apply_stock_falls_by_su
     # device flow (not a DB shortcut): a Super Admin registers it, one-click
     # approves it (no activation code to relay anywhere), then the store's
     # cashier logs in on it — exactly what a brand-new physical till does.
-    second_fingerprint = f"pytest-second-till-{uuid.uuid4().hex[:8]}"
+    suffix = uuid.uuid4().hex[:8]
+    second_fingerprint = f"pytest-second-till-{suffix}"
     register_resp = await client.post(
         "/api/v1/auth/devices/register",
-        params={"store_id": store_id, "code": "PYTEST-TILL2", "fingerprint": second_fingerprint},
+        params={"store_id": store_id, "code": f"PYTEST-TILL2-{suffix}", "fingerprint": second_fingerprint},
         headers=super_headers,
     )
     assert register_resp.status_code == 201
