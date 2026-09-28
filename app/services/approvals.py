@@ -74,6 +74,7 @@ async def submit_or_apply(
             entity_id=entity_id,
             new_value=new_value,
             approval_id=request.id,
+            reason=reason,
         )
     return request
 
@@ -105,6 +106,7 @@ async def decide(
             entity_type=request.entity_type,
             entity_id=request.entity_id,
             approval_id=request.id,
+            reason=note,
         )
     return request
 
@@ -128,6 +130,7 @@ async def _apply(db: AsyncSession, request: ApprovalRequest, *, approver_id: uui
         old_value=request.old_value,
         new_value=request.new_value,
         approval_id=request.id,
+        reason=request.reason,
     )
 
 

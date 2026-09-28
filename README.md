@@ -124,8 +124,11 @@ backend/
    ```
    POST /api/v1/auth/login
    { "email": "admin@gropto.local", "password": "ChangeMe!123",
-     "device_fingerprint": "seed-bootstrap-device", "device_activation_code": "<from seed output>" }
+     "device_fingerprint": "seed-bootstrap-device" }
    ```
+   (The seed script's bootstrap device is created already-active — no approval step needed for
+   that one specific device. Every device after it goes through the pending → approve flow
+   below.)
 
 ## Dev/pilot login credentials
 
@@ -141,10 +144,39 @@ users by hand.
 | Store Manager | `manager@gropto.local` | `Test@123` |
 | Cashier | `cashier@gropto.local` | `Test@123` |
 
-Every login also needs a registered device (`device_fingerprint` + a one-time
-`device_activation_code` from a Super Admin on first use — see `POST /auth/devices/register`).
-The Electron frontend generates and remembers its own device fingerprint automatically; these
-credentials alone are not enough to call the API directly without also registering a device.
+Every login also needs an **approved** device. There is no activation code anywhere in this
+flow — a device that has never logged in before is recorded as `pending` automatically on its
+first login attempt (still refused with 403 until approved, so this changes nothing about the
+security guarantee), and a Super Admin approves it with one click: `GET /auth/devices` lists
+pending devices, `POST /auth/devices/{id}/approve` approves one. `POST /auth/devices/register`
+still exists for pre-registering a device before it ever shows up (also no code — same one-click
+`approve` call finishes it). The Electron frontend generates and remembers its own device
+fingerprint automatically; these credentials alone are not enough to call the API directly
+without an approved device.
+
+## Audit trail (edit log)
+
+Every sensitive write across every module (17 call sites at last count — products, inventory,
+approvals, HR, cash, transfers, procurement, returns, auth, loyalty, discounts, devices, ...)
+already wrote to the append-only `audit_log` table via `app/services/audit.py`'s `write_audit()`
+— immutable at the database grant level (`REVOKE UPDATE, DELETE`), not just app logic.
+`app/api/v1/audit.py` adds a filtered, permission-gated (`audit.view`, granted to Super Admin
+and Admin) read API over it, store-scoped like every other list endpoint for non-Super-Admin
+callers:
+
+- `GET /audit/entries` — filter by `entity_type`, `action`, `user_id`, `store_id`, `date_from`,
+  `date_to`; paginated.
+- `GET /audit/entity/{entity_type}/{entity_id}` — the full, ordered version history for one
+  record (`entity_version` 1, 2, 3, ...), the before-vs-after comparison for every change to
+  that one thing over its whole lifetime.
+- `GET /audit/actions` — distinct actions that have actually occurred, for a filter dropdown.
+- `GET /audit/export` — same filters, streamed as an .xlsx.
+
+Each row records who (`user_id`, `role_code`), where (`store_id`, `device_id`, `ip_address` —
+captured once per request in `main.py`'s middleware via a contextvar, not threaded through
+every call site), what (`action`, `entity_type`, `entity_id`, `entity_version`), the change
+itself (`old_value`, `new_value` as JSON), and why (`reason`, populated wherever the caller gave
+one — e.g. every approval-engine request/decision).
 
 ## Making future schema changes
 

@@ -21,6 +21,26 @@ class TokenResponse(BaseModel):
     token_type: str = "bearer"
 
 
+class AuditEntryOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: uuid.UUID
+    user_id: uuid.UUID | None
+    role_code: str | None
+    store_id: uuid.UUID | None
+    device_id: uuid.UUID | None
+    ip_address: str | None
+    action: str
+    entity_type: str
+    entity_id: uuid.UUID | None
+    entity_version: int | None
+    old_value: dict | None
+    new_value: dict | None
+    reason: str | None
+    source: str
+    approval_id: uuid.UUID | None
+    created_at: datetime
+
+
 class DeviceOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: uuid.UUID
@@ -132,6 +152,29 @@ class PaymentIn(BaseModel):
     mode: str
     amount: float
     reference: str | None = None
+
+
+class RazorpayOrderRequest(BaseModel):
+    amount: float
+    receipt: str
+
+
+class RazorpayOrderOut(BaseModel):
+    order_id: str
+    amount: int
+    currency: str
+    key_id: str
+
+
+class RazorpayVerifyRequest(BaseModel):
+    razorpay_order_id: str
+    razorpay_payment_id: str
+    razorpay_signature: str
+
+
+class PaymentConfigOut(BaseModel):
+    enabled: bool
+    key_id: str | None = None
 
 
 class SaleIn(BaseModel):

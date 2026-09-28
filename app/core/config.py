@@ -15,6 +15,12 @@ class Settings(BaseSettings):
     ai_provider_base_url: str = ""
     ai_daily_call_cap: int = 200
 
+    # Razorpay — left blank in dev; when unset the payments API reports the
+    # gateway as unconfigured and the POS falls back to quick-tender buttons.
+    razorpay_key_id: str = ""
+    razorpay_key_secret: str = ""
+    razorpay_webhook_secret: str = ""
+
     cors_origins: str = "http://localhost:5173"
     environment: str = "development"
 

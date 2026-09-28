@@ -63,6 +63,58 @@ async def store_dashboard(
     }
 
 
+@router.get("/store/{store_id}/trend")
+async def store_sales_trend(
+    store_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(require_permission("report.export")),
+) -> dict:
+    """Last 14 days of revenue + a top-10 products-by-revenue breakdown —
+    backs the dashboard charts and answers "where sales are highest/lowest"
+    at a glance without an Excel round trip."""
+    require_store_access(store_id, current)
+    daily = (
+        await db.execute(
+            text(
+                """
+                select billed_at::date as day, coalesce(sum(grand_total), 0) as revenue, count(*) as bills
+                from sales
+                where store_id = :store_id and status = 'completed'
+                  and billed_at >= current_date - interval '13 days'
+                group by billed_at::date
+                order by billed_at::date
+                """
+            ),
+            {"store_id": str(store_id)},
+        )
+    ).all()
+
+    top_products = (
+        await db.execute(
+            text(
+                """
+                select si.product_name_snapshot as name,
+                       sum(si.quantity) as units,
+                       sum(si.line_total) as revenue
+                from sale_items si
+                join sales s on s.id = si.sale_id
+                where s.store_id = :store_id and s.status = 'completed'
+                  and s.billed_at >= current_date - interval '13 days'
+                group by si.product_name_snapshot
+                order by revenue desc
+                limit 10
+                """
+            ),
+            {"store_id": str(store_id)},
+        )
+    ).all()
+
+    return {
+        "daily": [{"day": str(r.day), "revenue": float(r.revenue), "bills": int(r.bills)} for r in daily],
+        "top_products": [{"name": r.name, "units": float(r.units), "revenue": float(r.revenue)} for r in top_products],
+    }
+
+
 @router.get("/company")
 async def company_dashboard(
     db: AsyncSession = Depends(get_db),
