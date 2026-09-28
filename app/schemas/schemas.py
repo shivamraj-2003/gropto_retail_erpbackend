@@ -66,6 +66,12 @@ class ForgotPasswordIn(BaseModel):
     email: str
 
 
+class ResetPasswordWithOtpIn(BaseModel):
+    email: str
+    otp: str
+    new_password: str = Field(min_length=6)
+
+
 class ResetPasswordIn(BaseModel):
     new_password: str = Field(min_length=6)
 

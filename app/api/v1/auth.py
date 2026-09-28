@@ -1,6 +1,6 @@
 import secrets
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
@@ -16,18 +16,22 @@ from app.core.security import (
     refresh_token_expiry,
     verify_password,
 )
-from app.models.models import Device, RefreshToken, Role, Store, User, UserStore
+from app.models.models import Device, PasswordResetOtp, RefreshToken, Role, Store, User, UserStore
 from app.schemas.schemas import (
     ChangePasswordIn,
     DeviceOut,
     ForgotPasswordIn,
     LoginRequest,
     RefreshRequest,
+    ResetPasswordWithOtpIn,
     StoreCredentialRow,
     TokenResponse,
 )
+from app.services import email as email_service
 from app.services.audit import write_audit
 from app.services.rate_limit import is_login_locked, record_login_failure, record_login_success
+
+OTP_EXPIRY_MINUTES = 10
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -211,15 +215,51 @@ async def change_password(
 
 @router.post("/forgot-password", status_code=200)
 async def forgot_password(payload: ForgotPasswordIn, db: AsyncSession = Depends(get_db)) -> dict:
-    """No email/SMS delivery is configured in this deployment, so this can't
-    send a reset link — what it CAN safely do is flag the request so an
-    Admin/Super Admin sees it (Audit Trail, action=auth.forgot_password_requested)
-    and resets the password directly (POST /users/{id}/reset-password), then
-    relays it to the account holder. Always returns the same generic message
-    regardless of whether the email exists, so this can't be used to enumerate
-    accounts."""
+    """When Resend is configured (RESEND_API_KEY in .env), this emails a
+    6-digit OTP the account holder submits to POST /auth/reset-password-with-otp
+    to set their own new password — fully self-service. Without it, this
+    falls back to flagging the request so an Admin/Super Admin sees it and
+    resets the password directly (POST /users/{id}/reset-password). Always
+    returns the same generic message regardless of whether the email exists,
+    so this can't be used to enumerate accounts."""
     stmt = select(User).where(User.email == payload.email)
     user = (await db.execute(stmt)).scalar_one_or_none()
+
+    if user is not None and email_service.is_configured():
+        # Invalidate any still-live OTPs from an earlier request so only the
+        # newest code works.
+        await db.execute(
+            PasswordResetOtp.__table__.update()
+            .where(PasswordResetOtp.user_id == user.id, PasswordResetOtp.used.is_(False))
+            .values(used=True)
+        )
+        code = f"{secrets.randbelow(1_000_000):06d}"
+        db.add(
+            PasswordResetOtp(
+                user_id=user.id,
+                code_hash=hash_password(code),
+                expires_at=datetime.now(timezone.utc) + timedelta(minutes=OTP_EXPIRY_MINUTES),
+            )
+        )
+        await email_service.send_email(
+            payload.email,
+            "Your Gropto ERP password reset code",
+            f"<p>Your verification code is <strong>{code}</strong>. It expires in {OTP_EXPIRY_MINUTES} minutes.</p>"
+            "<p>If you didn't request this, you can ignore this email.</p>",
+        )
+        await write_audit(
+            db,
+            user_id=user.id,
+            role_code=None,
+            store_id=None,
+            device_id=None,
+            action="auth.forgot_password_otp_sent",
+            entity_type="user",
+            entity_id=user.id,
+        )
+        await db.commit()
+        return {"message": "If that account exists, a verification code has been emailed to it.", "otp_sent": True}
+
     if user is not None:
         await write_audit(
             db,
@@ -232,7 +272,55 @@ async def forgot_password(payload: ForgotPasswordIn, db: AsyncSession = Depends(
             entity_id=user.id,
         )
         await db.commit()
-    return {"message": "If that account exists, your store's Admin or Super Admin has been notified to reset your password."}
+    return {
+        "message": "If that account exists, your store's Admin or Super Admin has been notified to reset your password.",
+        "otp_sent": False,
+    }
+
+
+@router.post("/reset-password-with-otp", status_code=204)
+async def reset_password_with_otp(payload: ResetPasswordWithOtpIn, db: AsyncSession = Depends(get_db)) -> None:
+    remaining = is_login_locked(payload.email, "otp-reset")
+    if remaining is not None:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"Too many attempts. Try again in {int(remaining // 60) + 1} minute(s).",
+        )
+
+    stmt = select(User).where(User.email == payload.email)
+    user = (await db.execute(stmt)).scalar_one_or_none()
+    if user is None:
+        record_login_failure(payload.email, "otp-reset")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid or expired code")
+
+    otp_stmt = select(PasswordResetOtp).where(
+        PasswordResetOtp.user_id == user.id,
+        PasswordResetOtp.used.is_(False),
+        PasswordResetOtp.expires_at > datetime.now(timezone.utc),
+    )
+    candidates = (await db.execute(otp_stmt)).scalars().all()
+    match = next((c for c in candidates if verify_password(payload.otp, c.code_hash)), None)
+    if match is None:
+        record_login_failure(payload.email, "otp-reset")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid or expired code")
+
+    record_login_success(payload.email, "otp-reset")
+    match.used = True
+    user.password_hash = hash_password(payload.new_password)
+    await db.execute(
+        RefreshToken.__table__.update().where(RefreshToken.user_id == user.id).values(revoked=True)
+    )
+    await write_audit(
+        db,
+        user_id=user.id,
+        role_code=None,
+        store_id=None,
+        device_id=None,
+        action="user.password_reset_via_otp",
+        entity_type="user",
+        entity_id=user.id,
+    )
+    await db.commit()
 
 
 @router.post("/devices/register", status_code=201)
