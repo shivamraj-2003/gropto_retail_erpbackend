@@ -71,3 +71,22 @@ def require_permission(permission_code: str):
 def require_store_access(store_id: uuid.UUID, current: CurrentUser) -> None:
     if not current.owns_store(store_id):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized for this store")
+
+
+async def require_super_admin(current: CurrentUser = Depends(get_current_user)) -> CurrentUser:
+    """A small number of actions are Super-Admin-only regardless of what
+    permission grants exist — reserved for things an Admin must never do
+    even via the approval queue."""
+    if current.role_code != "super_admin":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Super Admin only")
+    return current
+
+
+async def require_admin_or_super(current: CurrentUser = Depends(get_current_user)) -> CurrentUser:
+    """Both can call the endpoint; submit_or_apply decides what happens next —
+    Super Admin's call applies immediately, Admin's queues for approval. Used
+    for store onboarding/edits: a franchise's Admin can propose a new store
+    or edit an existing one, but Shivam (Super Admin) signs off on it."""
+    if current.role_code not in ("super_admin", "admin"):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin or Super Admin only")
+    return current

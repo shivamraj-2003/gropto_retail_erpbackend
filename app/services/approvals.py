@@ -270,6 +270,42 @@ async def _handle_user_create(db: AsyncSession, request: ApprovalRequest) -> Non
         db.add(UserStore(user_id=user.id, store_id=uuid.UUID(store_id)))
 
 
+@register_handler("store_create")
+async def _handle_store_create(db: AsyncSession, request: ApprovalRequest) -> None:
+    """Same shape as user_create: Super Admin's call applies right away,
+    Admin's queues and this handler runs once approved. Rechecks the code
+    isn't taken at apply time too, not just at submission — closes the race
+    where two requests for the same code are both still pending."""
+    from app.models.models import Store
+
+    payload = request.new_value
+    existing = await db.execute(select(Store).where(Store.code == payload["code"]))
+    if existing.scalar_one_or_none() is not None:
+        request.status = "rejected"
+        return
+    store = Store(
+        id=uuid.UUID(payload["store_id"]),
+        code=payload["code"],
+        name=payload["name"],
+        city=payload.get("city"),
+        cluster=payload.get("cluster"),
+    )
+    db.add(store)
+
+
+@register_handler("store_update")
+async def _handle_store_update(db: AsyncSession, request: ApprovalRequest) -> None:
+    from app.models.models import Store
+
+    store = await db.get(Store, request.entity_id)
+    if store is None:
+        request.status = "stale"
+        return
+    for field in ("name", "city", "cluster"):
+        if field in request.new_value:
+            setattr(store, field, request.new_value[field])
+
+
 @register_handler("config_change")
 async def _handle_config_change_noop(db: AsyncSession, request: ApprovalRequest) -> None:
     """Generic configuration changes are recorded via audit only in Phase 1;

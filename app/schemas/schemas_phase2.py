@@ -208,6 +208,34 @@ class StoreOut(BaseModel):
     cluster: str | None
 
 
+class StoreCreateIn(BaseModel):
+    code: str
+    name: str
+    city: str | None = None
+    cluster: str | None = None
+
+
+class StoreCreateResult(BaseModel):
+    status: str  # "created" | "pending_approval"
+    store_id: uuid.UUID | None = None
+    request_id: uuid.UUID | None = None
+
+
+class StoreUpdateIn(BaseModel):
+    """Code is deliberately not editable here — it's baked into every bill
+    number a store's tills have already generated (storeCode-deviceCode-seq),
+    so changing it after the fact would make historical bill numbers
+    inconsistent with new ones."""
+    name: str | None = None
+    city: str | None = None
+    cluster: str | None = None
+
+
+class StoreUpdateResult(BaseModel):
+    status: str  # "updated" | "pending_approval"
+    request_id: uuid.UUID | None = None
+
+
 class GrnOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: uuid.UUID
