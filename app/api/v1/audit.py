@@ -12,13 +12,13 @@ from datetime import datetime
 from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
 from openpyxl import Workbook
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser, require_permission
 from app.core.database import get_db
 from app.models.models import AuditLog
-from app.schemas.schemas import AuditEntryOut
+from app.schemas.schemas import AuditEntriesPage, AuditEntryOut
 
 router = APIRouter(prefix="/audit", tags=["audit"])
 
@@ -46,7 +46,7 @@ def _scoped_query(current: CurrentUser, *, entity_type: str | None, action: str 
     return stmt
 
 
-@router.get("/entries", response_model=list[AuditEntryOut])
+@router.get("/entries", response_model=AuditEntriesPage)
 async def list_entries(
     entity_type: str | None = None,
     action: str | None = None,
@@ -54,18 +54,20 @@ async def list_entries(
     store_id: uuid.UUID | None = None,
     date_from: datetime | None = None,
     date_to: datetime | None = None,
-    limit: int = 200,
+    limit: int = 20,
     offset: int = 0,
     db: AsyncSession = Depends(get_db),
     current: CurrentUser = Depends(require_permission("audit.view")),
-) -> list[AuditLog]:
-    stmt = _scoped_query(
+) -> AuditEntriesPage:
+    base_stmt = _scoped_query(
         current, entity_type=entity_type, action=action, user_id=user_id, store_id=store_id,
         date_from=date_from, date_to=date_to,
     )
-    stmt = stmt.order_by(AuditLog.created_at.desc()).limit(min(limit, 1000)).offset(offset)
+    capped_limit = min(limit, 1000)
+    total = (await db.execute(select(func.count()).select_from(base_stmt.subquery()))).scalar_one()
+    stmt = base_stmt.order_by(AuditLog.created_at.desc()).limit(capped_limit).offset(offset)
     result = await db.execute(stmt)
-    return list(result.scalars().all())
+    return AuditEntriesPage(items=list(result.scalars().all()), total=total, limit=capped_limit, offset=offset)
 
 
 @router.get("/entity/{entity_type}/{entity_id}", response_model=list[AuditEntryOut])

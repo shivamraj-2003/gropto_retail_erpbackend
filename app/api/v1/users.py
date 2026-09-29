@@ -1,14 +1,14 @@
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser, require_permission
 from app.core.database import get_db
 from app.core.security import hash_password
 from app.models.models import Role, User, UserStore
-from app.schemas.schemas import ASSIGNABLE_ROLES, ResetPasswordIn, UserCreateIn, UserCreateResult, UserOut
+from app.schemas.schemas import ASSIGNABLE_ROLES, ResetPasswordIn, UserCreateIn, UserCreateResult, UserOut, UsersPage
 from app.services.approvals import submit_or_apply
 
 router = APIRouter(prefix="/users", tags=["users"])
@@ -28,16 +28,23 @@ async def _to_user_out(db: AsyncSession, user: User, role_code: str) -> UserOut:
     )
 
 
-@router.get("", response_model=list[UserOut])
+@router.get("", response_model=UsersPage)
 async def list_users(
+    limit: int = 20,
+    offset: int = 0,
     current: CurrentUser = Depends(require_permission("user.manage")),
     db: AsyncSession = Depends(get_db),
-) -> list[UserOut]:
+) -> UsersPage:
     stmt = select(User, Role.code).join(Role, Role.id == User.role_id)
     if current.role_code != "super_admin":
         stmt = stmt.join(UserStore, UserStore.user_id == User.id).where(UserStore.store_id.in_(current.store_ids)).distinct()
-    result = await db.execute(stmt.order_by(User.created_at.desc()))
-    return [await _to_user_out(db, user, role_code) for user, role_code in result.all()]
+
+    capped_limit = min(limit, 500)
+    total = (await db.execute(select(func.count()).select_from(stmt.subquery()))).scalar_one()
+    paged_stmt = stmt.order_by(User.created_at.desc()).limit(capped_limit).offset(offset)
+    result = await db.execute(paged_stmt)
+    items = [await _to_user_out(db, user, role_code) for user, role_code in result.all()]
+    return UsersPage(items=items, total=total, limit=capped_limit, offset=offset)
 
 
 @router.post("", response_model=UserCreateResult, status_code=201)

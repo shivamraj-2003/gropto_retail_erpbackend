@@ -1,12 +1,13 @@
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser, require_permission
 from app.core.database import get_db
 from app.models.models_phase3 import Order
+from app.schemas.schemas import Page
 from app.schemas.schemas_phase3 import (
     OrderCreate,
     OrderDeliverRequest,
@@ -27,13 +28,15 @@ async def _get_order(db: AsyncSession, order_id: uuid.UUID) -> Order:
     return order
 
 
-@router.get("", response_model=list[OrderOut])
+@router.get("", response_model=Page[OrderOut])
 async def list_orders(
     status_filter: str | None = None,
     store_id: uuid.UUID | None = None,
+    limit: int = 20,
+    offset: int = 0,
     db: AsyncSession = Depends(get_db),
     _current: CurrentUser = Depends(require_permission("sale.create")),
-) -> list[Order]:
+) -> Page[OrderOut]:
     """The order queue: every online order, optionally filtered by status/store —
     the packer/dispatcher screen's main list."""
     stmt = select(Order)
@@ -41,8 +44,10 @@ async def list_orders(
         stmt = stmt.where(Order.status == status_filter)
     if store_id:
         stmt = stmt.where(Order.allocated_store_id == store_id)
-    result = await db.execute(stmt.order_by(Order.created_at.desc()).limit(200))
-    return list(result.scalars().all())
+    capped_limit = min(limit, 200)
+    total = (await db.execute(select(func.count()).select_from(stmt.subquery()))).scalar_one()
+    result = await db.execute(stmt.order_by(Order.created_at.desc()).limit(capped_limit).offset(offset))
+    return Page(items=list(result.scalars().all()), total=total, limit=capped_limit, offset=offset)
 
 
 @router.get("/{order_id}", response_model=OrderDetailOut)

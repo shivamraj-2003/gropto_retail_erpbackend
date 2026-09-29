@@ -21,7 +21,9 @@ async def test_super_admin_sees_audit_entries_and_they_have_ip_and_version(
     headers = auth_headers(super_admin_token)
     resp = await client.get("/api/v1/audit/entries", params={"limit": 5}, headers=headers)
     assert resp.status_code == 200
-    entries = resp.json()
+    page = resp.json()
+    assert page["total"] >= 1
+    entries = page["items"]
     assert entries, "expected at least one audit row (this very login already wrote one)"
     login_row = next((e for e in entries if e["action"] == "auth.login"), None)
     assert login_row is not None
@@ -81,7 +83,7 @@ async def test_admin_audit_view_is_scoped_to_their_own_stores(client: AsyncClien
     # admin actually has) via the one non-Super-Admin role that can call it.
     headers = auth_headers(admin_token)
     me = (await client.get("/api/v1/auth/me", headers=headers)).json()
-    entries = (await client.get("/api/v1/audit/entries", params={"limit": 50}, headers=headers)).json()
+    entries = (await client.get("/api/v1/audit/entries", params={"limit": 50}, headers=headers)).json()["items"]
     for e in entries:
         assert e["store_id"] is None or e["store_id"] in me["stores"]
 

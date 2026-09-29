@@ -29,7 +29,7 @@ async def test_super_admin_sees_the_new_device_already_active(client: AsyncClien
 
     await client.post("/api/v1/auth/login", json={"email": email, "password": password, "device_fingerprint": fingerprint})
 
-    devices = (await client.get("/api/v1/auth/devices", params={"status_filter": "active"}, headers=super_headers)).json()
+    devices = (await client.get("/api/v1/auth/devices", params={"status_filter": "active"}, headers=super_headers)).json()["items"]
     match = next((d for d in devices if d["fingerprint"] == fingerprint), None)
     assert match is not None, "the device that just logged in must appear in the device list, already active"
     assert match["status"] == "active"
@@ -41,7 +41,7 @@ async def test_revoked_device_is_refused_on_next_login(client: AsyncClient, supe
     super_headers = auth_headers(super_admin_token)
 
     await client.post("/api/v1/auth/login", json={"email": email, "password": password, "device_fingerprint": fingerprint})
-    devices = (await client.get("/api/v1/auth/devices", params={"status_filter": "active"}, headers=super_headers)).json()
+    devices = (await client.get("/api/v1/auth/devices", params={"status_filter": "active"}, headers=super_headers)).json()["items"]
     match = next(d for d in devices if d["fingerprint"] == fingerprint)
 
     revoke_resp = await client.post(f"/api/v1/auth/devices/{match['id']}/revoke", headers=super_headers)

@@ -1,13 +1,14 @@
 import uuid
 
 from fastapi import APIRouter, Depends
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser, require_permission, require_store_access
 from app.core.database import get_db
 from app.models.models_phase2 import FraudAlert, ReorderPoint
+from app.schemas.schemas import Page
 from app.schemas.schemas_phase2 import ExpenseCreate, FraudAlertOut, ReorderPointSet
 from app.services import finance as finance_service
 from app.services import fraud as fraud_service
@@ -100,11 +101,16 @@ async def run_scan(
     return alerts
 
 
-@router.get("/fraud/alerts", response_model=list[FraudAlertOut])
+@router.get("/fraud/alerts", response_model=Page[FraudAlertOut])
 async def list_alerts(
     status_filter: str = "open",
+    limit: int = 20,
+    offset: int = 0,
     db: AsyncSession = Depends(get_db),
     _current: CurrentUser = Depends(require_permission("approval.decide")),
-) -> list[FraudAlert]:
-    result = await db.execute(select(FraudAlert).where(FraudAlert.status == status_filter).order_by(FraudAlert.created_at.desc()))
-    return list(result.scalars().all())
+) -> Page[FraudAlertOut]:
+    stmt = select(FraudAlert).where(FraudAlert.status == status_filter)
+    capped_limit = min(limit, 200)
+    total = (await db.execute(select(func.count()).select_from(stmt.subquery()))).scalar_one()
+    result = await db.execute(stmt.order_by(FraudAlert.created_at.desc()).limit(capped_limit).offset(offset))
+    return Page(items=list(result.scalars().all()), total=total, limit=capped_limit, offset=offset)

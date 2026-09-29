@@ -1,12 +1,13 @@
 import uuid
 
 from fastapi import APIRouter, Depends
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser, require_permission, require_store_access
 from app.core.database import get_db
 from app.models.models_phase2 import Grn, PurchaseOrder, PurchaseRequisition
+from app.schemas.schemas import Page
 from app.schemas.schemas_phase2 import (
     GrnCreate,
     GrnOut,
@@ -20,20 +21,24 @@ from app.services import procurement as procurement_service
 router = APIRouter(prefix="/procurement", tags=["procurement"])
 
 
-@router.get("/requisitions", response_model=list[RequisitionOut])
+@router.get("/requisitions", response_model=Page[RequisitionOut])
 async def list_requisitions(
     store_id: uuid.UUID | None = None,
+    limit: int = 20,
+    offset: int = 0,
     db: AsyncSession = Depends(get_db),
     current: CurrentUser = Depends(require_permission("purchase.manage")),
-) -> list[PurchaseRequisition]:
+) -> Page[RequisitionOut]:
     stmt = select(PurchaseRequisition)
     if current.role_code != "super_admin":
         stmt = stmt.where(PurchaseRequisition.store_id.in_(current.store_ids))
     if store_id:
         require_store_access(store_id, current)
         stmt = stmt.where(PurchaseRequisition.store_id == store_id)
-    result = await db.execute(stmt.order_by(PurchaseRequisition.created_at.desc()).limit(200))
-    return list(result.scalars().all())
+    capped_limit = min(limit, 200)
+    total = (await db.execute(select(func.count()).select_from(stmt.subquery()))).scalar_one()
+    result = await db.execute(stmt.order_by(PurchaseRequisition.created_at.desc()).limit(capped_limit).offset(offset))
+    return Page(items=list(result.scalars().all()), total=total, limit=capped_limit, offset=offset)
 
 
 @router.post("/requisitions", status_code=201)
@@ -48,17 +53,21 @@ async def create_requisition(
     return {"requisition_id": str(req.id)}
 
 
-@router.get("/purchase-orders", response_model=list[PurchaseOrderOut])
+@router.get("/purchase-orders", response_model=Page[PurchaseOrderOut])
 async def list_purchase_orders(
     status_filter: str | None = None,
+    limit: int = 20,
+    offset: int = 0,
     db: AsyncSession = Depends(get_db),
     _current: CurrentUser = Depends(require_permission("purchase.manage")),
-) -> list[PurchaseOrder]:
+) -> Page[PurchaseOrderOut]:
     stmt = select(PurchaseOrder)
     if status_filter:
         stmt = stmt.where(PurchaseOrder.status == status_filter)
-    result = await db.execute(stmt.order_by(PurchaseOrder.created_at.desc()).limit(200))
-    return list(result.scalars().all())
+    capped_limit = min(limit, 200)
+    total = (await db.execute(select(func.count()).select_from(stmt.subquery()))).scalar_one()
+    result = await db.execute(stmt.order_by(PurchaseOrder.created_at.desc()).limit(capped_limit).offset(offset))
+    return Page(items=list(result.scalars().all()), total=total, limit=capped_limit, offset=offset)
 
 
 @router.post("/purchase-orders", status_code=201)
@@ -72,13 +81,18 @@ async def create_purchase_order(
     return {"purchase_order_id": str(po.id), "status": po.status}
 
 
-@router.get("/grn", response_model=list[GrnOut])
+@router.get("/grn", response_model=Page[GrnOut])
 async def list_grns(
+    limit: int = 20,
+    offset: int = 0,
     db: AsyncSession = Depends(get_db),
     _current: CurrentUser = Depends(require_permission("purchase.manage")),
-) -> list[Grn]:
-    result = await db.execute(select(Grn).order_by(Grn.created_at.desc()).limit(200))
-    return list(result.scalars().all())
+) -> Page[GrnOut]:
+    stmt = select(Grn)
+    capped_limit = min(limit, 200)
+    total = (await db.execute(select(func.count()).select_from(stmt.subquery()))).scalar_one()
+    result = await db.execute(stmt.order_by(Grn.created_at.desc()).limit(capped_limit).offset(offset))
+    return Page(items=list(result.scalars().all()), total=total, limit=capped_limit, offset=offset)
 
 
 @router.post("/grn", status_code=201)

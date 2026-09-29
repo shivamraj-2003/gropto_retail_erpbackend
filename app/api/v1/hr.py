@@ -1,13 +1,14 @@
 import uuid
 
 from fastapi import APIRouter, Depends
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser, require_permission, require_store_access
 from app.core.database import get_db
 from app.models.models_phase3 import Attendance, Employee, Shift
+from app.schemas.schemas import Page
 from app.schemas.schemas_phase3 import AttendanceMark, AttendanceOut, EmployeeCreate, EmployeeOut, ShiftCreate, ShiftOut
 from app.services.audit import write_audit
 
@@ -94,14 +95,20 @@ async def mark_attendance(
     return {"status": "ok"}
 
 
-@router.get("/attendance", response_model=list[AttendanceOut])
+@router.get("/attendance", response_model=Page[AttendanceOut])
 async def list_attendance(
     employee_id: uuid.UUID,
+    limit: int = 20,
+    offset: int = 0,
     db: AsyncSession = Depends(get_db),
     _current: CurrentUser = Depends(require_permission("user.manage")),
-) -> list[Attendance]:
-    result = await db.execute(
-        select(Attendance).where(Attendance.employee_id == employee_id).order_by(Attendance.attendance_date.desc())
-    )
+) -> Page[AttendanceOut]:
+    stmt = select(Attendance).where(Attendance.employee_id == employee_id)
+    capped_limit = min(limit, 200)
+    total = (await db.execute(select(func.count()).select_from(stmt.subquery()))).scalar_one()
+    result = await db.execute(stmt.order_by(Attendance.attendance_date.desc()).limit(capped_limit).offset(offset))
     rows = list(result.scalars().all())
-    return [AttendanceOut(date=a.attendance_date, status=a.status) for a in rows]
+    return Page(
+        items=[AttendanceOut(date=a.attendance_date, status=a.status) for a in rows],
+        total=total, limit=capped_limit, offset=offset,
+    )

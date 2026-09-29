@@ -3,7 +3,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser, get_current_user, require_permission, require_store_access
@@ -22,6 +22,7 @@ from app.schemas.schemas import (
     DeviceOut,
     ForgotPasswordIn,
     LoginRequest,
+    Page,
     RefreshRequest,
     ResetPasswordWithOtpIn,
     StoreCredentialRow,
@@ -351,19 +352,23 @@ async def register_device(
     return {"device_id": str(device.id)}
 
 
-@router.get("/devices", response_model=list[DeviceOut])
+@router.get("/devices", response_model=Page[DeviceOut])
 async def list_devices(
     status_filter: str | None = None,
+    limit: int = 20,
+    offset: int = 0,
     current: CurrentUser = Depends(require_permission("device.manage")),
     db: AsyncSession = Depends(get_db),
-) -> list[Device]:
+) -> Page[DeviceOut]:
     stmt = select(Device)
     if status_filter:
         stmt = stmt.where(Device.status == status_filter)
     if current.role_code != "super_admin":
         stmt = stmt.where(Device.store_id.in_(current.store_ids))
-    result = await db.execute(stmt.order_by(Device.created_at.desc()))
-    return list(result.scalars().all())
+    capped_limit = min(limit, 200)
+    total = (await db.execute(select(func.count()).select_from(stmt.subquery()))).scalar_one()
+    result = await db.execute(stmt.order_by(Device.created_at.desc()).limit(capped_limit).offset(offset))
+    return Page(items=list(result.scalars().all()), total=total, limit=capped_limit, offset=offset)
 
 
 @router.post("/devices/{device_id}/revoke", status_code=204)

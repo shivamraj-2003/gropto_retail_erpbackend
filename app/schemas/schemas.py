@@ -1,7 +1,22 @@
 import uuid
 from datetime import date, datetime
+from typing import Generic, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field
+
+T = TypeVar("T")
+
+
+class Page(BaseModel, Generic[T]):
+    """Shared pagination envelope — every list endpoint that can grow
+    unbounded over the life of a store (audit log, approvals, attendance,
+    orders, ...) returns this instead of a bare list, so the frontend always
+    has a real `total` to build page controls from rather than guessing from
+    a possibly-truncated page."""
+    items: list[T]
+    total: int
+    limit: int
+    offset: int
 
 
 # ---------------------------------------------------------------------------
@@ -39,6 +54,13 @@ class AuditEntryOut(BaseModel):
     source: str
     approval_id: uuid.UUID | None
     created_at: datetime
+
+
+class AuditEntriesPage(BaseModel):
+    items: list[AuditEntryOut]
+    total: int
+    limit: int
+    offset: int
 
 
 class DeviceOut(BaseModel):
@@ -108,6 +130,13 @@ class UserCreateResult(BaseModel):
     status: str  # "created" | "pending_approval"
     user_id: uuid.UUID | None = None
     request_id: uuid.UUID | None = None
+
+
+class UsersPage(BaseModel):
+    items: list[UserOut]
+    total: int
+    limit: int
+    offset: int
 
 
 class StoreCredentialRow(BaseModel):
