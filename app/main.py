@@ -1,3 +1,4 @@
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -6,8 +7,17 @@ from app.api.v1.router import api_router
 from app.core.config import settings
 from app.services.audit import set_current_ip
 from app.services.rate_limit import is_request_rate_limited
+from app.services.scheduler import start_scheduler, stop_scheduler
 
-app = FastAPI(title="Gropto Retail ERP API", version="1.0.0")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    start_scheduler()
+    yield
+    stop_scheduler()
+
+
+app = FastAPI(title="Gropto Retail ERP API", version="1.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,

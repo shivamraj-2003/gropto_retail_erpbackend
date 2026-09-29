@@ -170,7 +170,11 @@ async def refresh(payload: RefreshRequest, db: AsyncSession = Depends(get_db)) -
         await db.commit()
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Refresh token reuse detected")
 
-    if token_row.expires_at < datetime.now(timezone.utc):
+    expires_at = token_row.expires_at
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+
+    if expires_at < datetime.now(timezone.utc):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Refresh token expired")
 
     # A revoked device still invalidates this session (revoke_device revokes the
@@ -182,7 +186,11 @@ async def refresh(payload: RefreshRequest, db: AsyncSession = Depends(get_db)) -
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Device no longer active")
 
     user = await db.get(User, token_row.user_id)
+    if user is None or not user.is_active:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Account is deactivated or missing")
+
     role = await db.get(Role, user.role_id)
+
     store_ids = [str(s) for s in await _load_user_store_ids(db, user.id)]
 
     # Rotate: revoke old, issue new in the same family.
