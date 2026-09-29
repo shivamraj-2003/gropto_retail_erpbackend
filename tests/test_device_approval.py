@@ -60,3 +60,31 @@ async def test_cashier_cannot_see_or_revoke_devices(client: AsyncClient, cashier
     # or revoke devices, even their own.
     resp = await client.get("/api/v1/auth/devices", headers=auth_headers(cashier_token))
     assert resp.status_code == 403
+
+
+async def test_revoking_a_device_kills_its_live_access_token(client: AsyncClient, super_admin_token: str):
+    """An access token is self-contained, so before deps.py checked the database
+    a revoked till kept working until its token happened to expire. The check
+    makes revocation effective immediately — which matters more now that
+    ACCESS_TOKEN_EXPIRE_MINUTES is 60 rather than 15."""
+    super_headers = auth_headers(super_admin_token)
+    fingerprint = f"pytest-revoke-live-{uuid.uuid4().hex[:8]}"
+    email, password = CREDENTIALS["cashier"]
+
+    login_resp = await client.post(
+        "/api/v1/auth/login",
+        json={"email": email, "password": password, "device_fingerprint": fingerprint},
+    )
+    assert login_resp.status_code == 200, login_resp.text
+    access_token = login_resp.json()["access_token"]
+    headers = auth_headers(access_token)
+
+    # The token works before the revoke.
+    assert (await client.get("/api/v1/auth/me", headers=headers)).status_code == 200
+
+    device_id = (await client.get("/api/v1/auth/me", headers=headers)).json()["device_id"]
+    assert (await client.post(f"/api/v1/auth/devices/{device_id}/revoke", headers=super_headers)).status_code == 204
+
+    # The very same still-unexpired token must now be rejected.
+    after = await client.get("/api/v1/auth/me", headers=headers)
+    assert after.status_code == 401, f"revoked device's token should be dead, got {after.status_code}"

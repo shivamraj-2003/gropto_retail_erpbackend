@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.core.security import decode_token
-from app.models.models import Permission, Role, RolePermission
+from app.models.models import Device, Permission, Role, RolePermission, User
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login")
 
@@ -30,18 +30,50 @@ class CurrentUser:
         return self.sees_all_stores() or store_id in self.store_ids
 
 
-async def get_current_user(token: str = Depends(oauth2_scheme)) -> CurrentUser:
+async def get_current_user(
+    token: str = Depends(oauth2_scheme),
+    db: AsyncSession = Depends(get_db),
+) -> CurrentUser:
     try:
         payload = decode_token(token)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token") from exc
     if payload.get("type") != "access":
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Wrong token type")
+
+    user_id = uuid.UUID(payload["sub"])
+    store_ids = [uuid.UUID(s) for s in payload.get("stores", [])]
+    device_id = uuid.UUID(payload["device_id"]) if payload.get("device_id") else None
+
+    # The claims above are only trusted as far as they are checked here. An
+    # access token is self-contained, so without these lookups a user who is
+    # deactivated, or a device that gets revoked, keeps working until their token
+    # happens to expire — up to a full ACCESS_TOKEN_EXPIRE_MINUTES window. Both
+    # are primary-key lookups, and get_db is request-scoped so this adds two
+    # indexed reads to a request that already does more.
+    #
+    # 401 rather than 403: the token is no longer good and no amount of
+    # refreshing will fix it, which is exactly the case the client's
+    # 401 -> refresh -> sign-out path already handles, so a deactivated account
+    # or revoked till bounces to the login screen instead of erroring on screen.
+    user = await db.get(User, user_id)
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Account no longer exists")
+    if not user.is_active:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Account has been deactivated")
+
+    if device_id is not None:
+        device = await db.get(Device, device_id)
+        if device is None:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Device no longer registered")
+        if device.status != "active":
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Device has been revoked")
+
     return CurrentUser(
-        user_id=uuid.UUID(payload["sub"]),
+        user_id=user_id,
         role_code=payload["role"],
-        store_ids=[uuid.UUID(s) for s in payload.get("stores", [])],
-        device_id=uuid.UUID(payload["device_id"]) if payload.get("device_id") else None,
+        store_ids=store_ids,
+        device_id=device_id,
     )
 
 

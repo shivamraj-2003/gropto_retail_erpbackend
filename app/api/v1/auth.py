@@ -42,13 +42,35 @@ async def _load_user_store_ids(db: AsyncSession, user_id: uuid.UUID) -> list[uui
     return list(result.scalars().all())
 
 
+async def _default_device_fingerprint(db: AsyncSession, user: User) -> str:
+    """Fallback identity for a login that carries no device_fingerprint.
+
+    Devices remain a real concept here (bill numbers, cash sessions and sync are
+    all scoped to one), so a client that doesn't identify itself gets bound to
+    the user's own existing active device instead of minting a new row on every
+    login. Only a user with no usable device falls through to the deterministic
+    per-user key, which keeps the unique constraint on devices.fingerprint
+    satisfied.
+    """
+    store_ids = await _load_user_store_ids(db, user.id)
+    stmt = select(Device).where(Device.status == "active")
+    if store_ids:
+        stmt = stmt.where(Device.store_id.in_(store_ids))
+    device = (await db.execute(stmt.order_by(Device.created_at).limit(1))).scalar_one_or_none()
+    return device.fingerprint if device is not None else f"user-{user.id}"
+
+
 @router.post("/login", response_model=TokenResponse)
 async def login(payload: LoginRequest, db: AsyncSession = Depends(get_db)) -> TokenResponse:
     if not payload.email and not payload.phone:
         raise HTTPException(status_code=400, detail="email or phone required")
 
     identifier = payload.email or payload.phone or ""
-    remaining = is_login_locked(identifier, payload.device_fingerprint)
+    # Lockout is keyed by identifier+device so one till can't lock out every
+    # cashier at a store. With no fingerprint supplied there is no device
+    # dimension to scope by, so the identifier alone is the key.
+    lockout_device = payload.device_fingerprint or "no-device"
+    remaining = is_login_locked(identifier, lockout_device)
     if remaining is not None:
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
@@ -60,13 +82,14 @@ async def login(payload: LoginRequest, db: AsyncSession = Depends(get_db)) -> To
     )
     user = (await db.execute(stmt)).scalar_one_or_none()
     if user is None or not user.is_active or not verify_password(payload.password, user.password_hash):
-        record_login_failure(identifier, payload.device_fingerprint)
+        record_login_failure(identifier, lockout_device)
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
-    record_login_success(identifier, payload.device_fingerprint)
+    record_login_success(identifier, lockout_device)
 
     role = await db.get(Role, user.role_id)
 
-    device_stmt = select(Device).where(Device.fingerprint == payload.device_fingerprint)
+    fingerprint = payload.device_fingerprint or await _default_device_fingerprint(db, user)
+    device_stmt = select(Device).where(Device.fingerprint == fingerprint)
     device = (await db.execute(device_stmt)).scalar_one_or_none()
 
     if device is None:
@@ -81,7 +104,7 @@ async def login(payload: LoginRequest, db: AsyncSession = Depends(get_db)) -> To
         device = Device(
             store_id=target_store_id,
             code=f"AUTO-{secrets.token_hex(2).upper()}",
-            fingerprint=payload.device_fingerprint,
+            fingerprint=fingerprint,
             status="active",
         )
         db.add(device)
@@ -150,9 +173,11 @@ async def refresh(payload: RefreshRequest, db: AsyncSession = Depends(get_db)) -
     if token_row.expires_at < datetime.now(timezone.utc):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Refresh token expired")
 
+    # A revoked device still invalidates this session (revoke_device revokes the
+    # user's refresh rows too), but there is no fingerprint check: login is
+    # email+password only, so a refresh token is a bearer secret bound to the
+    # user, not to a client identity.
     device = await db.get(Device, token_row.device_id) if token_row.device_id else None
-    if device and device.fingerprint != payload.device_fingerprint:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Device mismatch")
     if device and device.status != "active":
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Device no longer active")
 

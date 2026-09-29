@@ -27,7 +27,11 @@ class LoginRequest(BaseModel):
     email: str | None = None
     phone: str | None = None
     password: str
-    device_fingerprint: str
+    # Login is email+password only. The fingerprint is optional and used solely
+    # to rebind this client to an existing Device row (bill numbering, cash
+    # sessions and sync are all keyed off it) — omitting it is fine, see
+    # auth.py's _default_device_fingerprint.
+    device_fingerprint: str | None = None
 
 
 class TokenResponse(BaseModel):
@@ -77,7 +81,10 @@ class DeviceOut(BaseModel):
 
 class RefreshRequest(BaseModel):
     refresh_token: str
-    device_fingerprint: str
+    # Accepted for backwards compatibility and ignored: the refresh token is a
+    # bearer secret bound to the user, not to a device. auth.py deliberately
+    # does not reject on a fingerprint mismatch.
+    device_fingerprint: str | None = None
 
 
 class ChangePasswordIn(BaseModel):

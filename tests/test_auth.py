@@ -52,3 +52,45 @@ async def test_protected_route_without_token_is_unauthorized(client: AsyncClient
 async def test_protected_route_with_garbage_token_is_unauthorized(client: AsyncClient):
     resp = await client.get("/api/v1/auth/me", headers=auth_headers("not-a-real-jwt"))
     assert resp.status_code == 401
+
+
+async def test_login_without_a_device_fingerprint_still_succeeds(client: AsyncClient):
+    # Email+password is the only credential — the fingerprint is optional and
+    # just rebinds the client to a Device row, so omitting it must not fail.
+    resp = await client.post(
+        "/api/v1/auth/login",
+        json={"email": "admin@gropto.local", "password": "ChangeMe!123"},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["access_token"] and body["refresh_token"]
+
+
+async def test_refresh_ignores_a_mismatched_fingerprint(client: AsyncClient):
+    # A refresh token is a bearer secret bound to the user, not to a client
+    # identity: refreshing from a different device (or with none at all) works.
+    login_resp = await client.post(
+        "/api/v1/auth/login",
+        json={"email": "admin@gropto.local", "password": "ChangeMe!123", "device_fingerprint": "pytest-refresh-till-a"},
+    )
+    assert login_resp.status_code == 200, login_resp.text
+    refresh_token = login_resp.json()["refresh_token"]
+
+    resp = await client.post(
+        "/api/v1/auth/refresh",
+        json={"refresh_token": refresh_token, "device_fingerprint": "a-completely-different-till"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert "access_token" in resp.json()
+
+
+async def test_refresh_without_a_device_fingerprint_still_succeeds(client: AsyncClient):
+    login_resp = await client.post(
+        "/api/v1/auth/login",
+        json={"email": "admin@gropto.local", "password": "ChangeMe!123"},
+    )
+    assert login_resp.status_code == 200, login_resp.text
+
+    resp = await client.post("/api/v1/auth/refresh", json={"refresh_token": login_resp.json()["refresh_token"]})
+    assert resp.status_code == 200, resp.text
+    assert "access_token" in resp.json()
