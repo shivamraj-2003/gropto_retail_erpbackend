@@ -19,8 +19,15 @@ class CurrentUser:
         self.store_ids = store_ids
         self.device_id = device_id
 
+    def sees_all_stores(self) -> bool:
+        """Admin sees every store, same as Super Admin — the franchise-owner
+        model here is: Admin's mutating actions still queue for Super Admin
+        approval (handled separately by the approval engine), but reads are
+        never restricted to whichever stores they happen to be assigned to."""
+        return self.role_code in ("super_admin", "admin")
+
     def owns_store(self, store_id: uuid.UUID) -> bool:
-        return self.role_code == "super_admin" or store_id in self.store_ids
+        return self.sees_all_stores() or store_id in self.store_ids
 
 
 async def get_current_user(token: str = Depends(oauth2_scheme)) -> CurrentUser:

@@ -23,7 +23,7 @@ async def list_returns(
     current: CurrentUser = Depends(require_permission("sale.void")),
 ) -> Page[ReturnOut]:
     stmt = select(Return)
-    if current.role_code != "super_admin":
+    if not current.sees_all_stores():
         stmt = stmt.where(Return.store_id.in_(current.store_ids))
     if store_id:
         require_store_access(store_id, current)

@@ -36,7 +36,7 @@ async def sales_register(
     their stores, not everyone's — and always audit-logged, since a full sales
     export leaving the business is a real event."""
     stmt = select(Sale)
-    if current.role_code != "super_admin":
+    if not current.sees_all_stores():
         stmt = stmt.where(Sale.store_id.in_(current.store_ids))
     if store_id:
         stmt = stmt.where(Sale.store_id == store_id)
@@ -86,7 +86,7 @@ async def inventory_snapshot(
     current: CurrentUser = Depends(require_permission("report.export")),
 ) -> StreamingResponse:
     stmt = select(InventoryBalance, Product).join(Product, Product.id == InventoryBalance.product_id)
-    if current.role_code != "super_admin":
+    if not current.sees_all_stores():
         stmt = stmt.where(InventoryBalance.store_id.in_(current.store_ids))
     if store_id:
         stmt = stmt.where(InventoryBalance.store_id == store_id)

@@ -215,7 +215,7 @@ async def _handle_high_stock_adjustment(db: AsyncSession, request: ApprovalReque
 
 @register_handler("user_permission_change")
 async def _handle_user_permission_change(db: AsyncSession, request: ApprovalRequest) -> None:
-    from app.models.models import Role, User
+    from app.models.models import Role, User, UserStore
 
     user = await db.get(User, request.entity_id)
     if user is None:
@@ -227,6 +227,10 @@ async def _handle_user_permission_change(db: AsyncSession, request: ApprovalRequ
         if role is None:
             raise HTTPException(status_code=400, detail="Unknown role_code")
         user.role_id = role.id
+    if "store_ids" in request.new_value:
+        await db.execute(UserStore.__table__.delete().where(UserStore.user_id == user.id))
+        for store_id in request.new_value["store_ids"]:
+            db.add(UserStore(user_id=user.id, store_id=uuid.UUID(store_id)))
 
 
 @register_handler("user_create")

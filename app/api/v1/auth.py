@@ -90,7 +90,11 @@ async def login(payload: LoginRequest, db: AsyncSession = Depends(get_db)) -> To
     if device.status == "revoked":
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Device has been revoked")
 
-    if role.code != "super_admin":
+    # Admin sees/can act on every store (approval-gated on writes, handled
+    # separately), same bypass as CurrentUser.sees_all_stores() — an Admin
+    # must be able to log in on any till, not just ones matching their
+    # nominal store assignment.
+    if role.code not in ("super_admin", "admin"):
         store_ids = await _load_user_store_ids(db, user.id)
         if device.store_id and device.store_id not in store_ids:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="User not assigned to this store")
@@ -360,15 +364,23 @@ async def list_devices(
     current: CurrentUser = Depends(require_permission("device.manage")),
     db: AsyncSession = Depends(get_db),
 ) -> Page[DeviceOut]:
-    stmt = select(Device)
+    stmt = select(Device, Store.name).join(Store, Store.id == Device.store_id)
     if status_filter:
         stmt = stmt.where(Device.status == status_filter)
-    if current.role_code != "super_admin":
+    if not current.sees_all_stores():
         stmt = stmt.where(Device.store_id.in_(current.store_ids))
     capped_limit = min(limit, 200)
     total = (await db.execute(select(func.count()).select_from(stmt.subquery()))).scalar_one()
     result = await db.execute(stmt.order_by(Device.created_at.desc()).limit(capped_limit).offset(offset))
-    return Page(items=list(result.scalars().all()), total=total, limit=capped_limit, offset=offset)
+    items = [
+        DeviceOut(
+            id=device.id, store_id=device.store_id, store_name=store_name, code=device.code,
+            fingerprint=device.fingerprint, status=device.status, last_seen_at=device.last_seen_at,
+            created_at=device.created_at,
+        )
+        for device, store_name in result.all()
+    ]
+    return Page(items=items, total=total, limit=capped_limit, offset=offset)
 
 
 @router.post("/devices/{device_id}/revoke", status_code=204)

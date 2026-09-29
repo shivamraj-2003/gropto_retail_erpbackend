@@ -30,7 +30,7 @@ async def list_requisitions(
     current: CurrentUser = Depends(require_permission("purchase.manage")),
 ) -> Page[RequisitionOut]:
     stmt = select(PurchaseRequisition)
-    if current.role_code != "super_admin":
+    if not current.sees_all_stores():
         stmt = stmt.where(PurchaseRequisition.store_id.in_(current.store_ids))
     if store_id:
         require_store_access(store_id, current)

@@ -29,7 +29,7 @@ def _scoped_query(current: CurrentUser, *, entity_type: str | None, action: str 
     # Multi-tenant isolation: a non-Super-Admin only ever sees audit rows for
     # their own stores, never another tenant's — the same store-scoping rule
     # every other list endpoint in this app already applies.
-    if current.role_code != "super_admin":
+    if not current.sees_all_stores():
         stmt = stmt.where(AuditLog.store_id.in_(current.store_ids))
     elif store_id is not None:
         stmt = stmt.where(AuditLog.store_id == store_id)
@@ -83,7 +83,7 @@ async def entity_history(
     before-vs-after comparison across the whole history meaningful, not just
     for one edit at a time."""
     stmt = select(AuditLog).where(AuditLog.entity_type == entity_type, AuditLog.entity_id == entity_id)
-    if current.role_code != "super_admin":
+    if not current.sees_all_stores():
         stmt = stmt.where(AuditLog.store_id.in_(current.store_ids))
     stmt = stmt.order_by(AuditLog.entity_version.asc().nulls_last(), AuditLog.created_at.asc())
     result = await db.execute(stmt)
@@ -99,7 +99,7 @@ async def distinct_actions(
     actually occur, rather than a hand-maintained list that drifts from the
     ~17 call sites that write them."""
     stmt = select(AuditLog.action).distinct()
-    if current.role_code != "super_admin":
+    if not current.sees_all_stores():
         stmt = stmt.where(AuditLog.store_id.in_(current.store_ids))
     result = await db.execute(stmt.order_by(AuditLog.action))
     return list(result.scalars().all())

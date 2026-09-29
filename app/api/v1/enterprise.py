@@ -54,9 +54,10 @@ async def fleet_health(
         await db.execute(
             text(
                 """
-                select d.id, d.code, d.status, d.last_seen_at,
+                select d.id, d.code, d.status, d.last_seen_at, d.created_at, st.name as store_name,
                        (select count(*) from sync_failures sf where sf.device_id = d.id and sf.resolved = false) as pending_failures
                 from devices d
+                join stores st on st.id = d.store_id
                 order by d.last_seen_at desc nulls last
                 """
             )
@@ -66,7 +67,9 @@ async def fleet_health(
         {
             "device_id": str(r.id),
             "code": r.code,
+            "store_name": r.store_name,
             "status": r.status,
+            "installed_at": r.created_at.isoformat(),
             "last_seen_at": r.last_seen_at.isoformat() if r.last_seen_at else None,
             "pending_sync_failures": int(r.pending_failures),
         }

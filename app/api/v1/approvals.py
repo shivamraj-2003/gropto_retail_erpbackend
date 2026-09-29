@@ -24,7 +24,7 @@ async def list_approvals(
     stmt = select(ApprovalRequest)
     if status_filter:
         stmt = stmt.where(ApprovalRequest.status == status_filter)
-    if current.role_code != "super_admin":
+    if not current.sees_all_stores():
         stmt = stmt.where(ApprovalRequest.store_id.in_(current.store_ids))
     capped_limit = min(limit, 200)
     total = (await db.execute(select(func.count()).select_from(stmt.subquery()))).scalar_one()

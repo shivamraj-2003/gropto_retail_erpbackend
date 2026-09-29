@@ -67,6 +67,7 @@ class DeviceOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: uuid.UUID
     store_id: uuid.UUID
+    store_name: str | None = None
     code: str
     fingerprint: str
     status: str
@@ -129,6 +130,19 @@ class UserOut(BaseModel):
 class UserCreateResult(BaseModel):
     status: str  # "created" | "pending_approval"
     user_id: uuid.UUID | None = None
+    request_id: uuid.UUID | None = None
+
+
+class UserUpdateIn(BaseModel):
+    """Both fields optional — send just the one you're changing. Reassigning
+    a Cashier/Store Manager to a different store, or changing anyone's role,
+    both go through this."""
+    role_code: str | None = None
+    store_ids: list[uuid.UUID] | None = None
+
+
+class UserUpdateResult(BaseModel):
+    status: str  # "updated" | "pending_approval"
     request_id: uuid.UUID | None = None
 
 

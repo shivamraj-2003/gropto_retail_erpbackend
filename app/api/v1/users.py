@@ -8,7 +8,16 @@ from app.api.deps import CurrentUser, require_permission
 from app.core.database import get_db
 from app.core.security import hash_password
 from app.models.models import Role, User, UserStore
-from app.schemas.schemas import ASSIGNABLE_ROLES, ResetPasswordIn, UserCreateIn, UserCreateResult, UserOut, UsersPage
+from app.schemas.schemas import (
+    ASSIGNABLE_ROLES,
+    ResetPasswordIn,
+    UserCreateIn,
+    UserCreateResult,
+    UserOut,
+    UsersPage,
+    UserUpdateIn,
+    UserUpdateResult,
+)
 from app.services.approvals import submit_or_apply
 
 router = APIRouter(prefix="/users", tags=["users"])
@@ -36,7 +45,7 @@ async def list_users(
     db: AsyncSession = Depends(get_db),
 ) -> UsersPage:
     stmt = select(User, Role.code).join(Role, Role.id == User.role_id)
-    if current.role_code != "super_admin":
+    if not current.sees_all_stores():
         stmt = stmt.join(UserStore, UserStore.user_id == User.id).where(UserStore.store_id.in_(current.store_ids)).distinct()
 
     capped_limit = min(limit, 500)
@@ -61,6 +70,8 @@ async def create_user(
         raise HTTPException(status_code=400, detail=f"role_code must be one of: {', '.join(sorted(ASSIGNABLE_ROLES))}")
     if not payload.email and not payload.phone:
         raise HTTPException(status_code=400, detail="email or phone required")
+    if payload.role_code in ("cashier", "store_manager") and len(payload.store_ids) > 1:
+        raise HTTPException(status_code=400, detail=f"{payload.role_code} can only be assigned to one store")
 
     if payload.email:
         existing = await db.execute(select(User).where(User.email == payload.email))
@@ -93,6 +104,57 @@ async def create_user(
     if request.status == "approved":
         return UserCreateResult(status="created", user_id=new_user_id)
     return UserCreateResult(status="pending_approval", request_id=request.id)
+
+
+@router.patch("/{user_id}", response_model=UserUpdateResult)
+async def update_user(
+    user_id: uuid.UUID,
+    payload: UserUpdateIn,
+    current: CurrentUser = Depends(require_permission("user.manage")),
+    db: AsyncSession = Depends(get_db),
+) -> UserUpdateResult:
+    """Reassigning a Cashier/Store Manager to a different store, or changing
+    anyone's role, both land here — same submit_or_apply gate as everything
+    else: a Super Admin's call applies immediately, an Admin's queues."""
+    if payload.role_code is None and payload.store_ids is None:
+        raise HTTPException(status_code=400, detail="Provide role_code and/or store_ids to change")
+
+    result = await db.execute(select(User, Role.code).join(Role, Role.id == User.role_id).where(User.id == user_id))
+    row = result.first()
+    if row is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    user, current_role_code = row
+    current_store_ids = list((await db.execute(select(UserStore.store_id).where(UserStore.user_id == user.id))).scalars().all())
+
+    effective_role = payload.role_code or current_role_code
+    if payload.role_code is not None and payload.role_code not in ASSIGNABLE_ROLES:
+        raise HTTPException(status_code=400, detail=f"role_code must be one of: {', '.join(sorted(ASSIGNABLE_ROLES))}")
+    if payload.store_ids is not None and effective_role in ("cashier", "store_manager") and len(payload.store_ids) > 1:
+        raise HTTPException(status_code=400, detail=f"{effective_role} can only be assigned to one store")
+
+    old_value: dict = {"role_code": current_role_code, "store_ids": [str(s) for s in current_store_ids]}
+    new_value: dict = {}
+    if payload.role_code is not None:
+        new_value["role_code"] = payload.role_code
+    if payload.store_ids is not None:
+        new_value["store_ids"] = [str(s) for s in payload.store_ids]
+
+    request = await submit_or_apply(
+        db,
+        current=current,
+        request_type="user_permission_change",
+        entity_type="user",
+        entity_id=user_id,
+        old_value=old_value,
+        new_value=new_value,
+        reason=f"Updated {user.full_name}",
+        store_id=payload.store_ids[0] if payload.store_ids else None,
+    )
+    await db.commit()
+
+    if request.status == "approved":
+        return UserUpdateResult(status="updated")
+    return UserUpdateResult(status="pending_approval", request_id=request.id)
 
 
 @router.post("/{user_id}/reset-password", status_code=204)
