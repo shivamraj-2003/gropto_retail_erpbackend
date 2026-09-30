@@ -1,7 +1,10 @@
 from contextlib import asynccontextmanager
+
+import asyncpg
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from sqlalchemy.exc import OperationalError
 
 from app.api.v1.router import api_router
 from app.core.config import settings
@@ -48,6 +51,32 @@ async def rate_limit_middleware(request: Request, call_next):
 
 
 app.include_router(api_router)
+
+
+def _is_pool_exhaustion(exc: BaseException) -> bool:
+    """Supabase's Session Pooler on this project hard-caps concurrent
+    connections; once exhausted, asyncpg surfaces it as a generic
+    InternalServerError (EMAXCONNSESSION) since it isn't a Postgres error
+    code asyncpg has a dedicated exception class for — SQLAlchemy may also
+    wrap it in OperationalError depending on where in the connect path it
+    happens. Either way this is the one DB failure mode that's guaranteed
+    transient (a connection freeing up fixes it, no data or logic is
+    involved), so it gets its own clear, retryable response instead of
+    surfacing as an opaque 500 with a five-screen traceback."""
+    text = str(exc)
+    return "EMAXCONNSESSION" in text or "max clients reached" in text.lower()
+
+
+@app.exception_handler(asyncpg.exceptions.InternalServerError)
+@app.exception_handler(OperationalError)
+async def db_pool_exhausted_handler(request: Request, exc: Exception) -> JSONResponse:
+    if not _is_pool_exhaustion(exc):
+        raise exc
+    return JSONResponse(
+        status_code=503,
+        headers={"Retry-After": "2"},
+        content={"detail": "Database is at its connection limit right now — please retry in a moment."},
+    )
 
 
 @app.get("/health")
