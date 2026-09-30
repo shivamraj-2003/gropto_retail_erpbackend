@@ -20,12 +20,28 @@ from app.services.audit import write_audit
 router = APIRouter(tags=["loyalty-discounts"])
 
 
+async def get_or_create_loyalty_config(db: AsyncSession) -> LoyaltyConfig:
+    config = await db.get(LoyaltyConfig, True)
+    if config is None:
+        config = LoyaltyConfig(
+            singleton=True,
+            earn_rate=0.01,
+            redeem_value=1.0,
+            min_balance_to_redeem=100.0,
+            max_redeem_share=0.5,
+        )
+        db.add(config)
+        await db.commit()
+        await db.refresh(config)
+    return config
+
+
 @router.get("/loyalty/config", response_model=LoyaltyConfigOut)
 async def get_loyalty_config(
     db: AsyncSession = Depends(get_db),
     _current: CurrentUser = Depends(require_permission("inventory.view")),
 ) -> LoyaltyConfig:
-    return await db.get(LoyaltyConfig, True)
+    return await get_or_create_loyalty_config(db)
 
 
 @router.post("/loyalty/config-change")
@@ -36,7 +52,7 @@ async def request_loyalty_config_change(
 ) -> dict:
     """Directly financial — always routed through the approval engine (Super
     Admin applies in the same motion; anyone else queues a request)."""
-    config = await db.get(LoyaltyConfig, True)
+    config = await get_or_create_loyalty_config(db)
     old_value = {
         "earn_rate": float(config.earn_rate),
         "redeem_value": float(config.redeem_value),

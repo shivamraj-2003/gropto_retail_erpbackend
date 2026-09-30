@@ -52,8 +52,8 @@ class AuditEntryOut(BaseModel):
     entity_type: str
     entity_id: uuid.UUID | None
     entity_version: int | None
-    old_value: dict | None
-    new_value: dict | None
+    old_value: dict | list | str | None = None
+    new_value: dict | list | str | None = None
     reason: str | None
     source: str
     approval_id: uuid.UUID | None

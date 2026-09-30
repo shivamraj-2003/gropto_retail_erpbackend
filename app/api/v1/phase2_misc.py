@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser, require_permission, require_store_access
 from app.core.database import get_db
-from app.models.models_phase2 import FraudAlert, ReorderPoint
+from app.models.models_phase2 import Expense, FraudAlert, ReorderPoint
 from app.schemas.schemas import Page
 from app.schemas.schemas_phase2 import ExpenseCreate, FraudAlertOut, ReorderPointSet
 from app.services import finance as finance_service
@@ -23,15 +23,17 @@ async def set_reorder_point(
     current: CurrentUser = Depends(require_permission("inventory.adjust")),
 ) -> dict:
     require_store_access(payload.store_id, current)
-    stmt = (
-        pg_insert(ReorderPoint)
-        .values(**payload.model_dump())
-        .on_conflict_do_update(
-            index_elements=[ReorderPoint.product_id, ReorderPoint.store_id],
-            set_={"min_qty": payload.min_qty, "max_qty": payload.max_qty, "safety_stock": payload.safety_stock},
-        )
+    stmt = select(ReorderPoint).where(
+        ReorderPoint.product_id == payload.product_id, ReorderPoint.store_id == payload.store_id
     )
-    await db.execute(stmt)
+    existing = (await db.execute(stmt)).scalar_one_or_none()
+    if existing:
+        existing.min_qty = payload.min_qty
+        existing.max_qty = payload.max_qty
+        existing.safety_stock = payload.safety_stock
+    else:
+        rp = ReorderPoint(**payload.model_dump())
+        db.add(rp)
     await db.commit()
     return {"status": "ok"}
 
@@ -47,12 +49,12 @@ async def replenishment_alerts(
         await db.execute(
             text(
                 """
-                select p.sku, p.name, ib.quantity, rp.min_qty, rp.max_qty
-                from inventory_balances ib
-                join products p on p.id = ib.product_id
-                join reorder_points rp on rp.product_id = ib.product_id and rp.store_id = ib.store_id
-                where ib.store_id = :store_id and ib.quantity <= rp.min_qty
-                order by ib.quantity asc
+                select p.sku, p.name, coalesce(ib.quantity, 0) as quantity, rp.min_qty, rp.max_qty
+                from reorder_points rp
+                join products p on p.id = rp.product_id
+                left join inventory_balances ib on ib.product_id = rp.product_id and ib.store_id = rp.store_id
+                where rp.store_id = :store_id and coalesce(ib.quantity, 0) <= rp.min_qty
+                order by quantity asc
                 """
             ),
             {"store_id": str(store_id)},
@@ -71,6 +73,34 @@ async def create_expense(
     expense = await finance_service.create_expense(db, current=current, payload=payload)
     await db.commit()
     return {"expense_id": str(expense.id), "status": expense.status}
+
+
+@router.get("/finance/expenses")
+async def list_expenses(
+    store_id: uuid.UUID | None = None,
+    limit: int = 50,
+    offset: int = 0,
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(require_permission("report.export")),
+) -> list[dict]:
+    stmt = select(Expense).order_by(Expense.created_at.desc()).offset(offset).limit(limit)
+    if store_id:
+        require_store_access(store_id, current)
+        stmt = stmt.where(Expense.store_id == store_id)
+    result = await db.execute(stmt)
+    expenses = result.scalars().all()
+    return [
+        {
+            "id": str(e.id),
+            "store_id": str(e.store_id),
+            "category": e.category,
+            "amount": float(e.amount),
+            "description": e.description,
+            "status": e.status,
+            "created_at": e.created_at.isoformat() if e.created_at else None,
+        }
+        for e in expenses
+    ]
 
 
 @router.get("/finance/store-pnl")

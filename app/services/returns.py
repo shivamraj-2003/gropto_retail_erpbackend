@@ -48,7 +48,15 @@ async def create_return(db: AsyncSession, *, current: CurrentUser, payload: Retu
         )
     await db.flush()
 
-    sale_age_days = (datetime.now(timezone.utc) - sale.billed_at.replace(tzinfo=timezone.utc)).days
+    from sqlalchemy import select
+
+    sale_age_days = 0
+    if sale.billed_at is not None:
+        billed_at = sale.billed_at
+        if billed_at.tzinfo is None:
+            billed_at = billed_at.replace(tzinfo=timezone.utc)
+        sale_age_days = (datetime.now(timezone.utc) - billed_at).days
+
     needs_approval = (
         refund_total > REFUND_APPROVAL_THRESHOLD or sale_age_days > AGE_APPROVAL_THRESHOLD_DAYS
     ) and current.role_code != "super_admin"
@@ -84,7 +92,11 @@ async def create_return(db: AsyncSession, *, current: CurrentUser, payload: Retu
 async def finalize_return(db: AsyncSession, ret: Return) -> None:
     """Applies stock disposition and marks the return completed. Called either
     directly (small/recent returns) or by the return_approval handler on approval."""
-    for item in ret.items:
+    from sqlalchemy import select
+
+    result = await db.execute(select(ReturnItem).where(ReturnItem.return_id == ret.id))
+    items = result.scalars().all()
+    for item in items:
         if item.disposition == "saleable":
             await apply_movement(
                 db,

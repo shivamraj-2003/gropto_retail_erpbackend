@@ -4,6 +4,8 @@ from fastapi import APIRouter, Depends
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from sqlalchemy.orm import selectinload
+
 from app.api.deps import CurrentUser, require_permission, require_store_access
 from app.core.database import get_db
 from app.models.models_phase2 import Grn, PurchaseOrder, PurchaseRequisition
@@ -29,14 +31,14 @@ async def list_requisitions(
     db: AsyncSession = Depends(get_db),
     current: CurrentUser = Depends(require_permission("purchase.manage")),
 ) -> Page[RequisitionOut]:
-    stmt = select(PurchaseRequisition)
+    stmt = select(PurchaseRequisition).options(selectinload(PurchaseRequisition.items))
     if not current.sees_all_stores():
         stmt = stmt.where(PurchaseRequisition.store_id.in_(current.store_ids))
     if store_id:
         require_store_access(store_id, current)
         stmt = stmt.where(PurchaseRequisition.store_id == store_id)
     capped_limit = min(limit, 200)
-    total = (await db.execute(select(func.count()).select_from(stmt.subquery()))).scalar_one()
+    total = (await db.execute(select(func.count()).select_from(select(PurchaseRequisition.id).subquery()))).scalar_one()
     result = await db.execute(stmt.order_by(PurchaseRequisition.created_at.desc()).limit(capped_limit).offset(offset))
     return Page(items=list(result.scalars().all()), total=total, limit=capped_limit, offset=offset)
 
@@ -61,11 +63,11 @@ async def list_purchase_orders(
     db: AsyncSession = Depends(get_db),
     _current: CurrentUser = Depends(require_permission("purchase.manage")),
 ) -> Page[PurchaseOrderOut]:
-    stmt = select(PurchaseOrder)
+    stmt = select(PurchaseOrder).options(selectinload(PurchaseOrder.items))
     if status_filter:
         stmt = stmt.where(PurchaseOrder.status == status_filter)
     capped_limit = min(limit, 200)
-    total = (await db.execute(select(func.count()).select_from(stmt.subquery()))).scalar_one()
+    total = (await db.execute(select(func.count()).select_from(select(PurchaseOrder.id).subquery()))).scalar_one()
     result = await db.execute(stmt.order_by(PurchaseOrder.created_at.desc()).limit(capped_limit).offset(offset))
     return Page(items=list(result.scalars().all()), total=total, limit=capped_limit, offset=offset)
 

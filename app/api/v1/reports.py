@@ -46,16 +46,23 @@ async def sales_register(
     ws = wb.active
     ws.title = "Sales"
     ws.append(["Bill Number", "Store", "Cashier", "Billed At", "Taxable Value", "Discount", "GST (CGST+SGST)", "Grand Total", "Status"])
+    tot_subtotal = tot_discount = tot_tax = tot_grand = 0.0
     for s in sales:
         ws.append(
             [s.bill_number, str(s.store_id), str(s.cashier_id), s.billed_at.isoformat(), float(s.subtotal), float(s.discount_total), float(s.tax_total), float(s.grand_total), s.status]
         )
+        tot_subtotal += float(s.subtotal)
+        tot_discount += float(s.discount_total)
+        tot_tax += float(s.tax_total)
+        tot_grand += float(s.grand_total)
+    ws.append(["TOTAL", "", "", "", tot_subtotal, tot_discount, tot_tax, tot_grand, ""])
 
     items_ws = wb.create_sheet("Line Items")
     items_ws.append(
         ["Bill Number", "Product", "HSN/SAC", "Qty", "Unit Price (incl. GST)", "Line Discount", "Line Total",
          "Taxable Value", "GST Rate %", "CGST", "SGST"]
     )
+    tot_qty = tot_line_disc = tot_line_tot = tot_taxable = tot_cgst = tot_sgst = 0.0
     for s in sales:
         for item in s.items:
             items_ws.append(
@@ -63,6 +70,13 @@ async def sales_register(
                  float(item.unit_price), float(item.line_discount), float(item.line_total),
                  float(item.taxable_value), float(item.tax_rate_snapshot), float(item.cgst_amount), float(item.sgst_amount)]
             )
+            tot_qty += float(item.quantity)
+            tot_line_disc += float(item.line_discount)
+            tot_line_tot += float(item.line_total)
+            tot_taxable += float(item.taxable_value)
+            tot_cgst += float(item.cgst_amount)
+            tot_sgst += float(item.sgst_amount)
+    items_ws.append(["TOTAL", "", "", tot_qty, "", tot_line_disc, tot_line_tot, tot_taxable, "", tot_cgst, tot_sgst])
 
     await write_audit(
         db,
@@ -96,8 +110,13 @@ async def inventory_snapshot(
     ws = wb.active
     ws.title = "Inventory"
     ws.append(["SKU", "Product", "Store", "Quantity", "Stock Value"])
+    tot_qty = tot_val = 0.0
     for balance, product in rows:
-        ws.append([product.sku, product.name, str(balance.store_id), float(balance.quantity), float(balance.quantity) * float(product.purchase_price)])
+        val = float(balance.quantity) * float(product.purchase_price)
+        ws.append([product.sku, product.name, str(balance.store_id), float(balance.quantity), val])
+        tot_qty += float(balance.quantity)
+        tot_val += val
+    ws.append(["TOTAL", "", "", tot_qty, tot_val])
 
     await write_audit(
         db,
@@ -124,8 +143,11 @@ async def loyalty_report(
     ws = wb.active
     ws.title = "Loyalty"
     ws.append(["Customer ID", "Delta Points", "Reason", "Source Type", "Created At"])
+    tot_pts = 0.0
     for r in rows:
         ws.append([str(r.customer_id), float(r.delta_points), r.reason, r.source_type, r.created_at.isoformat()])
+        tot_pts += float(r.delta_points)
+    ws.append(["TOTAL", tot_pts, "", "", ""])
 
     await write_audit(
         db,

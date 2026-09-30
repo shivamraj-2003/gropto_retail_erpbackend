@@ -82,15 +82,18 @@ async def mark_attendance(
     db: AsyncSession = Depends(get_db),
     current: CurrentUser = Depends(require_permission("user.manage")),
 ) -> dict:
-    stmt = (
-        pg_insert(Attendance)
-        .values(**payload.model_dump())
-        .on_conflict_do_update(
-            index_elements=[Attendance.employee_id, Attendance.attendance_date],
-            set_={"status": payload.status, "check_in": payload.check_in, "check_out": payload.check_out, "shift_id": payload.shift_id},
-        )
+    stmt = select(Attendance).where(
+        Attendance.employee_id == payload.employee_id, Attendance.attendance_date == payload.attendance_date
     )
-    await db.execute(stmt)
+    existing = (await db.execute(stmt)).scalar_one_or_none()
+    if existing:
+        existing.status = payload.status
+        existing.check_in = payload.check_in
+        existing.check_out = payload.check_out
+        existing.shift_id = payload.shift_id
+    else:
+        att = Attendance(**payload.model_dump())
+        db.add(att)
     await db.commit()
     return {"status": "ok"}
 

@@ -4,6 +4,8 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from sqlalchemy.orm import selectinload
+
 from app.api.deps import CurrentUser, require_permission
 from app.core.database import get_db
 from app.models.models_phase3 import Order
@@ -22,7 +24,8 @@ router = APIRouter(prefix="/orders", tags=["orders"])
 
 
 async def _get_order(db: AsyncSession, order_id: uuid.UUID) -> Order:
-    order = await db.get(Order, order_id)
+    stmt = select(Order).options(selectinload(Order.items)).where(Order.id == order_id)
+    order = (await db.execute(stmt)).scalar_one_or_none()
     if order is None:
         raise HTTPException(status_code=404, detail="Order not found")
     return order

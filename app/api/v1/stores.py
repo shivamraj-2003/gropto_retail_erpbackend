@@ -85,6 +85,7 @@ async def create_store(
     return StoreCreateResult(status="pending_approval", request_id=request.id)
 
 
+@router.put("/stores/{store_id}", response_model=StoreUpdateResult)
 @router.patch("/stores/{store_id}", response_model=StoreUpdateResult)
 async def update_store(
     store_id: uuid.UUID,

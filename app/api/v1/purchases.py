@@ -98,3 +98,19 @@ async def create_purchase(
     await db.commit()
     await db.refresh(purchase)
     return purchase
+
+
+@router.get("/purchases", response_model=list[PurchaseOut])
+async def list_purchases(
+    store_id: uuid.UUID | None = None,
+    limit: int = 50,
+    offset: int = 0,
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(require_permission("purchase.manage")),
+) -> list[Purchase]:
+    stmt = select(Purchase).order_by(Purchase.created_at.desc()).offset(offset).limit(limit)
+    if store_id:
+        require_store_access(store_id, current)
+        stmt = stmt.where(Purchase.store_id == store_id)
+    result = await db.execute(stmt)
+    return list(result.scalars().all())
