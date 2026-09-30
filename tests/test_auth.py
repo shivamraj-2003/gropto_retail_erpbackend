@@ -94,3 +94,59 @@ async def test_refresh_without_a_device_fingerprint_still_succeeds(client: Async
     resp = await client.post("/api/v1/auth/refresh", json={"refresh_token": login_resp.json()["refresh_token"]})
     assert resp.status_code == 200, resp.text
     assert "access_token" in resp.json()
+
+
+async def test_refresh_rotates_the_token_and_issues_a_working_access_token(client: AsyncClient):
+    # The silent-refresh contract the frontend relies on: exchanging a valid
+    # refresh token returns a NEW pair (rotation), and the new access token is
+    # immediately usable on a protected route — not just structurally present.
+    login_resp = await client.post(
+        "/api/v1/auth/login",
+        json={"email": "admin@gropto.local", "password": "ChangeMe!123", "device_fingerprint": "pytest-rotation"},
+    )
+    assert login_resp.status_code == 200, login_resp.text
+    old_access, old_refresh = login_resp.json()["access_token"], login_resp.json()["refresh_token"]
+
+    refresh_resp = await client.post("/api/v1/auth/refresh", json={"refresh_token": old_refresh})
+    assert refresh_resp.status_code == 200, refresh_resp.text
+    new_access, new_refresh = refresh_resp.json()["access_token"], refresh_resp.json()["refresh_token"]
+
+    assert new_access != old_access
+    assert new_refresh != old_refresh
+
+    me_resp = await client.get("/api/v1/auth/me", headers=auth_headers(new_access))
+    assert me_resp.status_code == 200, me_resp.text
+
+
+async def test_refresh_with_an_invalid_token_is_rejected(client: AsyncClient):
+    resp = await client.post("/api/v1/auth/refresh", json={"refresh_token": "this-token-was-never-issued"})
+    assert resp.status_code == 401
+
+
+async def test_reusing_a_rotated_refresh_token_revokes_the_whole_family(client: AsyncClient):
+    # This is the exact scenario the frontend's silent-refresh must treat as
+    # "reauth_required": a spent (already-rotated) refresh token being
+    # presented again — real reuse, or two concurrent refreshes racing without
+    # the frontend's single-flight guard. The server detects it and revokes
+    # every token in the family, so even the freshly-issued sibling token from
+    # the legitimate first use stops working too.
+    login_resp = await client.post(
+        "/api/v1/auth/login",
+        json={"email": "admin@gropto.local", "password": "ChangeMe!123", "device_fingerprint": "pytest-reuse"},
+    )
+    assert login_resp.status_code == 200, login_resp.text
+    original_refresh = login_resp.json()["refresh_token"]
+
+    first_use = await client.post("/api/v1/auth/refresh", json={"refresh_token": original_refresh})
+    assert first_use.status_code == 200, first_use.text
+    rotated_refresh = first_use.json()["refresh_token"]
+
+    # Reuse: present the already-rotated (now-revoked) token again.
+    reuse_attempt = await client.post("/api/v1/auth/refresh", json={"refresh_token": original_refresh})
+    assert reuse_attempt.status_code == 401
+    assert "reuse" in reuse_attempt.json()["detail"].lower()
+
+    # The legitimate rotated token from the first, valid use is also now dead
+    # — the whole family was revoked, not just the reused one.
+    second_use_attempt = await client.post("/api/v1/auth/refresh", json={"refresh_token": rotated_refresh})
+    assert second_use_attempt.status_code == 401
