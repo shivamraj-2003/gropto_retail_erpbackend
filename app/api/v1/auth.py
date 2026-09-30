@@ -7,7 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import CurrentUser, get_current_user, require_permission, require_store_access
+from app.api.deps import ENTERPRISE_WIDE_ROLES, CurrentUser, get_current_user, require_permission, require_store_access
 from app.core.database import get_db
 from app.core.security import (
     create_access_token,
@@ -120,11 +120,10 @@ async def login(payload: LoginRequest, db: AsyncSession = Depends(get_db)) -> Lo
     if device.status == "revoked":
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Device has been revoked")
 
-    # Admin sees/can act on every store (approval-gated on writes, handled
-    # separately), same bypass as CurrentUser.sees_all_stores() — an Admin
-    # must be able to log in on any till, not just ones matching their
-    # nominal store assignment.
-    if role.code not in ("super_admin", "admin"):
+    # Enterprise-wide roles (see ENTERPRISE_WIDE_ROLES / CurrentUser.sees_all_stores())
+    # must be able to log in even though they carry zero store_ids by design —
+    # they aren't tied to a device's home store the way a Cashier/Store Manager is.
+    if role.code not in ENTERPRISE_WIDE_ROLES:
         store_ids = await _load_user_store_ids(db, user.id)
         if device.store_id and device.store_id not in store_ids:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="User not assigned to this store")

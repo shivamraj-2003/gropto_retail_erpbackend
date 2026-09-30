@@ -137,7 +137,18 @@ class ResetPasswordIn(BaseModel):
 # User management
 # ---------------------------------------------------------------------------
 
-ASSIGNABLE_ROLES = {"admin", "cashier", "store_manager"}
+ASSIGNABLE_ROLES = {
+    "admin",
+    "cashier",
+    "store_manager",
+    "ceo",
+    "coo",
+    "finance_head",
+    "purchase_head",
+    "regional_manager",
+    "inventory_user",
+    "system_admin",
+}
 
 
 class UserCreateIn(BaseModel):
