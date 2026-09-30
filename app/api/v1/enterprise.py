@@ -1,11 +1,13 @@
 import uuid
 
-from fastapi import APIRouter, Depends
-from sqlalchemy import text
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser, require_permission, require_store_access
 from app.core.database import get_db
+from app.models.models import Device
+from app.models.models_phase3 import DeviceConfig
 
 router = APIRouter(prefix="/enterprise", tags=["enterprise"])
 
@@ -103,3 +105,60 @@ async def exception_feed(
         "unresolved_sync_failures": int(counts.unresolved_sync_failures),
         "transfer_discrepancies": int(counts.transfer_discrepancies),
     }
+
+
+@router.put("/devices/{device_id}/config")
+async def push_device_config(
+    device_id: uuid.UUID,
+    config: dict,
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(require_permission("config.manage")),
+) -> dict:
+    """Blueprint §19 "centralized configuration pushed to every device" — the
+    DeviceConfig table existed with no API surface at all before this. A
+    device's sync worker reads its row via GET below on each poll."""
+    device = await db.get(Device, device_id)
+    if device is None:
+        raise HTTPException(status_code=404, detail="Device not found")
+    require_store_access(device.store_id, current)
+    existing = await db.get(DeviceConfig, device_id)
+    if existing is None:
+        existing = DeviceConfig(device_id=device_id, config=config)
+        db.add(existing)
+    else:
+        existing.config = config
+    await db.commit()
+    return {"device_id": str(device_id), "config": config}
+
+
+@router.get("/devices/{device_id}/config")
+async def get_device_config(
+    device_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(require_permission("device.manage")),
+) -> dict:
+    device = await db.get(Device, device_id)
+    if device is None:
+        raise HTTPException(status_code=404, detail="Device not found")
+    require_store_access(device.store_id, current)
+    row = await db.get(DeviceConfig, device_id)
+    return {"device_id": str(device_id), "config": row.config if row else {}}
+
+
+@router.put("/config/broadcast")
+async def broadcast_config(
+    config: dict,
+    db: AsyncSession = Depends(get_db),
+    _current: CurrentUser = Depends(require_permission("config.manage")),
+) -> dict:
+    """Pushes the same config to every active device in one call — the
+    fleet-wide half of centralized configuration, not just per-device."""
+    device_ids = list((await db.execute(select(Device.id).where(Device.status == "active"))).scalars().all())
+    for device_id in device_ids:
+        existing = await db.get(DeviceConfig, device_id)
+        if existing is None:
+            db.add(DeviceConfig(device_id=device_id, config=config))
+        else:
+            existing.config = config
+    await db.commit()
+    return {"devices_updated": len(device_ids), "config": config}

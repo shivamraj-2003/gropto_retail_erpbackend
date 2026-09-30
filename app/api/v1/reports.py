@@ -10,7 +10,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import CurrentUser, require_permission
 from app.core.database import get_db
 from app.models.models import AuditLog, InventoryBalance, LoyaltyLedger, Product, Sale
+from app.services import crm as crm_service
+from app.services import finance as finance_service
 from app.services.audit import write_audit
+from sqlalchemy import text
 
 router = APIRouter(prefix="/reports", tags=["reports"])
 
@@ -177,3 +180,162 @@ async def approvals_audit_report(
     for r in rows:
         ws.append([r.created_at.isoformat(), str(r.user_id), r.role_code, r.action, r.entity_type, str(r.entity_id), str(r.old_value), str(r.new_value)])
     return _workbook_response(wb, "audit_log.xlsx")
+
+
+@router.get("/purchase-trend")
+async def purchase_trend_report(
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(require_permission("report.export")),
+) -> StreamingResponse:
+    rows = (
+        await db.execute(
+            text(
+                """
+                select po.id, v.name as vendor_name, po.total_amount, po.status, po.created_at,
+                       rate_variance.avg_variance_pct
+                from purchase_orders po
+                join vendors v on v.id = po.vendor_id
+                left join lateral (
+                    select avg(
+                        case when poi.unit_cost > 0
+                            then (poi.unit_cost - coalesce(prior.unit_cost, poi.unit_cost)) / poi.unit_cost * 100
+                            else 0 end
+                    ) as avg_variance_pct
+                    from purchase_order_items poi
+                    left join lateral (
+                        select unit_cost from purchase_order_items poi2
+                        join purchase_orders po2 on po2.id = poi2.purchase_order_id
+                        where poi2.product_id = poi.product_id and po2.created_at < po.created_at
+                        order by po2.created_at desc limit 1
+                    ) prior on true
+                    where poi.purchase_order_id = po.id
+                ) rate_variance on true
+                order by po.created_at desc
+                limit 5000
+                """
+            )
+        )
+    ).all()
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Purchase Trend"
+    ws.append(["PO ID", "Vendor", "Total Amount", "Status", "Created At", "Avg Rate Variance %"])
+    for r in rows:
+        ws.append([
+            str(r.id), r.vendor_name, float(r.total_amount), r.status, r.created_at.isoformat(),
+            round(float(r.avg_variance_pct), 2) if r.avg_variance_pct is not None else None,
+        ])
+    return _workbook_response(wb, "purchase_trend.xlsx")
+
+
+@router.get("/warehouse-discrepancies")
+async def warehouse_report(
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(require_permission("report.export")),
+) -> StreamingResponse:
+    rows = (
+        await db.execute(
+            text(
+                """
+                select g.id as grn_id, g.warehouse_id, g.status, g.created_at,
+                       count(gi.id) filter (where gi.received_qty <> gi.expected_qty) as line_variances,
+                       count(gi.id) filter (where gi.qc_status <> 'accepted') as qc_rejections,
+                       sum(gi.expected_qty - gi.received_qty) as total_qty_variance
+                from grn g
+                left join grn_items gi on gi.grn_id = g.id
+                group by g.id, g.warehouse_id, g.status, g.created_at
+                order by g.created_at desc
+                limit 5000
+                """
+            )
+        )
+    ).all()
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Warehouse Discrepancies"
+    ws.append(["GRN ID", "Warehouse ID", "Status", "Line Variances", "QC Rejections", "Total Qty Variance", "Created At"])
+    for r in rows:
+        ws.append([
+            str(r.grn_id), str(r.warehouse_id) if r.warehouse_id else None, r.status,
+            r.line_variances, r.qc_rejections,
+            float(r.total_qty_variance) if r.total_qty_variance is not None else 0,
+            r.created_at.isoformat(),
+        ])
+    return _workbook_response(wb, "warehouse_report.xlsx")
+
+
+@router.get("/finance-pnl")
+async def finance_pnl_report(
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(require_permission("report.export")),
+) -> StreamingResponse:
+    store_rows = (await db.execute(text("select id, name from stores where is_active = true"))).all()
+    payables = await finance_service.payables_ageing(db)
+    payables_by_vendor_total = sum(p["amount_due"] for p in payables)
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Finance PnL"
+    ws.append(["Store", "MTD Revenue", "MTD Discounts", "MTD Expenses", "Net Contribution", "Company Payables Outstanding"])
+    for s in store_rows:
+        pnl = await finance_service.store_pnl(db, store_id=s.id)
+        net = pnl["estimated_contribution_mtd"] - pnl["discounts_mtd"]
+        ws.append([s.name, pnl["revenue_mtd"], pnl["discounts_mtd"], pnl["expenses_mtd"], net, None])
+    ws.append(["TOTAL (company payables outstanding)", None, None, None, None, payables_by_vendor_total])
+    return _workbook_response(wb, "finance_pnl.xlsx")
+
+
+@router.get("/customer-rfm")
+async def customer_rfm_report(
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(require_permission("report.export")),
+) -> StreamingResponse:
+    rows = await crm_service.rfm_segments(db)
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Customer RFM"
+    ws.append(["Customer ID", "Segment", "Recency (days)", "Frequency", "Monetary"])
+    for r in rows:
+        ws.append([r["customer_id"], r["segment"], r["recency_days"], r["frequency"], r["monetary"]])
+    return _workbook_response(wb, "customer_rfm.xlsx")
+
+
+@router.get("/operations-scorecard")
+async def operations_scorecard_report(
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(require_permission("report.export")),
+) -> StreamingResponse:
+    rows = (
+        await db.execute(
+            text(
+                """
+                select s.id as store_id, s.name as store_name,
+                    (select count(*) from employees e where e.store_id = s.id and e.is_active = true) as staff_count,
+                    (select count(*) from attendance a
+                       join employees e2 on e2.id = a.employee_id
+                       where e2.store_id = s.id and a.attendance_date = current_date - interval '1 day') as marked_yesterday,
+                    (select count(*) from attendance a2
+                       join employees e3 on e3.id = a2.employee_id
+                       where e3.store_id = s.id and a2.attendance_date = current_date - interval '1 day' and a2.status = 'present') as present_yesterday,
+                    (select count(*) from fraud_alerts fa where fa.store_id = s.id and fa.created_at::date = current_date - interval '1 day') as fraud_exceptions,
+                    (select count(*) from approval_requests ar where ar.store_id = s.id and ar.status = 'pending') as pending_approvals
+                from stores s
+                where s.is_active = true
+                order by s.name
+                """
+            )
+        )
+    ).all()
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Operations Scorecard"
+    ws.append(["Store", "Staff Count", "Attendance Marked (yesterday)", "Present (yesterday)", "Attendance Rate %", "Fraud Exceptions (yesterday)", "Pending Approvals", "Exception Count"])
+    for r in rows:
+        attendance_rate = round(r.present_yesterday / r.marked_yesterday * 100, 1) if r.marked_yesterday else None
+        exception_count = r.fraud_exceptions + r.pending_approvals
+        ws.append([
+            r.store_name, r.staff_count, r.marked_yesterday, r.present_yesterday,
+            attendance_rate, r.fraud_exceptions, r.pending_approvals, exception_count,
+        ])
+    return _workbook_response(wb, "operations_scorecard.xlsx")
+

@@ -2,6 +2,7 @@ import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
 
+import pyotp
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -10,6 +11,8 @@ from app.api.deps import CurrentUser, get_current_user, require_permission, requ
 from app.core.database import get_db
 from app.core.security import (
     create_access_token,
+    create_mfa_challenge_token,
+    decode_token,
     hash_password,
     hash_refresh_token,
     new_refresh_token,
@@ -22,6 +25,10 @@ from app.schemas.schemas import (
     DeviceOut,
     ForgotPasswordIn,
     LoginRequest,
+    LoginResponse,
+    MfaLoginVerifyIn,
+    MfaSetupOut,
+    MfaVerifySetupIn,
     Page,
     RefreshRequest,
     ResetPasswordWithOtpIn,
@@ -60,8 +67,8 @@ async def _default_device_fingerprint(db: AsyncSession, user: User) -> str:
     return device.fingerprint if device is not None else f"user-{user.id}"
 
 
-@router.post("/login", response_model=TokenResponse)
-async def login(payload: LoginRequest, db: AsyncSession = Depends(get_db)) -> TokenResponse:
+@router.post("/login", response_model=LoginResponse)
+async def login(payload: LoginRequest, db: AsyncSession = Depends(get_db)) -> LoginResponse:
     if not payload.email and not payload.phone:
         raise HTTPException(status_code=400, detail="email or phone required")
 
@@ -123,6 +130,19 @@ async def login(payload: LoginRequest, db: AsyncSession = Depends(get_db)) -> To
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="User not assigned to this store")
     device.last_seen_at = datetime.now(timezone.utc)
 
+    if user.mfa_enabled:
+        # Password already verified above; withhold real tokens until a valid
+        # TOTP code confirms the second factor. Nothing is committed yet
+        # beyond the lockout bookkeeping already recorded.
+        await db.commit()
+        return LoginResponse(mfa_required=True, mfa_challenge_token=create_mfa_challenge_token(user_id=user.id))
+
+    access_token, raw_refresh = await _issue_tokens(db, user=user, role=role, device=device)
+    await db.commit()
+    return LoginResponse(access_token=access_token, refresh_token=raw_refresh)
+
+
+async def _issue_tokens(db: AsyncSession, *, user: User, role: Role, device: Device) -> tuple[str, str]:
     store_ids = [str(s) for s in await _load_user_store_ids(db, user.id)]
     access_token = create_access_token(
         user_id=user.id, role_code=role.code, store_ids=store_ids, device_id=str(device.id)
@@ -147,8 +167,103 @@ async def login(payload: LoginRequest, db: AsyncSession = Depends(get_db)) -> To
         entity_type="user",
         entity_id=user.id,
     )
+    return access_token, raw_refresh
+
+
+@router.post("/mfa/login-verify", response_model=TokenResponse)
+async def mfa_login_verify(payload: MfaLoginVerifyIn, db: AsyncSession = Depends(get_db)) -> TokenResponse:
+    try:
+        claims = decode_token(payload.challenge_token)
+    except ValueError:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired MFA challenge")
+    if claims.get("type") != "mfa_challenge":
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired MFA challenge")
+
+    user = await db.get(User, uuid.UUID(claims["sub"]))
+    if user is None or not user.is_active or not user.mfa_enabled or not user.mfa_secret:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="MFA not available for this account")
+    if not pyotp.TOTP(user.mfa_secret).verify(payload.code, valid_window=1):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid authentication code")
+
+    role = await db.get(Role, user.role_id)
+    # The device that originated this login isn't persisted anywhere
+    # mid-challenge (only the user_id survives on the challenge token) — fall
+    # back to the user's most-recently-seen active device, same resolution
+    # login() itself uses when no fingerprint is supplied.
+    device = (
+        await db.execute(
+            select(Device).where(Device.status == "active").order_by(Device.last_seen_at.desc().nulls_last()).limit(1)
+        )
+    ).scalars().first()
+    if device is None:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No active device to complete login")
+
+    access_token, raw_refresh = await _issue_tokens(db, user=user, role=role, device=device)
     await db.commit()
     return TokenResponse(access_token=access_token, refresh_token=raw_refresh)
+
+
+@router.post("/mfa/setup", response_model=MfaSetupOut)
+async def mfa_setup(
+    current: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> MfaSetupOut:
+    """Blueprint §19: "MFA for privileged users." Generates a new secret every
+    call (overwrites any prior unconfirmed one) — mfa_enabled only flips to
+    True once /mfa/verify-setup confirms the user actually has it working."""
+    user = await db.get(User, current.user_id)
+    secret = pyotp.random_base32()
+    user.mfa_secret = secret
+    user.mfa_enabled = False
+    await db.commit()
+    uri = pyotp.TOTP(secret).provisioning_uri(name=user.email or user.phone or str(user.id), issuer_name="Gropto ERP")
+    return MfaSetupOut(secret=secret, provisioning_uri=uri)
+
+
+@router.post("/mfa/verify-setup", status_code=204)
+async def mfa_verify_setup(
+    payload: MfaVerifySetupIn,
+    current: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    user = await db.get(User, current.user_id)
+    if not user.mfa_secret:
+        raise HTTPException(status_code=400, detail="Call /mfa/setup first")
+    if not pyotp.TOTP(user.mfa_secret).verify(payload.code, valid_window=1):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid authentication code")
+    user.mfa_enabled = True
+    await write_audit(
+        db,
+        user_id=current.user_id,
+        role_code=current.role_code,
+        store_id=None,
+        device_id=current.device_id,
+        action="mfa.enabled",
+        entity_type="user",
+        entity_id=current.user_id,
+    )
+    await db.commit()
+
+
+@router.post("/mfa/disable", status_code=204)
+async def mfa_disable(
+    current: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    user = await db.get(User, current.user_id)
+    user.mfa_enabled = False
+    user.mfa_secret = None
+    await write_audit(
+        db,
+        user_id=current.user_id,
+        role_code=current.role_code,
+        store_id=None,
+        device_id=current.device_id,
+        action="mfa.disabled",
+        entity_type="user",
+        entity_id=current.user_id,
+    )
+    await db.commit()
 
 
 @router.post("/refresh", response_model=TokenResponse)
