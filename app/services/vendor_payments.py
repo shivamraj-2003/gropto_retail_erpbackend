@@ -3,6 +3,7 @@ an approval threshold for large payouts (Point 6 audit fix: no payment model,
 no partial-payment support, and no approval workflow existed at all before)."""
 
 from fastapi import HTTPException
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser
@@ -17,6 +18,16 @@ PAYMENT_APPROVAL_THRESHOLD = 20000.0
 async def record_payment(db: AsyncSession, *, current: CurrentUser, payable: Payable, payload: VendorPaymentIn) -> VendorPayment | dict:
     if payload.amount <= 0:
         raise HTTPException(status_code=400, detail="Payment amount must be positive")
+
+    # Point 10 audit fix: idempotent replay — a retried call with the same
+    # key returns the existing payment instead of double-paying.
+    if payload.idempotency_key is not None:
+        existing = (
+            await db.execute(select(VendorPayment).where(VendorPayment.idempotency_key == payload.idempotency_key))
+        ).scalar_one_or_none()
+        if existing is not None:
+            return existing
+
     if payload.amount > float(payable.amount_due) + 0.01:
         raise HTTPException(status_code=409, detail=f"Payment {payload.amount} exceeds the outstanding balance {float(payable.amount_due)}")
 
@@ -28,14 +39,24 @@ async def record_payment(db: AsyncSession, *, current: CurrentUser, payable: Pay
             entity_type="payable",
             entity_id=payable.id,
             old_value=None,
-            new_value={"payable_id": str(payable.id), "amount": payload.amount, "reference": payload.reference},
+            new_value={
+                "payable_id": str(payable.id),
+                "amount": payload.amount,
+                "reference": payload.reference,
+                "idempotency_key": str(payload.idempotency_key) if payload.idempotency_key else None,
+            },
             reason=payload.reference,
             store_id=None,
         )
         return {"approval_request_id": request.id, "status": request.status}
 
     payment = VendorPayment(
-        payable_id=payable.id, amount=payload.amount, reference=payload.reference, requested_by=current.user_id, status="applied"
+        payable_id=payable.id,
+        amount=payload.amount,
+        reference=payload.reference,
+        requested_by=current.user_id,
+        status="applied",
+        idempotency_key=payload.idempotency_key,
     )
     db.add(payment)
     payable.amount_due = float(payable.amount_due) - payload.amount

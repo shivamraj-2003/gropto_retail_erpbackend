@@ -314,6 +314,7 @@ class StoreBudgetOut(BaseModel):
     capex_budget: float
     opex_budget: float
     actual_opex: float
+    actual_capex: float
 
 
 class ReceivableOut(BaseModel):
@@ -349,6 +350,9 @@ class TicketOut(BaseModel):
     subject: str
     description: str | None
     status: str
+    assigned_to: uuid.UUID | None = None
+    resolution_notes: str | None = None
+    resolved_at: datetime | None = None
     created_at: datetime
 
 
@@ -421,8 +425,11 @@ class CompanyIn(BaseModel):
     name: str
     legal_entity_name: str
     gstin: str | None = None
+    pan: str | None = None
     state: str
     city: str
+    einvoice_applicable: bool = False
+    aato_threshold: float | None = None
 
 
 class CompanyOut(BaseModel):
@@ -431,9 +438,40 @@ class CompanyOut(BaseModel):
     name: str
     legal_entity_name: str
     gstin: str | None
+    pan: str | None
     state: str
     city: str
+    einvoice_applicable: bool
+    aato_threshold: float | None
     created_at: datetime
+
+
+class StoreBudgetCreate(BaseModel):
+    store_id: uuid.UUID
+    financial_year: int
+    month: int
+    capex_budget: float = 0.0
+    opex_budget: float = 0.0
+
+
+class EInvoiceOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: uuid.UUID
+    sale_id: uuid.UUID
+    company_id: uuid.UUID | None
+    status: str
+    irn: str | None
+    ack_no: str | None
+    ack_date: datetime | None
+    error_response: str | None
+    retry_count: int
+    cancelled_reason: str | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class EInvoiceCancelIn(BaseModel):
+    reason: str
 
 
 class ClusterIn(BaseModel):
@@ -552,3 +590,94 @@ class PickListDispatch(BaseModel):
     pick_list_ids: list[uuid.UUID]
     dest_type: str
     dest_id: uuid.UUID
+
+# ---------------------------------------------------------------------------
+# CRM Enriched Schemas
+# ---------------------------------------------------------------------------
+
+class Customer360Full(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    total_orders: int
+    total_spend: float
+    aov: float
+    first_purchase: str | None
+    last_purchase: str | None
+    loyalty_balance: float
+    purchase_frequency: float
+    preferred_store: dict | None  # {id, name}
+    preferred_categories: list[str]
+    new_or_repeat: str
+    rfm_segment: str | None
+    churn_risk: bool | None
+    wallet_balance: float
+    loyalty_history: list[dict]
+    coupon_history: list[dict]
+    refund_history: list[dict]
+    ticket_history: list[dict]
+    order_history: list[dict]
+
+class AudienceCriteria(BaseModel):
+    segment: str | None = None
+    min_spend: float | None = None
+    max_spend: float | None = None
+    min_orders: int | None = None
+    min_recency_days: int | None = None
+    max_recency_days: int | None = None
+    store_id: uuid.UUID | None = None
+    churn_risk: bool | None = None
+    loyalty_tier_min_points: float | None = None
+    has_used_coupon: bool | None = None
+    has_refund: bool | None = None
+
+class SavedAudienceCreate(BaseModel):
+    name: str
+    criteria: AudienceCriteria
+
+class AudiencePreviewIn(BaseModel):
+    criteria: AudienceCriteria
+
+class SavedAudienceOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: uuid.UUID
+    name: str
+    criteria: dict
+    estimated_size: int
+    created_at: datetime
+
+class ConsentHistoryOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: uuid.UUID
+    customer_id: uuid.UUID
+    channel: str
+    old_value: bool
+    new_value: bool
+    source: str
+    created_at: datetime
+
+class TicketUpdate(BaseModel):
+    status: str | None = None
+    assigned_to: uuid.UUID | None = None
+    resolution_notes: str | None = None
+
+class ClvSnapshotOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: uuid.UUID
+    customer_id: uuid.UUID
+    historic_clv: float
+    predicted_clv: float
+    avg_order_value: float
+    purchase_frequency: float
+    customer_lifespan_months: int
+    segment: str
+    calculated_at: datetime
+
+class CampaignAnalyticsOut(BaseModel):
+    campaign_id: uuid.UUID
+    name: str
+    channel: str
+    status: str
+    sent_count: int
+    failed_count: int
+    skipped_count: int
+    delivery_rate: float
+    created_at: datetime

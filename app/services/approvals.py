@@ -393,6 +393,9 @@ async def _handle_store_create(db: AsyncSession, request: ApprovalRequest) -> No
         cluster=payload.get("cluster"),
         area_sqft=payload.get("area_sqft"),
         target_revenue_monthly=payload.get("target_revenue_monthly"),
+        company_id=uuid.UUID(payload["company_id"]) if payload.get("company_id") else None,
+        gstin=payload.get("gstin"),
+        state=payload.get("state"),
     )
     db.add(store)
 
@@ -405,9 +408,11 @@ async def _handle_store_update(db: AsyncSession, request: ApprovalRequest) -> No
     if store is None:
         request.status = "stale"
         return
-    for field in ("name", "city", "cluster", "area_sqft", "target_revenue_monthly"):
+    for field in ("name", "city", "cluster", "area_sqft", "target_revenue_monthly", "gstin", "state"):
         if field in request.new_value:
             setattr(store, field, request.new_value[field])
+    if "company_id" in request.new_value:
+        store.company_id = uuid.UUID(request.new_value["company_id"]) if request.new_value["company_id"] else None
 
 
 @register_handler("config_change")
@@ -467,9 +472,30 @@ async def _handle_vendor_payment_approval(db: AsyncSession, request: ApprovalReq
     if amount > float(payable.amount_due) + 0.01:
         request.status = "stale"
         return
-    db.add(VendorPayment(payable_id=payable.id, amount=amount, reference=payload.get("reference"), requested_by=request.requested_by, status="applied"))
+    idempotency_key = payload.get("idempotency_key")
+    db.add(
+        VendorPayment(
+            payable_id=payable.id,
+            amount=amount,
+            reference=payload.get("reference"),
+            requested_by=request.requested_by,
+            status="applied",
+            idempotency_key=uuid.UUID(idempotency_key) if idempotency_key else None,
+        )
+    )
     payable.amount_due = float(payable.amount_due) - amount
     payable.status = "paid" if payable.amount_due <= 0.01 else "partially_paid"
+
+
+@register_handler("cash_variance_escalation")
+async def _handle_cash_variance_escalation(db: AsyncSession, request: ApprovalRequest) -> None:
+    """Point 10 audit fix: VARIANCE_TOLERANCE was dead — a cash shortage/
+    excess beyond it had no escalation at all. The shift itself is already
+    updated (variance/variance_status/variance_reason) directly in
+    cash.py::close_shift before this request is raised; this request exists
+    purely as a visible, reviewable record for Finance/CEO — the shift
+    doesn't reopen or change state on review."""
+    return
 
 
 @register_handler("expense_approval")

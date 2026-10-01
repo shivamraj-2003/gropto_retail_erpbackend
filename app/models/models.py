@@ -67,6 +67,16 @@ class Store(Base):
     # defaults), set per store by whoever owns store setup.
     area_sqft: Mapped[float | None] = mapped_column(Numeric(10, 2))
     target_revenue_monthly: Mapped[float | None] = mapped_column(Numeric(14, 2))
+    # Point 10 audit fix: GST registration/e-invoice applicability attaches to
+    # a legal-entity GSTIN (companies.gstin), not to a store in isolation —
+    # company_id is the real link that lets turnover/applicability be
+    # computed correctly across every store under one PAN. gstin here covers
+    # the (less common) case of a store having its own branch-level
+    # registration distinct from the parent company's; state drives
+    # place-of-supply / inter-state tax determination.
+    company_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("companies.id"))
+    gstin: Mapped[str | None] = mapped_column(String)
+    state: Mapped[str | None] = mapped_column(String)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
@@ -220,6 +230,14 @@ class Customer(Base):
     id: Mapped[uuid.UUID] = uuid_pk()
     phone: Mapped[str] = mapped_column(String, unique=True, nullable=False)
     name: Mapped[str | None] = mapped_column(String)
+    # Point 11 audit fix: the email campaign channel had no field to send
+    # to at all — Customer had no email address anywhere. push_token is the
+    # device token a push provider (FCM) actually sends to; nothing in this
+    # app registers one yet (no mobile/web push SDK integration exists), so
+    # it stays null until that registration flow is built — the push send
+    # path reports "no device token on file" rather than silently skipping.
+    email: Mapped[str | None] = mapped_column(String)
+    push_token: Mapped[str | None] = mapped_column(String)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -291,6 +309,15 @@ class Sale(Base):
     loyalty_points_redeemed: Mapped[float] = mapped_column(Numeric(12, 2), default=0)
     override_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"))
     override_reason: Mapped[str | None] = mapped_column(Text)
+    # Point 10 audit fix: GSTR-1-ready sales data didn't exist — no place of
+    # supply, no document type, no customer GSTIN for B2B bills. Defaulted
+    # server-side at sync time (services/sync.py), not collected from the
+    # POS UI (a live-till flow this pass doesn't touch — see services/gst.py
+    # for the intra-state-by-default assumption and how a supplied
+    # customer_gstin can flip place_of_supply/tax split to inter-state).
+    place_of_supply: Mapped[str | None] = mapped_column(String)
+    document_type: Mapped[str] = mapped_column(String, default="invoice")  # invoice, credit_note, debit_note
+    customer_gstin: Mapped[str | None] = mapped_column(String)
     status: Mapped[str] = mapped_column(String, default="completed")
     client_idempotency_key: Mapped[str] = mapped_column(String, unique=True, nullable=False)
     billed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
@@ -320,6 +347,12 @@ class SaleItem(Base):
     taxable_value: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False, default=0)
     cgst_amount: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False, default=0)
     sgst_amount: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False, default=0)
+    # Point 10 audit fix: no IGST column existed anywhere in the schema — an
+    # inter-state sale (customer_gstin's state differing from the selling
+    # store's state) could never be taxed correctly. 0 for every existing
+    # intra-state sale; only non-zero when services/gst.py determines the
+    # sale is inter-state.
+    igst_amount: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False, default=0)
     # Point 4 audit fix: MRP was never captured on the sale itself — only the
     # selling price. Snapshotted at billing time (like product_name_snapshot)
     # so it survives later MRP changes to the product catalogue.

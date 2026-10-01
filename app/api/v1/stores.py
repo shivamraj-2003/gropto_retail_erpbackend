@@ -73,6 +73,9 @@ async def create_store(
         "cluster": payload.cluster,
         "area_sqft": payload.area_sqft,
         "target_revenue_monthly": payload.target_revenue_monthly,
+        "company_id": str(payload.company_id) if payload.company_id else None,
+        "gstin": payload.gstin,
+        "state": payload.state,
     }
     request = await submit_or_apply(
         db,
@@ -106,6 +109,9 @@ async def update_store(
         and payload.cluster is None
         and payload.area_sqft is None
         and payload.target_revenue_monthly is None
+        and payload.company_id is None
+        and payload.gstin is None
+        and payload.state is None
     ):
         raise HTTPException(status_code=400, detail="Provide at least one field to change")
 
@@ -119,6 +125,9 @@ async def update_store(
         "cluster": store.cluster,
         "area_sqft": float(store.area_sqft) if store.area_sqft is not None else None,
         "target_revenue_monthly": float(store.target_revenue_monthly) if store.target_revenue_monthly is not None else None,
+        "company_id": str(store.company_id) if store.company_id else None,
+        "gstin": store.gstin,
+        "state": store.state,
     }
     new_value: dict = {}
     if payload.name is not None:
@@ -131,6 +140,12 @@ async def update_store(
         new_value["area_sqft"] = payload.area_sqft
     if payload.target_revenue_monthly is not None:
         new_value["target_revenue_monthly"] = payload.target_revenue_monthly
+    if payload.company_id is not None:
+        new_value["company_id"] = str(payload.company_id)
+    if payload.gstin is not None:
+        new_value["gstin"] = payload.gstin
+    if payload.state is not None:
+        new_value["state"] = payload.state
 
     request = await submit_or_apply(
         db,

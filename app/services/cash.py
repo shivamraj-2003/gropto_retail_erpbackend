@@ -144,6 +144,18 @@ async def close_shift(db: AsyncSession, *, current: CurrentUser, shift: CashierS
     shift.variance = counted_cash - expected
     shift.denomination_breakdown = payload.denomination_breakdown
     shift.tender_breakdown = await _tender_breakdown(db, device_id=shift.device_id, since=shift.opened_at)
+    # Point 10 audit fix: VARIANCE_TOLERANCE existed but nothing ever read
+    # it — no classification or escalation happened regardless of variance
+    # size. The shift still always closes (the till has to close at day
+    # end), but a variance beyond tolerance now requires a reason and raises
+    # a real, visible escalation for Finance instead of only an audit row.
+    if abs(shift.variance) <= VARIANCE_TOLERANCE:
+        shift.variance_status = "within_tolerance"
+    elif shift.variance < 0:
+        shift.variance_status = "shortage_flagged"
+    else:
+        shift.variance_status = "excess_flagged"
+    shift.variance_reason = payload.variance_reason
     shift.status = "closed"
     shift.closed_at = datetime.now(timezone.utc)
 
@@ -156,8 +168,34 @@ async def close_shift(db: AsyncSession, *, current: CurrentUser, shift: CashierS
         action="shift.closed",
         entity_type="cashier_shift",
         entity_id=shift.id,
-        new_value={"expected": expected, "counted": counted_cash, "variance": shift.variance, "tender_breakdown": shift.tender_breakdown},
+        new_value={
+            "expected": expected,
+            "counted": counted_cash,
+            "variance": shift.variance,
+            "variance_status": shift.variance_status,
+            "variance_reason": shift.variance_reason,
+            "tender_breakdown": shift.tender_breakdown,
+        },
     )
+
+    if shift.variance_status != "within_tolerance":
+        await submit_or_apply(
+            db,
+            current=current,
+            request_type="cash_variance_escalation",
+            entity_type="cashier_shift",
+            entity_id=shift.id,
+            old_value=None,
+            new_value={
+                "shift_id": str(shift.id),
+                "store_id": str(shift.store_id),
+                "variance": shift.variance,
+                "variance_status": shift.variance_status,
+                "reason": shift.variance_reason,
+            },
+            reason=shift.variance_reason,
+            store_id=shift.store_id,
+        )
     return shift
 
 

@@ -355,6 +355,10 @@ class SaleIn(BaseModel):
     loyalty_points_redeemed: float = 0
     client_idempotency_key: str
     billed_at: datetime
+    # Point 10 audit fix: GST-ready sales data (B2B customer GSTIN) didn't
+    # exist. Optional — when absent, the sale is treated as intra-state
+    # (unchanged from prior behaviour); the POS UI doesn't collect this yet.
+    customer_gstin: str | None = None
 
 
 class SyncPushBatch(BaseModel):

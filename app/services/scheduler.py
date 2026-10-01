@@ -136,6 +136,43 @@ async def expire_loyalty_points_job() -> None:
             logger.error(f"Error during scheduled loyalty point expiry: {e}")
 
 
+async def retry_pending_einvoices_job() -> None:
+    """Point 10 audit fix: no e-invoice retry mechanism existed (nothing
+    did, because e-invoicing itself didn't exist). Always a safe no-op when
+    GSP credentials aren't configured — see services/einvoice.py."""
+    from app.services.einvoice import retry_failed_einvoices
+
+    async with SessionLocal() as db:
+        try:
+            count = await retry_failed_einvoices(db)
+            await db.commit()
+            if count:
+                logger.info(f"E-invoice retry: {count} invoice(s) re-attempted.")
+        except Exception as e:
+            await db.rollback()
+            logger.error(f"Error during scheduled e-invoice retry: {e}")
+
+
+async def refresh_budget_actuals_job() -> None:
+    """Point 10 audit fix: StoreBudget.actual_opex/actual_capex had no
+    computation path at all."""
+    from datetime import date
+
+    from app.services.budget import refresh_actuals
+
+    today = date.today()
+    financial_year = today.year if today.month >= 4 else today.year - 1
+    async with SessionLocal() as db:
+        try:
+            count = await refresh_actuals(db, financial_year=financial_year, month=today.month)
+            await db.commit()
+            if count:
+                logger.info(f"Budget actuals refresh: {count} store budget(s) updated.")
+        except Exception as e:
+            await db.rollback()
+            logger.error(f"Error during scheduled budget actuals refresh: {e}")
+
+
 scheduler = AsyncIOScheduler()
 
 
@@ -224,6 +261,20 @@ def start_scheduler() -> None:
             "interval",
             hours=24,
             id="expire_loyalty_points",
+            replace_existing=True,
+        )
+        scheduler.add_job(
+            retry_pending_einvoices_job,
+            "interval",
+            hours=1,
+            id="retry_pending_einvoices",
+            replace_existing=True,
+        )
+        scheduler.add_job(
+            refresh_budget_actuals_job,
+            "interval",
+            hours=24,
+            id="refresh_budget_actuals",
             replace_existing=True,
         )
         scheduler.start()

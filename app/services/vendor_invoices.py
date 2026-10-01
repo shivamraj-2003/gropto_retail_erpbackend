@@ -81,6 +81,11 @@ async def create_vendor_invoice(db: AsyncSession, *, current: CurrentUser, paylo
         invoice_number=payload.invoice_number,
         invoice_date=payload.invoice_date,
         invoice_amount=payload.invoice_amount,
+        taxable_value=payload.taxable_value,
+        cgst_amount=payload.cgst_amount,
+        sgst_amount=payload.sgst_amount,
+        igst_amount=payload.igst_amount,
+        place_of_supply=payload.place_of_supply,
         status=match_status,
         created_by=current.user_id,
     )
