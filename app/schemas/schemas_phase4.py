@@ -216,6 +216,51 @@ class WalletLedgerOut(BaseModel):
     created_at: datetime
 
 
+class CouponCreate(BaseModel):
+    code: str
+    discount_type: str  # percent, flat
+    discount_value: float
+    min_cart_value: float | None = None
+    max_discount_amount: float | None = None
+    start_date: date | None = None
+    end_date: date | None = None
+    usage_limit_total: int | None = None
+    usage_limit_per_customer: int | None = None
+    active: bool = True
+
+
+class CouponOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: uuid.UUID
+    code: str
+    discount_type: str
+    discount_value: float
+    min_cart_value: float | None
+    max_discount_amount: float | None
+    start_date: date | None
+    end_date: date | None
+    usage_limit_total: int | None
+    usage_limit_per_customer: int | None
+    active: bool
+    created_at: datetime
+
+
+class PromotionRedemptionOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: uuid.UUID
+    promotion_rule_id: uuid.UUID
+    source_type: str
+    source_id: uuid.UUID
+    store_id: uuid.UUID | None
+    discount_amount: float
+    created_at: datetime
+
+
+class WalletCreditIn(BaseModel):
+    amount: float
+    reason: str
+
+
 class PromotionRuleIn(BaseModel):
     name: str
     promo_type: str  # bogo, combo, category_offer, coupon, cart_rule

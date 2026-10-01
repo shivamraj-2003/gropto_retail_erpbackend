@@ -196,6 +196,59 @@ class ScheduledPriceChange(Base):
     status: Mapped[str] = mapped_column(String, default="pending_approval")  # pending_approval, approved, executed
 
 
+class PromotionRedemption(Base):
+    """Point 9 audit fix: PromotionRule (BOGO/combo/category) had zero
+    per-redemption usage log — no way to tell which rule fired on which
+    bill/order, so "promotion profitability" could never be more than an
+    aggregate discount total. One row per rule per bill/order; idempotent
+    under replay via the (source_type, source_id, promotion_rule_id)
+    unique constraint, same pattern as loyalty_ledger/customer_wallet_ledgers."""
+
+    __tablename__ = "promotion_redemptions"
+    id: Mapped[uuid.UUID] = uuid_pk()
+    promotion_rule_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("promotion_rules.id"), nullable=False)
+    source_type: Mapped[str] = mapped_column(String, nullable=False)  # order, sale
+    source_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    store_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("stores.id"))
+    discount_amount: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False)
+    details_json: Mapped[dict] = mapped_column(JSONB, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (UniqueConstraint("source_type", "source_id", "promotion_rule_id"),)
+
+
+class Coupon(Base):
+    """Point 9 audit fix: coupons didn't exist anywhere beyond a UI dropdown
+    label — no code, no validation, no redemption tracking."""
+
+    __tablename__ = "coupons"
+    id: Mapped[uuid.UUID] = uuid_pk()
+    code: Mapped[str] = mapped_column(String, unique=True, nullable=False)
+    discount_type: Mapped[str] = mapped_column(String, nullable=False)  # percent, flat
+    discount_value: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False)
+    min_cart_value: Mapped[float | None] = mapped_column(Numeric(12, 2))
+    max_discount_amount: Mapped[float | None] = mapped_column(Numeric(12, 2))
+    start_date: Mapped[date | None] = mapped_column(Date)
+    end_date: Mapped[date | None] = mapped_column(Date)
+    usage_limit_total: Mapped[int | None] = mapped_column(Integer)
+    usage_limit_per_customer: Mapped[int | None] = mapped_column(Integer)
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class CouponRedemption(Base):
+    __tablename__ = "coupon_redemptions"
+    id: Mapped[uuid.UUID] = uuid_pk()
+    coupon_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("coupons.id"), nullable=False)
+    customer_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("customers.id"))
+    source_type: Mapped[str] = mapped_column(String, nullable=False)  # order, sale
+    source_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    discount_amount: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (UniqueConstraint("source_type", "source_id", "coupon_id"),)
+
+
 class CustomerWalletLedger(Base):
     """Point 4 audit fix: this table existed but nothing ever wrote to it —
     wallet was listed as a payment mode in PaymentModeMaster with no actual

@@ -24,11 +24,25 @@ from app.services.audit import write_audit
 
 HandlerFn = Callable[[AsyncSession, ApprovalRequest], Awaitable[None]]
 _HANDLERS: dict[str, HandlerFn] = {}
+# Point 6 audit fix: rejecting an approval request used to only ever change
+# the ApprovalRequest row itself — the underlying entity (e.g. a PO) was left
+# permanently stuck at its "pending" state with no way to tell a rejection
+# apart from one still awaiting review. Optional per-type hook, mirroring
+# _HANDLERS, run on reject instead of apply.
+_REJECT_HANDLERS: dict[str, HandlerFn] = {}
 
 
 def register_handler(request_type: str):
     def wrapper(fn: HandlerFn) -> HandlerFn:
         _HANDLERS[request_type] = fn
+        return fn
+
+    return wrapper
+
+
+def register_reject_handler(request_type: str):
+    def wrapper(fn: HandlerFn) -> HandlerFn:
+        _REJECT_HANDLERS[request_type] = fn
         return fn
 
     return wrapper
@@ -79,6 +93,14 @@ async def submit_or_apply(
     return request
 
 
+#: Point 6 audit fix: PO approval previously had no amount-tiered limit at
+#: all — the same blanket "Super Admin applies immediately, anyone else with
+#: approval.decide can approve" rule every other request type uses. A
+#: high-value PO now requires one of these roles specifically.
+PO_HIGH_VALUE_THRESHOLD = 50000.0
+PO_HIGH_VALUE_APPROVER_ROLES = ("super_admin", "purchase_head", "finance_head")
+
+
 async def decide(
     db: AsyncSession, *, request_id: uuid.UUID, approver: CurrentUser, approve: bool, note: str | None
 ) -> ApprovalRequest:
@@ -88,6 +110,16 @@ async def decide(
     if request.status != "pending":
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Request already decided")
 
+    if request.request_type == "purchase_order_approval":
+        from app.models.models_phase2 import PurchaseOrder
+
+        po = await db.get(PurchaseOrder, request.entity_id)
+        if po is not None and float(po.total_amount) > PO_HIGH_VALUE_THRESHOLD and approver.role_code not in PO_HIGH_VALUE_APPROVER_ROLES:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"POs over ₹{PO_HIGH_VALUE_THRESHOLD:,.0f} require Purchase Head, Finance Head, or Super Admin approval",
+            )
+
     request.reviewed_by = approver.user_id
     request.review_note = note
     request.reviewed_at = datetime.now(timezone.utc)
@@ -96,6 +128,9 @@ async def decide(
         await _apply(db, request, approver_id=approver.user_id)
     else:
         request.status = "rejected"
+        reject_handler = _REJECT_HANDLERS.get(request.request_type)
+        if reject_handler is not None:
+            await reject_handler(db, request)
         await write_audit(
             db,
             user_id=approver.user_id,
@@ -156,6 +191,22 @@ async def _handle_price_change(db: AsyncSession, request: ApprovalRequest) -> No
     product.revision = product.revision + 1 if product.revision else 1
 
 
+@register_handler("scheduled_price_change")
+async def _handle_scheduled_price_change(db: AsyncSession, request: ApprovalRequest) -> None:
+    """Point 9 audit fix: a scheduled price change previously had no approval
+    gate and nothing ever executed it. Approval here only marks the row
+    approved — it still doesn't touch Product until effective_at actually
+    arrives; services/scheduler.py's execute_scheduled_price_changes_job
+    applies it and marks it executed."""
+    from app.models.models_phase4 import ScheduledPriceChange
+
+    sp_change = await db.get(ScheduledPriceChange, request.entity_id)
+    if sp_change is None or sp_change.status != "pending_approval":
+        request.status = "stale"
+        return
+    sp_change.status = "approved"
+
+
 @register_handler("product_deactivation")
 async def _handle_product_deactivation(db: AsyncSession, request: ApprovalRequest) -> None:
     product = await db.get(Product, request.entity_id)
@@ -190,7 +241,7 @@ async def _handle_loyalty_rule_change(db: AsyncSession, request: ApprovalRequest
     from app.models.models import LoyaltyConfig
 
     config = await db.get(LoyaltyConfig, True)
-    for field in ("earn_rate", "redeem_value", "min_balance_to_redeem", "max_redeem_share"):
+    for field in ("earn_rate", "redeem_value", "min_balance_to_redeem", "max_redeem_share", "points_expiry_days"):
         if field in request.new_value:
             setattr(config, field, request.new_value[field])
 
@@ -392,6 +443,33 @@ async def _handle_purchase_order_approval(db: AsyncSession, request: ApprovalReq
         request.status = "stale"
         return
     po.status = "approved"
+
+
+@register_reject_handler("purchase_order_approval")
+async def _reject_purchase_order_approval(db: AsyncSession, request: ApprovalRequest) -> None:
+    from app.models.models_phase2 import PurchaseOrder
+
+    po = await db.get(PurchaseOrder, request.entity_id)
+    if po is not None and po.status == "pending_approval":
+        po.status = "rejected"
+
+
+@register_handler("vendor_payment_approval")
+async def _handle_vendor_payment_approval(db: AsyncSession, request: ApprovalRequest) -> None:
+    from app.models.models_phase2 import Payable, VendorPayment
+
+    payload = request.new_value
+    payable = await db.get(Payable, uuid.UUID(payload["payable_id"]))
+    if payable is None:
+        request.status = "stale"
+        return
+    amount = float(payload["amount"])
+    if amount > float(payable.amount_due) + 0.01:
+        request.status = "stale"
+        return
+    db.add(VendorPayment(payable_id=payable.id, amount=amount, reference=payload.get("reference"), requested_by=request.requested_by, status="applied"))
+    payable.amount_due = float(payable.amount_due) - amount
+    payable.status = "paid" if payable.amount_due <= 0.01 else "partially_paid"
 
 
 @register_handler("expense_approval")

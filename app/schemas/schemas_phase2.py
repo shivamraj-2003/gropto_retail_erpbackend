@@ -210,6 +210,8 @@ class PoItemIn(BaseModel):
     product_id: uuid.UUID
     quantity: float
     unit_cost: float
+    discount_amount: float = 0
+    tax_rate: float = 0
 
 
 class PurchaseOrderCreate(BaseModel):
@@ -217,6 +219,10 @@ class PurchaseOrderCreate(BaseModel):
     store_id: uuid.UUID | None = None
     requisition_id: uuid.UUID | None = None
     items: list[PoItemIn]
+
+
+class PurchaseOrderCancelIn(BaseModel):
+    reason: str | None = None
 
 
 class GrnItemIn(BaseModel):
@@ -227,6 +233,11 @@ class GrnItemIn(BaseModel):
     mfg_date: date | None = None
     expiry_date: date | None = None
     qc_status: str = "accepted"
+    # Point 6 audit fix: receiving used to accept any quantity for any
+    # product against any PO with zero validation. Over-receipt beyond the
+    # PO's ordered quantity now requires this explicit flag instead of
+    # silently going through.
+    allow_over_receipt: bool = False
 
 
 class GrnCreate(BaseModel):
@@ -258,6 +269,9 @@ class PurchaseOrderItemOut(BaseModel):
     product_id: uuid.UUID
     quantity: float
     unit_cost: float
+    discount_amount: float
+    tax_rate: float
+    received_qty: float
 
 
 class PurchaseOrderOut(BaseModel):
@@ -269,6 +283,80 @@ class PurchaseOrderOut(BaseModel):
     total_amount: float
     created_at: datetime
     items: list[PurchaseOrderItemOut]
+
+
+# ---------------------------------------------------------------------------
+# Vendor invoices / payables / payments (Point 6 audit fix)
+# ---------------------------------------------------------------------------
+
+
+class VendorInvoiceCreate(BaseModel):
+    vendor_id: uuid.UUID
+    purchase_order_id: uuid.UUID | None = None
+    grn_id: uuid.UUID | None = None
+    invoice_number: str
+    invoice_date: date
+    invoice_amount: float
+
+
+class VendorInvoiceOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: uuid.UUID
+    vendor_id: uuid.UUID
+    purchase_order_id: uuid.UUID | None
+    grn_id: uuid.UUID | None
+    invoice_number: str
+    invoice_date: date
+    invoice_amount: float
+    status: str
+    created_at: datetime
+
+
+class ThreeWayMatchResultOut(BaseModel):
+    invoice: VendorInvoiceOut
+    po_amount: float | None
+    grn_amount: float | None
+    variance_amount: float
+    match_status: str
+    payable_id: uuid.UUID | None
+
+
+class PayableOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: uuid.UUID
+    vendor_id: uuid.UUID
+    vendor_invoice_id: uuid.UUID | None
+    original_amount: float
+    amount_due: float
+    due_date: date | None
+    status: str
+    created_at: datetime
+
+
+class VendorPaymentIn(BaseModel):
+    amount: float
+    reference: str | None = None
+
+
+class VendorPaymentOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: uuid.UUID
+    payable_id: uuid.UUID
+    amount: float
+    reference: str | None
+    status: str
+    created_at: datetime
+
+
+class VendorPerformanceOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    vendor_id: uuid.UUID
+    snapshot_date: date
+    fill_rate: float
+    avg_lead_time_days: float
+    rejection_rate: float
+    price_variance_pct: float
+    service_score: float
 
 
 class RoleOut(BaseModel):
@@ -383,6 +471,8 @@ class LoyaltyConfigOut(BaseModel):
     redeem_value: float
     min_balance_to_redeem: float
     max_redeem_share: float
+    # Point 9 audit fix: points never expired under any code path. Null = no expiry.
+    points_expiry_days: int | None = None
 
 
 class LoyaltyConfigChange(BaseModel):
@@ -390,6 +480,7 @@ class LoyaltyConfigChange(BaseModel):
     redeem_value: float | None = None
     min_balance_to_redeem: float | None = None
     max_redeem_share: float | None = None
+    points_expiry_days: int | None = None
     reason: str | None = None
 
 

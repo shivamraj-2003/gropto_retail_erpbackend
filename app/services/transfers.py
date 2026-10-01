@@ -1,9 +1,13 @@
 """Warehouse-to-store, store-to-store and store-to-warehouse transfers (Phase 2).
 Two-sided document: dispatch decrements the source, receive increments the
-destination — deliberately two separate calls so in-transit stock is a real gap,
-not assumed. Store legs use the Phase 1 inventory_balances table; warehouse legs
-use warehouse_balances (see services/inventory.py's adjust_warehouse_balance) —
-both sides now actually move a balance, not just record the transfer document.
+destination — correctness never depended on an in_transit bucket (the source
+is already gone and the destination isn't credited until receipt). Point 7
+audit fix: a store destination's InventoryBalance.in_transit is now also
+bumped at dispatch and cleared at receipt, purely so "how much is inbound to
+this store" is queryable — it never feeds available-stock math. Store legs
+use the Phase 1 inventory_balances table; warehouse legs use warehouse_balances
+(see services/inventory.py's adjust_warehouse_balance) — both sides actually
+move a balance, not just record the transfer document.
 """
 
 from datetime import datetime, timezone
@@ -16,7 +20,7 @@ from app.models.models_phase2 import Transfer, TransferItem
 from app.schemas.schemas_phase2 import TransferCreate, TransferReceive
 from app.services.approvals import submit_or_apply
 from app.services.audit import write_audit
-from app.services.inventory import adjust_warehouse_balance, apply_movement, get_balance, get_warehouse_balance
+from app.services.inventory import adjust_in_transit, adjust_warehouse_balance, apply_movement, get_balance, get_warehouse_balance
 
 DISCREPANCY_APPROVAL_THRESHOLD = 20  # absolute units variance on any one line; above this needs review before closing
 
@@ -64,6 +68,8 @@ async def dispatch_transfer(db: AsyncSession, *, current: CurrentUser, payload: 
             await adjust_warehouse_balance(
                 db, product_id=item.product_id, warehouse_id=payload.source_id, delta=-item.dispatched_qty
             )
+        if payload.dest_type == "store":
+            await adjust_in_transit(db, product_id=item.product_id, store_id=payload.dest_id, delta=item.dispatched_qty)
 
     await write_audit(
         db,
@@ -108,6 +114,11 @@ async def receive_transfer(db: AsyncSession, *, current: CurrentUser, transfer: 
             await adjust_warehouse_balance(
                 db, product_id=item.product_id, warehouse_id=transfer.dest_id, delta=received.received_qty
             )
+        if transfer.dest_type == "store":
+            # Clears the full dispatched amount, not just what was actually
+            # received — the entire dispatched quantity has left the pipeline
+            # either way; any shortfall is the discrepancy captured below.
+            await adjust_in_transit(db, product_id=item.product_id, store_id=transfer.dest_id, delta=-float(item.dispatched_qty))
 
     transfer.status = "discrepancy" if discrepancy else "received"
     transfer.received_by = current.user_id

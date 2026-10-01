@@ -243,6 +243,9 @@ class LoyaltyConfig(Base):
     redeem_value: Mapped[float] = mapped_column(Numeric(6, 4), default=0.5)
     min_balance_to_redeem: Mapped[float] = mapped_column(Numeric(12, 2), default=50)
     max_redeem_share: Mapped[float] = mapped_column(Numeric(4, 3), default=0.5)
+    # Point 9 audit fix: points never expired under any code path. Null/0 =
+    # never expire (opt-in), preserving existing behaviour by default.
+    points_expiry_days: Mapped[int | None] = mapped_column(Integer)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -374,9 +377,19 @@ class Vendor(Base):
     __tablename__ = "vendors"
     id: Mapped[uuid.UUID] = uuid_pk()
     name: Mapped[str] = mapped_column(String, nullable=False)
-    gst_number: Mapped[str | None] = mapped_column(String)
+    # Point 6 audit fix: Vendor used to be name/gst/phone/email/is_active
+    # only — no bank details, category, terms, or service area, and no
+    # update/deactivate path existed at all.
+    gst_number: Mapped[str | None] = mapped_column(String, unique=True)
     phone: Mapped[str | None] = mapped_column(String)
     email: Mapped[str | None] = mapped_column(String)
+    category: Mapped[str | None] = mapped_column(String)
+    service_area: Mapped[str | None] = mapped_column(String)
+    credit_days: Mapped[int] = mapped_column(Integer, default=30)
+    bank_account_name: Mapped[str | None] = mapped_column(String)
+    bank_account_number: Mapped[str | None] = mapped_column(String)
+    bank_ifsc: Mapped[str | None] = mapped_column(String)
+    bank_name: Mapped[str | None] = mapped_column(String)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
 
 

@@ -9,12 +9,14 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser
-from app.models.models import Sale, SaleItem
+from app.models.models import Payment, Sale, SaleItem
 from app.models.models_phase2 import Return, ReturnItem
 from app.schemas.schemas_phase2 import ReturnCreate
 from app.services.approvals import submit_or_apply
 from app.services.audit import write_audit
-from app.services.inventory import apply_movement
+from app.services.inventory import adjust_damaged, apply_movement
+from app.services.loyalty import DuplicateLedgerEntry, apply_ledger_entry
+from app.services.wallet import DuplicateWalletEntry, credit_wallet
 
 REFUND_APPROVAL_THRESHOLD = 1000.0
 AGE_APPROVAL_THRESHOLD_DAYS = 30
@@ -142,9 +144,74 @@ async def finalize_return(db: AsyncSession, ret: Return) -> None:
                 created_by=ret.requested_by,
                 device_id=None,
             )
-        # damaged / vendor_return: removed from sellable stock permanently — tracked
-        # via the return record itself rather than the sellable-quantity ledger.
+        elif item.disposition == "damaged":
+            # Point 7 audit fix: a damaged return previously vanished from
+            # the books entirely (never credited back anywhere) — the
+            # physical unit is real and should be visible as damaged stock,
+            # not silently absent.
+            await adjust_damaged(db, product_id=item.product_id, store_id=ret.store_id, delta=item.quantity)
+        # vendor_return: genuinely leaves the store's books (goes back to the
+        # vendor) — correctly not credited to any local balance.
     ret.status = "completed"
+
+    # Point 9 audit fix: a return previously left the loyalty points earned
+    # (and any points redeemed to pay for the bill) untouched — a customer
+    # could return a bill, keep the cash refund, and keep the loyalty/wallet
+    # side-effects the original sale generated. Reversed proportionally to
+    # how much of the bill this return actually refunds.
+    sale = await db.get(Sale, ret.sale_id)
+    if sale is not None and sale.customer_id is not None and float(sale.grand_total) > 0:
+        proportion = min(float(ret.refund_total) / float(sale.grand_total), 1.0)
+
+        if float(sale.loyalty_points_earned) > 0:
+            reversal = round(float(sale.loyalty_points_earned) * proportion, 2)
+            if reversal > 0:
+                try:
+                    await apply_ledger_entry(
+                        db,
+                        customer_id=sale.customer_id,
+                        delta_points=-reversal,
+                        reason="return_reversal_earn",
+                        source_type="return",
+                        source_id=ret.id,
+                    )
+                except DuplicateLedgerEntry:
+                    pass
+
+        if float(sale.loyalty_points_redeemed) > 0:
+            restored = round(float(sale.loyalty_points_redeemed) * proportion, 2)
+            if restored > 0:
+                try:
+                    await apply_ledger_entry(
+                        db,
+                        customer_id=sale.customer_id,
+                        delta_points=restored,
+                        reason="return_reversal_redeem",
+                        source_type="return",
+                        source_id=ret.id,
+                    )
+                except DuplicateLedgerEntry:
+                    pass
+
+        wallet_payment = (
+            await db.execute(
+                select(Payment.amount).where(Payment.sale_id == sale.id, Payment.mode == "wallet")
+            )
+        ).scalars().first()
+        if wallet_payment is not None:
+            credit_amount = round(float(wallet_payment) * proportion, 2)
+            if credit_amount > 0:
+                try:
+                    await credit_wallet(
+                        db,
+                        customer_id=sale.customer_id,
+                        amount=credit_amount,
+                        reference_type="return_refund",
+                        source_type="return",
+                        source_id=ret.id,
+                    )
+                except DuplicateWalletEntry:
+                    pass
 
 
 async def link_exchange(db: AsyncSession, *, current: CurrentUser, ret: Return, exchange_sale_id) -> Return:

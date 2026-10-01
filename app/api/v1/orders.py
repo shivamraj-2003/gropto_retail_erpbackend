@@ -6,17 +6,23 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from sqlalchemy.orm import selectinload
 
-from app.api.deps import CurrentUser, require_permission
+from app.api.deps import CurrentUser, require_permission, require_store_access
 from app.core.database import get_db
-from app.models.models_phase3 import Order
+from app.models.models_phase3 import Order, OrderRefund, OrderStatusHistory
 from app.schemas.schemas import Page
 from app.schemas.schemas_phase3 import (
+    OrderCancelIn,
     OrderCreate,
     OrderDeliverRequest,
+    OrderDeliveryOtpOut,
     OrderDetailOut,
     OrderDispatchRequest,
     OrderOut,
     OrderPickRequest,
+    OrderRefundOut,
+    OrderReturnCreate,
+    OrderReturnOut,
+    OrderStatusHistoryOut,
 )
 from app.services import oms
 
@@ -30,6 +36,16 @@ async def _get_order(db: AsyncSession, order_id: uuid.UUID) -> Order:
     order = (await db.execute(stmt)).scalar_one_or_none()
     if order is None:
         raise HTTPException(status_code=404, detail="Order not found")
+    return order
+
+
+async def _get_order_scoped(db: AsyncSession, order_id: uuid.UUID, current: CurrentUser) -> Order:
+    """Point 8 audit fix: every order endpoint used to skip store scoping
+    entirely — any user holding the relevant blanket permission could act on
+    any store's orders."""
+    order = await _get_order(db, order_id)
+    if order.allocated_store_id is not None:
+        require_store_access(order.allocated_store_id, current)
     return order
 
 
@@ -116,14 +132,19 @@ async def list_orders(
     limit: int = 20,
     offset: int = 0,
     db: AsyncSession = Depends(get_db),
-    _current: CurrentUser = Depends(require_permission("sale.create")),
+    current: CurrentUser = Depends(require_permission("sale.create")),
 ) -> Page[OrderOut]:
     """The order queue: every online order, optionally filtered by status/store —
     the packer/dispatcher screen's main list."""
     stmt = select(Order)
+    # Point 8 audit fix: the queue previously returned every store's orders
+    # to anyone holding sale.create, regardless of their own store assignment.
+    if not current.sees_all_stores():
+        stmt = stmt.where(Order.allocated_store_id.in_(current.store_ids))
     if status_filter:
         stmt = stmt.where(Order.status == status_filter)
     if store_id:
+        require_store_access(store_id, current)
         stmt = stmt.where(Order.allocated_store_id == store_id)
     capped_limit = min(limit, 200)
     total = (await db.execute(select(func.count()).select_from(stmt.subquery()))).scalar_one()
@@ -135,9 +156,32 @@ async def list_orders(
 async def get_order(
     order_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    _current: CurrentUser = Depends(require_permission("sale.create")),
+    current: CurrentUser = Depends(require_permission("sale.create")),
 ) -> Order:
-    return await _get_order(db, order_id)
+    return await _get_order_scoped(db, order_id, current)
+
+
+@router.get("/{order_id}/delivery-otp", response_model=OrderDeliveryOtpOut)
+async def get_delivery_otp(
+    order_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(require_permission("inventory.adjust")),
+) -> dict:
+    order = await _get_order(db, order_id)
+    return await oms.get_delivery_otp(current=current, order=order)
+
+
+@router.get("/{order_id}/status-history", response_model=list[OrderStatusHistoryOut])
+async def get_order_status_history(
+    order_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(require_permission("sale.create")),
+) -> list[OrderStatusHistory]:
+    await _get_order_scoped(db, order_id, current)
+    result = await db.execute(
+        select(OrderStatusHistory).where(OrderStatusHistory.order_id == order_id).order_by(OrderStatusHistory.created_at)
+    )
+    return list(result.scalars().all())
 
 
 @router.post("", response_model=OrderOut, status_code=201)
@@ -158,7 +202,7 @@ async def start_picking(
     db: AsyncSession = Depends(get_db),
     current: CurrentUser = Depends(require_permission("inventory.adjust")),
 ) -> Order:
-    order = await _get_order(db, order_id)
+    order = await _get_order_scoped(db, order_id, current)
     order = await oms.start_picking(db, current=current, order=order)
     await db.commit()
     await db.refresh(order)
@@ -172,8 +216,21 @@ async def pick_order(
     db: AsyncSession = Depends(get_db),
     current: CurrentUser = Depends(require_permission("inventory.adjust")),
 ) -> Order:
-    order = await _get_order(db, order_id)
+    order = await _get_order_scoped(db, order_id, current)
     order = await oms.pick_order(db, current=current, order=order, payload=payload)
+    await db.commit()
+    await db.refresh(order)
+    return order
+
+
+@router.post("/{order_id}/pack", response_model=OrderOut)
+async def confirm_pack(
+    order_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(require_permission("inventory.adjust")),
+) -> Order:
+    order = await _get_order_scoped(db, order_id, current)
+    order = await oms.confirm_pack(db, current=current, order=order)
     await db.commit()
     await db.refresh(order)
     return order
@@ -186,7 +243,7 @@ async def dispatch_order(
     db: AsyncSession = Depends(get_db),
     current: CurrentUser = Depends(require_permission("inventory.adjust")),
 ) -> Order:
-    order = await _get_order(db, order_id)
+    order = await _get_order_scoped(db, order_id, current)
     order = await oms.dispatch_order(db, current=current, order=order, payload=payload)
     await db.commit()
     await db.refresh(order)
@@ -200,7 +257,7 @@ async def deliver_order(
     db: AsyncSession = Depends(get_db),
     current: CurrentUser = Depends(require_permission("inventory.adjust")),
 ) -> Order:
-    order = await _get_order(db, order_id)
+    order = await _get_order(db, order_id)  # rider may not be store-assigned; oms.deliver_order enforces rider identity itself
     order = await oms.deliver_order(db, current=current, order=order, payload=payload)
     await db.commit()
     await db.refresh(order)
@@ -210,12 +267,51 @@ async def deliver_order(
 @router.post("/{order_id}/cancel", response_model=OrderOut)
 async def cancel_order(
     order_id: uuid.UUID,
-    reason: str | None = None,
+    payload: OrderCancelIn = OrderCancelIn(),
     db: AsyncSession = Depends(get_db),
     current: CurrentUser = Depends(require_permission("sale.void")),
 ) -> Order:
-    order = await _get_order(db, order_id)
-    order = await oms.cancel_order(db, current=current, order=order, reason=reason)
+    order = await _get_order_scoped(db, order_id, current)
+    order = await oms.cancel_order(db, current=current, order=order, reason=payload.reason)
     await db.commit()
     await db.refresh(order)
     return order
+
+
+@router.post("/{order_id}/recall", response_model=OrderOut)
+async def recall_dispatched_order(
+    order_id: uuid.UUID,
+    payload: OrderCancelIn = OrderCancelIn(),
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(require_permission("sale.void")),
+) -> Order:
+    order = await _get_order_scoped(db, order_id, current)
+    order = await oms.recall_dispatched_order(db, current=current, order=order, reason=payload.reason)
+    await db.commit()
+    await db.refresh(order)
+    return order
+
+
+@router.get("/{order_id}/refunds", response_model=list[OrderRefundOut])
+async def list_order_refunds(
+    order_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(require_permission("sale.void")),
+) -> list[OrderRefund]:
+    await _get_order_scoped(db, order_id, current)
+    result = await db.execute(select(OrderRefund).where(OrderRefund.order_id == order_id).order_by(OrderRefund.created_at.desc()))
+    return list(result.scalars().all())
+
+
+@router.post("/{order_id}/returns", response_model=OrderReturnOut, status_code=201)
+async def create_order_return(
+    order_id: uuid.UUID,
+    payload: OrderReturnCreate,
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(require_permission("sale.void")),
+) -> Order:
+    order = await _get_order_scoped(db, order_id, current)
+    ret = await oms.create_order_return(db, current=current, order=order, payload=payload)
+    await db.commit()
+    await db.refresh(ret)
+    return ret

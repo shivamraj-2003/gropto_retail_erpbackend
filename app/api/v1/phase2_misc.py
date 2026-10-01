@@ -28,6 +28,13 @@ async def set_reorder_point(
         ReorderPoint.product_id == payload.product_id, ReorderPoint.store_id == payload.store_id
     )
     existing = (await db.execute(stmt)).scalar_one_or_none()
+    # Point 7 audit fix: min/max/safety-stock changes were completely
+    # unaudited — no user, timestamp, or before/after values captured.
+    old_value = (
+        {"min_qty": float(existing.min_qty), "max_qty": float(existing.max_qty), "safety_stock": float(existing.safety_stock)}
+        if existing
+        else None
+    )
     if existing:
         existing.min_qty = payload.min_qty
         existing.max_qty = payload.max_qty
@@ -35,6 +42,18 @@ async def set_reorder_point(
     else:
         rp = ReorderPoint(**payload.model_dump())
         db.add(rp)
+    await write_audit(
+        db,
+        user_id=current.user_id,
+        role_code=current.role_code,
+        store_id=payload.store_id,
+        device_id=current.device_id,
+        action="reorder_point.updated" if existing else "reorder_point.created",
+        entity_type="reorder_point",
+        entity_id=payload.product_id,
+        old_value=old_value,
+        new_value={"min_qty": payload.min_qty, "max_qty": payload.max_qty, "safety_stock": payload.safety_stock},
+    )
     await db.commit()
     return {"status": "ok"}
 

@@ -14,7 +14,7 @@ from app.models.models_phase2 import GiftVoucher
 from app.schemas.schemas import SaleIn, SyncItemVerdict
 from app.services.audit import write_audit
 from app.services.inventory import DuplicateMovement, apply_movement, get_balance as get_stock_balance
-from app.services.loyalty import DuplicateLedgerEntry, apply_ledger_entry, get_balance, get_config
+from app.services.loyalty import DuplicateLedgerEntry, apply_ledger_entry, get_balance, get_config, get_earn_multiplier
 from app.services.wallet import DuplicateWalletEntry, InsufficientWalletBalance, debit_wallet
 
 
@@ -248,7 +248,8 @@ async def process_sale(db: AsyncSession, sale_in: SaleIn) -> SyncItemVerdict:
         # the counter (a rare write-off beats refusing a customer at checkout).
         if customer:
             config = await get_config(db)
-            earn_points = round(float(grand_total) * float(config.earn_rate), 2)
+            multiplier = await get_earn_multiplier(db, customer_id=customer.id)
+            earn_points = round(float(grand_total) * float(config.earn_rate) * multiplier, 2)
             if earn_points > 0:
                 try:
                     await apply_ledger_entry(

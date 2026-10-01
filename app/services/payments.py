@@ -50,3 +50,10 @@ def verify_webhook_signature(raw_body: bytes, signature: str) -> bool:
         return False
     expected = hmac.new(settings.razorpay_webhook_secret.encode(), raw_body, hashlib.sha256).hexdigest()
     return hmac.compare_digest(expected, signature)
+
+
+def refund_payment(payment_id: str, amount_rupees: float) -> dict:
+    """Point 8 audit fix: OMS had no refund capability at all. Amount is
+    rupees at the call site; Razorpay wants paise (integer)."""
+    client = _client()
+    return client.payment.refund(payment_id, {"amount": int(round(amount_rupees * 100))})
