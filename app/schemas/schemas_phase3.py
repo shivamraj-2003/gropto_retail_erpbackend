@@ -151,12 +151,14 @@ class ConsentUpdate(BaseModel):
     whatsapp_opt_in: bool | None = None
     sms_opt_in: bool | None = None
     email_opt_in: bool | None = None
+    source: str = "admin"  # admin, customer_request, unsubscribe_link
 
 
 class CampaignCreate(BaseModel):
     name: str
     channel: str
-    segment_query: dict
+    segment_query: dict = {}
+    saved_audience_id: uuid.UUID | None = None
     template_name: str | None = None
 
 
@@ -166,10 +168,12 @@ class CampaignOut(BaseModel):
     name: str
     channel: str
     segment_query: dict
+    saved_audience_id: uuid.UUID | None = None
     template_name: str | None
     status: str
     sent_count: int
     failed_count: int
+    created_by: uuid.UUID | None = None
     created_at: datetime
 
 

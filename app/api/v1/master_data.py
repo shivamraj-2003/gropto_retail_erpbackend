@@ -29,6 +29,7 @@ from app.schemas.schemas_phase4 import (
     ReasonCodeIn,
     ReasonCodeOut,
 )
+from app.services.audit import write_audit
 
 router = APIRouter(prefix="/master-data", tags=["master-data"])
 
@@ -45,10 +46,62 @@ async def list_companies(
 async def create_company(
     payload: CompanyIn,
     db: AsyncSession = Depends(get_db),
-    _current: CurrentUser = Depends(require_permission("config.manage")),
+    current: CurrentUser = Depends(require_permission("finance.gst_configure")),
 ) -> Company:
     company = Company(**payload.model_dump())
     db.add(company)
+    await db.flush()
+    await write_audit(
+        db,
+        user_id=current.user_id,
+        role_code=current.role_code,
+        store_id=None,
+        device_id=current.device_id,
+        action="company.created",
+        entity_type="company",
+        entity_id=company.id,
+        new_value=payload.model_dump(mode="json"),
+    )
+    await db.commit()
+    await db.refresh(company)
+    return company
+
+
+@router.put("/companies/{company_id}", response_model=CompanyOut)
+async def update_company(
+    company_id: uuid.UUID,
+    payload: CompanyIn,
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(require_permission("finance.gst_configure")),
+) -> Company:
+    """Point 10 audit fix: GSTIN/PAN/e-invoice applicability changes had no
+    audited update path at all (POST-only, no PUT) — GST config changes are
+    exactly the kind of change that must be auditable."""
+    from fastapi import HTTPException
+
+    company = await db.get(Company, company_id)
+    if company is None:
+        raise HTTPException(status_code=404, detail="Company not found")
+    old_value = {
+        "gstin": company.gstin,
+        "pan": company.pan,
+        "einvoice_applicable": company.einvoice_applicable,
+        "aato_threshold": float(company.aato_threshold) if company.aato_threshold is not None else None,
+    }
+    for field, value in payload.model_dump().items():
+        setattr(company, field, value)
+    await write_audit(
+        db,
+        user_id=current.user_id,
+        role_code=current.role_code,
+        store_id=None,
+        device_id=current.device_id,
+        action="company.updated",
+        entity_type="company",
+        entity_id=company.id,
+        old_value=old_value,
+        new_value=payload.model_dump(mode="json"),
+    )
     await db.commit()
     await db.refresh(company)
     return company

@@ -14,6 +14,7 @@ from app.api.v1 import (
     enterprise,
     finance_advanced,
     gift_vouchers,
+    gst,
     hr,
     hr_advanced,
     imports,
@@ -80,6 +81,7 @@ api_router.include_router(procurement_advanced.router)
 api_router.include_router(inventory_intelligence.router)
 api_router.include_router(promotions.router)
 api_router.include_router(finance_advanced.router)
+api_router.include_router(gst.router)
 api_router.include_router(crm_advanced.router)
 api_router.include_router(hr_advanced.router)
 api_router.include_router(control_tower.router)

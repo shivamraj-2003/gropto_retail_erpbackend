@@ -12,8 +12,10 @@ from app.schemas.schemas_phase4 import (
     BankDepositCreate,
     BankDepositOut,
     ReceivableOut,
+    StoreBudgetCreate,
     StoreBudgetOut,
 )
+from app.services.budget import create_or_update_budget, refresh_actuals
 
 router = APIRouter(prefix="/finance-advanced", tags=["finance-advanced"])
 
@@ -259,6 +261,44 @@ async def list_store_budgets(
         stmt = stmt.where(StoreBudget.store_id == store_id)
     result = await db.execute(stmt)
     return list(result.scalars().all())
+
+
+@router.post("/budgets", response_model=StoreBudgetOut, status_code=201)
+async def create_store_budget(
+    payload: StoreBudgetCreate,
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(require_permission("purchase.manage")),
+) -> StoreBudget:
+    """Point 10 audit fix: StoreBudget had a model, a read-only API, and a
+    frontend tab, but no endpoint could ever create a row — the feature was
+    dead in every real deployment."""
+    require_store_access(payload.store_id, current)
+    budget = await create_or_update_budget(
+        db,
+        current=current,
+        store_id=payload.store_id,
+        financial_year=payload.financial_year,
+        month=payload.month,
+        capex_budget=payload.capex_budget,
+        opex_budget=payload.opex_budget,
+    )
+    await db.commit()
+    await db.refresh(budget)
+    return budget
+
+
+@router.post("/budgets/refresh-actuals")
+async def refresh_budget_actuals(
+    financial_year: int,
+    month: int,
+    db: AsyncSession = Depends(get_db),
+    _current: CurrentUser = Depends(require_permission("report.export")),
+) -> dict:
+    """Point 10 audit fix: actual_opex/actual_capex had no computation path
+    at all — recomputes both from real approved Expense records."""
+    updated = await refresh_actuals(db, financial_year=financial_year, month=month)
+    await db.commit()
+    return {"budgets_updated": updated}
 
 
 @router.get("/receivables", response_model=list[ReceivableOut])

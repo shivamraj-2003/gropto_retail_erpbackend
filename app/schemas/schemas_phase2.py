@@ -185,6 +185,9 @@ class ShiftClose(BaseModel):
     # sum must match counted_cash (validated in cash.py service), giving a
     # real denomination count instead of only a lump total.
     denomination_breakdown: dict[str, int] | None = None
+    # Point 10 audit fix: captured once the variance exceeds
+    # cash.py::VARIANCE_TOLERANCE (not required below it).
+    variance_reason: str | None = None
 
 
 class DayCloseRequest(BaseModel):
@@ -297,6 +300,13 @@ class VendorInvoiceCreate(BaseModel):
     invoice_number: str
     invoice_date: date
     invoice_amount: float
+    # Point 10 audit fix: purchase-side GST data didn't exist — all optional,
+    # informational capture (not used by the existing amount-based 3-way match).
+    taxable_value: float | None = None
+    cgst_amount: float | None = None
+    sgst_amount: float | None = None
+    igst_amount: float | None = None
+    place_of_supply: str | None = None
 
 
 class VendorInvoiceOut(BaseModel):
@@ -308,6 +318,11 @@ class VendorInvoiceOut(BaseModel):
     invoice_number: str
     invoice_date: date
     invoice_amount: float
+    taxable_value: float | None
+    cgst_amount: float | None
+    sgst_amount: float | None
+    igst_amount: float | None
+    place_of_supply: str | None
     status: str
     created_at: datetime
 
@@ -336,6 +351,11 @@ class PayableOut(BaseModel):
 class VendorPaymentIn(BaseModel):
     amount: float
     reference: str | None = None
+    # Point 10 audit fix: no idempotency protection existed on vendor
+    # payments at all — a retried/double-clicked submission had no
+    # server-side guard against double-paying. Optional for backward
+    # compatibility; strongly recommended.
+    idempotency_key: uuid.UUID | None = None
 
 
 class VendorPaymentOut(BaseModel):
@@ -386,6 +406,11 @@ class StoreOut(BaseModel):
     # Achievement KPIs — null until someone sets a real value for the store.
     area_sqft: float | None = None
     target_revenue_monthly: float | None = None
+    # Point 10 audit fix: GST registration/place-of-supply data didn't exist
+    # on Store at all.
+    company_id: uuid.UUID | None = None
+    gstin: str | None = None
+    state: str | None = None
 
 
 class StoreCreateIn(BaseModel):
@@ -395,6 +420,9 @@ class StoreCreateIn(BaseModel):
     cluster: str | None = None
     area_sqft: float | None = None
     target_revenue_monthly: float | None = None
+    company_id: uuid.UUID | None = None
+    gstin: str | None = None
+    state: str | None = None
 
 
 class StoreCreateResult(BaseModel):
@@ -413,6 +441,9 @@ class StoreUpdateIn(BaseModel):
     cluster: str | None = None
     area_sqft: float | None = None
     target_revenue_monthly: float | None = None
+    company_id: uuid.UUID | None = None
+    gstin: str | None = None
+    state: str | None = None
 
 
 class StoreUpdateResult(BaseModel):

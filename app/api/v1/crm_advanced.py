@@ -1,13 +1,15 @@
 import uuid
+from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import delete, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser, require_permission
 from app.core.database import get_db
 from app.models.models_phase4 import CustomerServiceTicket, RfmCohortSnapshot
-from app.schemas.schemas_phase4 import RfmCohortOut, TicketCreate, TicketOut
+from app.schemas.schemas_phase4 import RfmCohortOut, TicketCreate, TicketOut, TicketUpdate
+from app.services.audit import write_audit
 
 router = APIRouter(prefix="/crm-advanced", tags=["crm-advanced"])
 
@@ -89,7 +91,11 @@ async def list_tickets(
     customer_id: uuid.UUID | None = None,
     status_filter: str | None = None,
     db: AsyncSession = Depends(get_db),
-    _current: CurrentUser = Depends(require_permission("inventory.view")),
+    # Point 11 audit fix: this was gated by inventory.view, an unrelated
+    # permission that most store staff hold — any of them could read every
+    # customer service ticket company-wide. crm.view is the actual CRM
+    # read permission used everywhere else in this feature area.
+    _current: CurrentUser = Depends(require_permission("crm.view")),
 ) -> list[CustomerServiceTicket]:
     stmt = select(CustomerServiceTicket).order_by(CustomerServiceTicket.created_at.desc())
     if customer_id:
@@ -104,10 +110,61 @@ async def list_tickets(
 async def create_ticket(
     payload: TicketCreate,
     db: AsyncSession = Depends(get_db),
-    _current: CurrentUser = Depends(require_permission("inventory.view")),
+    current: CurrentUser = Depends(require_permission("crm.view")),
 ) -> CustomerServiceTicket:
     ticket = CustomerServiceTicket(**payload.model_dump())
     db.add(ticket)
+    await db.flush()
+    await write_audit(
+        db,
+        user_id=current.user_id,
+        role_code=current.role_code,
+        store_id=None,
+        device_id=current.device_id,
+        action="ticket.created",
+        entity_type="customer_service_ticket",
+        entity_id=ticket.id,
+        new_value={"category": ticket.category, "subject": ticket.subject, "priority": ticket.priority},
+    )
+    await db.commit()
+    await db.refresh(ticket)
+    return ticket
+
+
+@router.put("/tickets/{ticket_id}", response_model=TicketOut)
+async def update_ticket(
+    ticket_id: uuid.UUID,
+    payload: TicketUpdate,
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(require_permission("crm.view")),
+) -> CustomerServiceTicket:
+    """Point 11 audit fix: the frontend already called this endpoint
+    (assign/resolve a ticket) — it didn't exist on the backend at all, so
+    every call 404'd."""
+    ticket = await db.get(CustomerServiceTicket, ticket_id)
+    if ticket is None:
+        raise HTTPException(status_code=404, detail="Ticket not found")
+    old_value = {"status": ticket.status, "assigned_to": str(ticket.assigned_to) if ticket.assigned_to else None}
+    if payload.status is not None:
+        ticket.status = payload.status
+        if payload.status in ("resolved", "closed") and ticket.resolved_at is None:
+            ticket.resolved_at = datetime.now(timezone.utc)
+    if payload.assigned_to is not None:
+        ticket.assigned_to = payload.assigned_to
+    if payload.resolution_notes is not None:
+        ticket.resolution_notes = payload.resolution_notes
+    await write_audit(
+        db,
+        user_id=current.user_id,
+        role_code=current.role_code,
+        store_id=None,
+        device_id=current.device_id,
+        action="ticket.updated",
+        entity_type="customer_service_ticket",
+        entity_id=ticket.id,
+        old_value=old_value,
+        new_value={"status": ticket.status, "assigned_to": str(ticket.assigned_to) if ticket.assigned_to else None},
+    )
     await db.commit()
     await db.refresh(ticket)
     return ticket
@@ -117,7 +174,7 @@ async def create_ticket(
 async def list_rfm_cohorts(
     segment: str | None = None,
     db: AsyncSession = Depends(get_db),
-    _current: CurrentUser = Depends(require_permission("inventory.view")),
+    _current: CurrentUser = Depends(require_permission("crm.view")),
 ) -> list[RfmCohortSnapshot]:
     stmt = select(RfmCohortSnapshot)
     if segment:

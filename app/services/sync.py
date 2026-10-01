@@ -9,10 +9,11 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.models import Customer, Device, Payment, Role, Sale, SaleItem, SyncFailure, User
+from app.models.models import Customer, Device, Payment, Role, Sale, SaleItem, Store, SyncFailure, User
 from app.models.models_phase2 import GiftVoucher
 from app.schemas.schemas import SaleIn, SyncItemVerdict
 from app.services.audit import write_audit
+from app.services.gst import determine_place_of_supply, split_tax
 from app.services.inventory import DuplicateMovement, apply_movement, get_balance as get_stock_balance
 from app.services.loyalty import DuplicateLedgerEntry, apply_ledger_entry, get_balance, get_config, get_earn_multiplier
 from app.services.wallet import DuplicateWalletEntry, InsufficientWalletBalance, debit_wallet
@@ -51,20 +52,29 @@ async def process_sale(db: AsyncSession, sale_in: SaleIn) -> SyncItemVerdict:
         if device is None or device.status != "active":
             raise ValueError("Device not active")
 
+        # Point 10 audit fix: place of supply / inter-state determination —
+        # defaults to the selling store's own state (the normal walk-in
+        # case); only flips to inter-state when a B2B customer_gstin is
+        # supplied with a genuinely different state prefix.
+        store = await db.get(Store, sale_in.store_id)
+        place_of_supply, inter_state = determine_place_of_supply(
+            store_state=store.state if store else None, customer_gstin=sale_in.customer_gstin
+        )
+
         # GST-inclusive pricing (per Indian law, MRP already includes GST — tax is
         # backed OUT of unit_price here, never added on top). subtotal ends up
         # meaning "taxable value" (pre-GST), not the old exclusive-pricing gross.
         subtotal = 0.0
         tax_total = 0.0
-        line_tax_breakdown: dict[int, tuple[float, float]] = {}
+        line_tax_breakdown: dict[int, tuple[float, float, float, float]] = {}
         for idx, item in enumerate(sale_in.items):
             line_net = item.quantity * item.unit_price - item.line_discount  # GST-inclusive
             rate = float(item.tax_rate_snapshot)
-            line_taxable = line_net / (1 + rate / 100) if rate else line_net
-            line_tax = line_net - line_taxable
+            line_taxable, cgst, sgst, igst = split_tax(line_net, rate, inter_state=inter_state)
+            line_tax = cgst + sgst + igst
             subtotal += line_taxable
             tax_total += line_tax
-            line_tax_breakdown[idx] = (line_taxable, line_tax)
+            line_tax_breakdown[idx] = (line_taxable, cgst, sgst, igst)
 
         line_discounts = sum(item.line_discount for item in sale_in.items)
         discount_total = sale_in.discount_total + line_discounts
@@ -145,6 +155,8 @@ async def process_sale(db: AsyncSession, sale_in: SaleIn) -> SyncItemVerdict:
             grand_total=grand_total,
             override_user_id=override_user_id,
             override_reason=override_reason,
+            place_of_supply=place_of_supply,
+            customer_gstin=sale_in.customer_gstin,
             client_idempotency_key=sale_in.client_idempotency_key,
             billed_at=sale_in.billed_at,
         )
@@ -152,7 +164,7 @@ async def process_sale(db: AsyncSession, sale_in: SaleIn) -> SyncItemVerdict:
         await db.flush()
 
         for idx, item in enumerate(sale_in.items):
-            line_taxable, line_tax = line_tax_breakdown[idx]
+            line_taxable, cgst, sgst, igst = line_tax_breakdown[idx]
             db.add(
                 SaleItem(
                     sale_id=sale.id,
@@ -165,8 +177,9 @@ async def process_sale(db: AsyncSession, sale_in: SaleIn) -> SyncItemVerdict:
                     line_discount=item.line_discount,
                     line_total=item.quantity * item.unit_price - item.line_discount,
                     taxable_value=line_taxable,
-                    cgst_amount=line_tax / 2,
-                    sgst_amount=line_tax / 2,
+                    cgst_amount=cgst,
+                    sgst_amount=sgst,
+                    igst_amount=igst,
                     mrp_snapshot=item.mrp_snapshot,
                 )
             )

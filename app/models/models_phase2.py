@@ -235,6 +235,13 @@ class CashierShift(Base):
     # just cash.
     denomination_breakdown: Mapped[dict | None] = mapped_column(JSONB)
     tender_breakdown: Mapped[dict | None] = mapped_column(JSONB)
+    # Point 10 audit fix: VARIANCE_TOLERANCE was defined in cash.py but never
+    # referenced anywhere — no discrepancy classification or escalation
+    # existed regardless of variance size. within_tolerance/shortage_flagged/
+    # excess_flagged, set at close; variance_reason is the cashier's note,
+    # required once the variance exceeds tolerance.
+    variance_status: Mapped[str] = mapped_column(String, default="within_tolerance")
+    variance_reason: Mapped[str | None] = mapped_column(Text)
     status: Mapped[str] = mapped_column(String, default="open")  # open, closed
     opened_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -399,6 +406,15 @@ class VendorInvoice(Base):
     invoice_number: Mapped[str] = mapped_column(String, nullable=False)
     invoice_date: Mapped[date] = mapped_column(Date, nullable=False)
     invoice_amount: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False)
+    # Point 10 audit fix: purchase-side GST data didn't exist at all — only a
+    # single lump invoice_amount, no tax breakdown of any kind. All nullable
+    # (informational capture, not required for the existing amount-based
+    # three-way match, which is left untouched).
+    taxable_value: Mapped[float | None] = mapped_column(Numeric(12, 2))
+    cgst_amount: Mapped[float | None] = mapped_column(Numeric(12, 2))
+    sgst_amount: Mapped[float | None] = mapped_column(Numeric(12, 2))
+    igst_amount: Mapped[float | None] = mapped_column(Numeric(12, 2))
+    place_of_supply: Mapped[str | None] = mapped_column(String)
     status: Mapped[str] = mapped_column(String, default="recorded")  # recorded, matched, discrepancy_flagged
     created_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
@@ -431,6 +447,11 @@ class VendorPayment(Base):
     reference: Mapped[str | None] = mapped_column(String)
     requested_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"))
     status: Mapped[str] = mapped_column(String, default="applied")  # applied, pending_approval
+    # Point 10 audit fix: unlike every other money-moving table in this
+    # codebase (Sale, LoyaltyLedger, InventoryMovement, ...), VendorPayment
+    # had no idempotency protection at all — a retried/double-clicked
+    # payment submission had no server-side guard against double-paying.
+    idempotency_key: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), unique=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 

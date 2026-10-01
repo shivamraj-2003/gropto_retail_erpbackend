@@ -195,6 +195,12 @@ class Campaign(Base):
     status: Mapped[str] = mapped_column(String, default="draft")  # draft, sending, sent, failed
     sent_count: Mapped[int] = mapped_column(Integer, default=0)
     failed_count: Mapped[int] = mapped_column(Integer, default=0)
+    # Point 11 audit fix: a campaign could only ever target a flat RFM-band
+    # string — no way to point it at a real, reusable, multi-criteria
+    # SavedAudience. created_by closes a prior audit-trail gap (no record of
+    # who created a campaign at all).
+    saved_audience_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("saved_audiences.id"))
+    created_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -207,6 +213,12 @@ class CampaignRecipient(Base):
     provider_message_id: Mapped[str | None] = mapped_column(String)
     error: Mapped[str | None] = mapped_column(String)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    # Point 11 audit fix: nothing stopped a campaign from being sent twice
+    # and double-messaging every recipient — one row per (campaign,
+    # customer) makes a resend idempotent (see services/crm.py's retry path,
+    # which only targets customers with no prior "sent" row).
+    __table_args__ = (UniqueConstraint("campaign_id", "customer_id", name="uq_campaign_recipient"),)
 
 
 # ---------------------------------------------------------------------------

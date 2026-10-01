@@ -295,6 +295,52 @@ class StoreBudget(Base):
     capex_budget: Mapped[float] = mapped_column(Numeric(12, 2), default=0.0)
     opex_budget: Mapped[float] = mapped_column(Numeric(12, 2), default=0.0)
     actual_opex: Mapped[float] = mapped_column(Numeric(12, 2), default=0.0)
+    # Point 10 audit fix: this table had a read-only API and a frontend tab
+    # built against it, but zero write path anywhere — no endpoint ever
+    # created a budget or computed an actual. actual_capex mirrors
+    # actual_opex (previously missing entirely); created_by/updated_at make
+    # the row auditable like everything else in the app.
+    actual_capex: Mapped[float] = mapped_column(Numeric(12, 2), default=0.0)
+    created_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (UniqueConstraint("store_id", "financial_year", "month", name="uq_store_budget_period"),)
+
+
+class EInvoice(Base):
+    """Point 10 audit fix: e-invoice/IRN/IRP integration did not exist in any
+    form. This is the real status-tracking skeleton — applicability
+    determination, payload generation, and a status machine are all real;
+    the actual IRP submission call is intentionally stubbed behind
+    services/einvoice.py::is_configured() (same pattern as
+    services/payments.py's Razorpay gate) because it requires real GSP
+    (GST Suvidha Provider) credentials this environment doesn't have. Faking
+    a working submission would misrepresent compliance status, which is
+    exactly the failure mode this table exists to make visible instead of
+    hiding."""
+
+    __tablename__ = "einvoices"
+    id: Mapped[uuid.UUID] = uuid_pk()
+    sale_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("sales.id"), nullable=False, unique=True)
+    company_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("companies.id"))
+    status: Mapped[str] = mapped_column(
+        String, default="not_applicable"
+    )  # not_applicable, pending, submitted, irn_generated, failed, cancelled
+    payload_json: Mapped[dict | None] = mapped_column(JSONB)
+    irn: Mapped[str | None] = mapped_column(String, unique=True)
+    ack_no: Mapped[str | None] = mapped_column(String)
+    ack_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    signed_qr_code: Mapped[str | None] = mapped_column(Text)
+    error_response: Mapped[str | None] = mapped_column(Text)
+    retry_count: Mapped[int] = mapped_column(Integer, default=0)
+    # Prevents a retried submission call from ever generating two IRNs for
+    # the same sale under replay — same idempotent-replay pattern used for
+    # inventory_movements/loyalty_ledger elsewhere in this codebase.
+    idempotency_key: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), unique=True, server_default=func.gen_random_uuid())
+    cancelled_reason: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class CustomerReceivable(Base):
@@ -321,6 +367,12 @@ class CustomerServiceTicket(Base):
     subject: Mapped[str] = mapped_column(String, nullable=False)
     description: Mapped[str | None] = mapped_column(Text)
     status: Mapped[str] = mapped_column(String, default="open")  # open, in_progress, resolved, closed
+    # Point 11 audit fix: frontend already called a PUT /tickets/{id} update
+    # endpoint (assign/resolve) that didn't exist on either the API or the
+    # model — these three columns are what that update actually needed.
+    assigned_to: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"))
+    resolution_notes: Mapped[str | None] = mapped_column(Text)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -334,6 +386,54 @@ class RfmCohortSnapshot(Base):
     segment: Mapped[str] = mapped_column(String, default="new_customer")  # champions, loyal, at_risk, hibernating
     churn_risk_flag: Mapped[bool] = mapped_column(Boolean, default=False)
     calculated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class ClvSnapshot(Base):
+    """Point 11 audit fix: services/clv.py's real CLV computation referenced
+    this table everywhere but it was never defined anywhere — every CLV
+    endpoint failed on import before this fix."""
+
+    __tablename__ = "clv_snapshots"
+    id: Mapped[uuid.UUID] = uuid_pk()
+    customer_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("customers.id"), nullable=False, unique=True)
+    historic_clv: Mapped[float] = mapped_column(Numeric(14, 2), default=0)
+    predicted_clv: Mapped[float] = mapped_column(Numeric(14, 2), default=0)
+    avg_order_value: Mapped[float] = mapped_column(Numeric(12, 2), default=0)
+    purchase_frequency: Mapped[float] = mapped_column(Numeric(10, 4), default=0)
+    customer_lifespan_months: Mapped[int] = mapped_column(Integer, default=0)
+    segment: Mapped[str] = mapped_column(String, default="new")  # new, high_value, medium_value, low_value
+    calculated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class SavedAudience(Base):
+    """Point 11 audit fix: the audience-builder endpoints referenced this
+    table and a build_audience() function that didn't exist anywhere —
+    both POST and GET /crm/audiences failed on every call before this fix."""
+
+    __tablename__ = "saved_audiences"
+    id: Mapped[uuid.UUID] = uuid_pk()
+    name: Mapped[str] = mapped_column(String, nullable=False)
+    criteria: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    estimated_size: Mapped[int] = mapped_column(Integer, default=0)
+    created_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class ConsentHistory(Base):
+    """Point 11 audit fix: GET /customers/{id}/consent-history referenced
+    this table and it didn't exist — the endpoint failed on every call, and
+    update_consent() itself never recorded a change trail at all, even
+    independent of this missing table."""
+
+    __tablename__ = "consent_history"
+    id: Mapped[uuid.UUID] = uuid_pk()
+    customer_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("customers.id"), nullable=False)
+    channel: Mapped[str] = mapped_column(String, nullable=False)  # whatsapp, sms, email
+    old_value: Mapped[bool | None] = mapped_column(Boolean)
+    new_value: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    changed_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"))
+    source: Mapped[str] = mapped_column(String, default="admin")  # admin, customer_request, unsubscribe_link
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 # ---------------------------------------------------------------------------
@@ -398,13 +498,27 @@ class SuspiciousBillingLog(Base):
 # ---------------------------------------------------------------------------
 
 class Company(Base):
+    """Point 10 audit fix: this is the real GST taxpayer/legal-entity record —
+    GST registration (and therefore e-invoice applicability/turnover) attaches
+    to a GSTIN held by a PAN, not to an individual Store. Stores are now
+    linked here (Store.company_id) instead of GST concepts floating free."""
+
     __tablename__ = "companies"
     id: Mapped[uuid.UUID] = uuid_pk()
     name: Mapped[str] = mapped_column(String, nullable=False)
     legal_entity_name: Mapped[str] = mapped_column(String, nullable=False)
     gstin: Mapped[str | None] = mapped_column(String)
+    pan: Mapped[str | None] = mapped_column(String)
     state: Mapped[str] = mapped_column(String, nullable=False)
     city: Mapped[str] = mapped_column(String, nullable=False)
+    # Point 10 audit fix: e-invoice applicability is a configured regulatory
+    # fact (does this GSTIN's PAN cross the AATO e-invoicing threshold this
+    # financial year?), not something the code should infer from a single
+    # store's revenue. Finance sets this explicitly; aato_threshold is the
+    # configurable monitoring line used to warn before that determination is
+    # due, not a hardcoded business rule.
+    einvoice_applicable: Mapped[bool] = mapped_column(Boolean, default=False)
+    aato_threshold: Mapped[float | None] = mapped_column(Numeric(14, 2))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
