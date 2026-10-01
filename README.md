@@ -133,16 +133,41 @@ backend/
 ## Dev/pilot login credentials
 
 Seeded by `python -m scripts.seed` (Super Admin) and `python -m scripts.seed_test_users` (one
-account per other role, all sharing store scope with the Super Admin). **Change every one of
-these before any real go-live** — they exist purely so each role can be tested without creating
-users by hand.
+account per other role, all sharing store scope with the Super Admin except the enterprise-wide
+roles — see "Store scope" below). **Change every one of these before any real go-live** — they
+exist purely so each role can be tested without creating users by hand. Every row below was
+verified with a real `POST /api/v1/auth/login` call against a live instance, not assumed.
 
-| Role | Email | Password |
-|---|---|---|
-| Super Admin | `admin@gropto.local` | `ChangeMe!123` |
-| Admin | `admin.test@gropto.local` | `Test@123` |
-| Store Manager | `manager@gropto.local` | `Test@123` |
-| Cashier | `cashier@gropto.local` | `Test@123` |
+| Role | Email | Password | Store scope |
+|---|---|---|---|
+| Super Admin | `admin@gropto.local` | `ChangeMe!123` | all stores |
+| Admin | `admin.test@gropto.local` | `Test@123` | all stores |
+| System Admin | `sysadmin@gropto.local` | `Test@123` | all stores |
+| CEO | `ceo@gropto.local` | `Test@123` | all stores |
+| COO | `coo@gropto.local` | `Test@123` | all stores |
+| Finance Head | `financehead@gropto.local` | `Test@123` | all stores |
+| Purchase Head | `purchasehead@gropto.local` | `Test@123` | all stores |
+| Regional Manager | `regionalmgr@gropto.local` | `Test@123` | assigned store(s) only |
+| Store Manager | `manager@gropto.local` | `Test@123` | assigned store only |
+| Inventory User | `inventoryuser@gropto.local` | `Test@123` | assigned store only |
+| Cashier | `cashier@gropto.local` | `Test@123` | assigned store only |
+
+"All stores" means the role is in `ENTERPRISE_WIDE_ROLES` (`app/api/deps.py`) — it bypasses
+per-store scoping everywhere (`CurrentUser.sees_all_stores()`), the same bypass Super Admin and
+Admin already had. Regional Manager is deliberately **not** enterprise-wide — per blueprint §14
+("Regional/Cluster Manager: Assigned stores and operational exceptions") it's scoped through the
+normal `user_stores` assignment like Store Manager/Cashier, just potentially to more than one
+store.
+
+Two real bugs were found and fixed while wiring these up:
+- `ASSIGNABLE_ROLES` (`app/schemas/schemas.py`) only allowed `POST /api/v1/users` to create
+  `admin`/`cashier`/`store_manager` accounts — the other 7 roles had permissions seeded but no
+  way to actually create a user for them. Expanded to all 10 non-super-admin roles.
+- The login endpoint's device-binding check (`app/api/v1/auth.py`) only exempted
+  `super_admin`/`admin` from requiring a matching `store_ids` entry, so every other
+  enterprise-wide role — which by design carries zero `store_ids` — was rejected at login with
+  "User not assigned to this store". Fixed by extracting the shared `ENTERPRISE_WIDE_ROLES`
+  constant so the login check and `sees_all_stores()` can't drift apart again.
 
 Login is **email + password only** — no activation code, no pending/approval gate. A device
 that has never logged in before is recorded and active from its very first attempt; there's

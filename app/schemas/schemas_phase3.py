@@ -17,7 +17,7 @@ class OrderItemIn(BaseModel):
 class OrderCreate(BaseModel):
     channel: str
     customer_phone: str
-    preferred_store_id: uuid.UUID
+    preferred_store_id: uuid.UUID | None = None
     delivery_address: str | None = None
     items: list[OrderItemIn]
 

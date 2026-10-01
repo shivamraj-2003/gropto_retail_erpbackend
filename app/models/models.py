@@ -37,6 +37,17 @@ def revision_column() -> Mapped[int]:
     )
 
 
+class Region(Base):
+    """Real Company→City/Cluster→Store rollup layer (blueprint §1/§2) — replaces
+    the free-text-only Store.cluster tag with a queryable hierarchy."""
+
+    __tablename__ = "regions"
+    id: Mapped[uuid.UUID] = uuid_pk()
+    name: Mapped[str] = mapped_column(String, nullable=False)
+    code: Mapped[str] = mapped_column(String, unique=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 class Store(Base):
     __tablename__ = "stores"
     id: Mapped[uuid.UUID] = uuid_pk()
@@ -44,6 +55,7 @@ class Store(Base):
     name: Mapped[str] = mapped_column(String, nullable=False)
     city: Mapped[str | None] = mapped_column(String)
     cluster: Mapped[str | None] = mapped_column(String)
+    region_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("regions.id"))
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
@@ -81,6 +93,8 @@ class User(Base):
     password_hash: Mapped[str] = mapped_column(String, nullable=False)
     role_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("roles.id"), nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    mfa_secret: Mapped[str | None] = mapped_column(String)
+    mfa_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
@@ -154,6 +168,8 @@ class Product(Base):
     # adding it on top. See app/services/sync.py's process_sale for the split.
     tax_rate: Mapped[float] = mapped_column(Numeric(5, 2), default=0)
     hsn_code: Mapped[str | None] = mapped_column(String)
+    brand: Mapped[str | None] = mapped_column(String)
+    is_private_label: Mapped[bool] = mapped_column(Boolean, default=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     revision: Mapped[int] = revision_column()
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
@@ -217,6 +233,20 @@ class LoyaltyConfig(Base):
     min_balance_to_redeem: Mapped[float] = mapped_column(Numeric(12, 2), default=50)
     max_redeem_share: Mapped[float] = mapped_column(Numeric(4, 3), default=0.5)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class LoyaltyTier(Base):
+    """Blueprint §9: "Loyalty points earn/burn, tiers, expiry." Tier is derived
+    from lifetime points earned (sum of positive loyalty_ledger deltas), not
+    stored per-customer — a customer's tier is always recomputed from their
+    real ledger history rather than a cached, driftable field."""
+
+    __tablename__ = "loyalty_tiers"
+    id: Mapped[uuid.UUID] = uuid_pk()
+    name: Mapped[str] = mapped_column(String, nullable=False)  # e.g. Silver, Gold, Platinum
+    min_lifetime_points: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False)
+    earn_rate_multiplier: Mapped[float] = mapped_column(Numeric(6, 4), default=1.0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class DiscountRule(Base):

@@ -35,6 +35,16 @@ def create_access_token(
     return jwt.encode(payload, settings.jwt_secret, algorithm=settings.jwt_algorithm)
 
 
+def create_mfa_challenge_token(*, user_id: uuid.UUID) -> str:
+    """Short-lived (2 min), single-purpose token proving "password already
+    verified for this user" — issued instead of real access/refresh tokens
+    when the user has MFA enabled, exchanged for real tokens only after a
+    valid TOTP code is presented to /auth/mfa/login-verify."""
+    now = datetime.now(timezone.utc)
+    payload = {"sub": str(user_id), "iat": now, "exp": now + timedelta(minutes=2), "type": "mfa_challenge"}
+    return jwt.encode(payload, settings.jwt_secret, algorithm=settings.jwt_algorithm)
+
+
 def decode_token(token: str) -> dict:
     try:
         return jwt.decode(token, settings.jwt_secret, algorithms=[settings.jwt_algorithm])

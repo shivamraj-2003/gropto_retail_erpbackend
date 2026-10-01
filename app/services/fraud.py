@@ -72,4 +72,77 @@ async def run_fraud_scan(db: AsyncSession) -> list[FraudAlert]:
         db.add(alert)
         alerts.append(alert)
 
+    stock_adjustment_abuse = (
+        await db.execute(
+            text(
+                """
+                select created_by, store_id, count(*) cnt, sum(abs(delta)) total_qty
+                from inventory_movements
+                where source_type = 'manual_adjustment' and created_at::date = current_date
+                group by created_by, store_id
+                having count(*) > 10
+                """
+            )
+        )
+    ).all()
+    for row in stock_adjustment_abuse:
+        alert = FraudAlert(
+            store_id=row.store_id,
+            rule_code="stock_adjustment_abuse",
+            severity="medium",
+            details={"created_by": str(row.created_by), "adjustment_count": row.cnt, "total_qty_adjusted": float(row.total_qty)},
+        )
+        db.add(alert)
+        alerts.append(alert)
+
+    master_data_changes = (
+        await db.execute(
+            text(
+                """
+                select user_id, count(*) cnt
+                from audit_log
+                where action in (
+                    'price_change.applied', 'product_deactivation.applied',
+                    'store_update.applied', 'store_create.applied', 'config_change.applied'
+                )
+                  and created_at::date = current_date
+                group by user_id
+                having count(*) > 20
+                """
+            )
+        )
+    ).all()
+    for row in master_data_changes:
+        alert = FraudAlert(
+            store_id=None,
+            rule_code="excessive_master_data_changes",
+            severity="medium",
+            details={"user_id": str(row.user_id), "change_count": row.cnt},
+        )
+        db.add(alert)
+        alerts.append(alert)
+
+    repeated_returns = (
+        await db.execute(
+            text(
+                """
+                select requested_by, store_id, count(*) cnt, sum(refund_total) total_refund
+                from returns
+                where created_at::date = current_date
+                group by requested_by, store_id
+                having count(*) > 3
+                """
+            )
+        )
+    ).all()
+    for row in repeated_returns:
+        alert = FraudAlert(
+            store_id=row.store_id,
+            rule_code="repeated_returns",
+            severity="medium",
+            details={"requested_by": str(row.requested_by), "return_count": row.cnt, "total_refund": float(row.total_refund)},
+        )
+        db.add(alert)
+        alerts.append(alert)
+
     return alerts

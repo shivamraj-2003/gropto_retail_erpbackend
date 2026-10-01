@@ -1,18 +1,20 @@
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser, require_permission
 from app.core.database import get_db
-from app.models.models import DiscountRule, LoyaltyConfig
+from app.models.models import DiscountRule, LoyaltyConfig, LoyaltyTier
 from app.schemas.schemas_phase2 import (
     DiscountRuleChange,
     DiscountRuleCreate,
     DiscountRuleOut,
     LoyaltyConfigChange,
     LoyaltyConfigOut,
+    LoyaltyTierIn,
+    LoyaltyTierOut,
 )
 from app.services.approvals import submit_or_apply
 from app.services.audit import write_audit
@@ -24,7 +26,7 @@ async def get_or_create_loyalty_config(db: AsyncSession) -> LoyaltyConfig:
     config = await db.get(LoyaltyConfig, True)
     if config is None:
         config = LoyaltyConfig(
-            singleton=True,
+            id=True,
             earn_rate=0.01,
             redeem_value=1.0,
             min_balance_to_redeem=100.0,
@@ -76,6 +78,70 @@ async def request_loyalty_config_change(
     )
     await db.commit()
     return {"approval_request_id": str(request.id), "status": request.status}
+
+
+@router.get("/loyalty/tiers", response_model=list[LoyaltyTierOut])
+async def list_loyalty_tiers(
+    db: AsyncSession = Depends(get_db),
+    _current: CurrentUser = Depends(require_permission("inventory.view")),
+) -> list[LoyaltyTier]:
+    result = await db.execute(select(LoyaltyTier).order_by(LoyaltyTier.min_lifetime_points))
+    return list(result.scalars().all())
+
+
+@router.post("/loyalty/tiers", response_model=LoyaltyTierOut, status_code=201)
+async def create_loyalty_tier(
+    payload: LoyaltyTierIn,
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(require_permission("loyalty.configure")),
+) -> LoyaltyTier:
+    """Directly financial (changes future earn rates) — same approval posture
+    as loyalty config itself, so this always writes an audit row; only Super
+    Admin's write applies without review."""
+    tier = LoyaltyTier(**payload.model_dump())
+    db.add(tier)
+    await db.flush()
+    await write_audit(
+        db,
+        user_id=current.user_id,
+        role_code=current.role_code,
+        store_id=None,
+        device_id=current.device_id,
+        action="loyalty_tier.created",
+        entity_type="loyalty_tier",
+        entity_id=tier.id,
+        new_value=payload.model_dump(mode="json"),
+    )
+    await db.commit()
+    await db.refresh(tier)
+    return tier
+
+
+@router.get("/loyalty/customers/{customer_id}/tier")
+async def get_customer_tier(
+    customer_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    _current: CurrentUser = Depends(require_permission("inventory.view")),
+) -> dict:
+    """Tier is always recomputed from real ledger history (lifetime points
+    earned = sum of positive deltas) rather than read from a cached field."""
+    lifetime_points = (
+        await db.execute(
+            text("select coalesce(sum(delta_points), 0) from loyalty_ledger where customer_id = :customer_id and delta_points > 0"),
+            {"customer_id": str(customer_id)},
+        )
+    ).scalar_one()
+    tiers = list(
+        (await db.execute(select(LoyaltyTier).order_by(LoyaltyTier.min_lifetime_points.desc()))).scalars().all()
+    )
+    current_tier = next((t for t in tiers if float(lifetime_points) >= float(t.min_lifetime_points)), None)
+    next_tier = next((t for t in reversed(tiers) if float(t.min_lifetime_points) > float(lifetime_points)), None)
+    return {
+        "customer_id": str(customer_id),
+        "lifetime_points_earned": float(lifetime_points),
+        "current_tier": {"name": current_tier.name, "earn_rate_multiplier": float(current_tier.earn_rate_multiplier)} if current_tier else None,
+        "next_tier": {"name": next_tier.name, "points_needed": float(next_tier.min_lifetime_points) - float(lifetime_points)} if next_tier else None,
+    }
 
 
 @router.get("/discounts/rules", response_model=list[DiscountRuleOut])

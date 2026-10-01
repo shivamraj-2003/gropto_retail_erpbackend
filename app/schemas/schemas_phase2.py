@@ -280,6 +280,20 @@ class LoyaltyConfigChange(BaseModel):
     reason: str | None = None
 
 
+class LoyaltyTierIn(BaseModel):
+    name: str
+    min_lifetime_points: float
+    earn_rate_multiplier: float = 1.0
+
+
+class LoyaltyTierOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: uuid.UUID
+    name: str
+    min_lifetime_points: float
+    earn_rate_multiplier: float
+
+
 class DiscountRuleCreate(BaseModel):
     name: str
     scope: str  # product, category, bill
