@@ -53,9 +53,11 @@ async def cash_movement(
     if shift is None:
         raise HTTPException(status_code=404, detail="Shift not found")
     require_store_access(shift.store_id, current)
-    movement = await cash_service.record_cash_movement(db, current=current, shift=shift, payload=payload)
+    result = await cash_service.record_cash_movement(db, current=current, shift=shift, payload=payload)
     await db.commit()
-    return {"movement_id": str(movement.id)}
+    if isinstance(result, dict):
+        return {"approval_request_id": str(result["approval_request_id"]), "status": result["status"]}
+    return {"movement_id": str(result.id), "status": "applied"}
 
 
 @router.post("/shifts/{shift_id}/close")
@@ -71,7 +73,13 @@ async def close_shift(
     require_store_access(shift.store_id, current)
     shift = await cash_service.close_shift(db, current=current, shift=shift, payload=payload)
     await db.commit()
-    return {"expected_cash": float(shift.expected_cash), "counted_cash": float(shift.counted_cash), "variance": float(shift.variance)}
+    return {
+        "expected_cash": float(shift.expected_cash),
+        "counted_cash": float(shift.counted_cash),
+        "variance": float(shift.variance),
+        "denomination_breakdown": shift.denomination_breakdown,
+        "tender_breakdown": shift.tender_breakdown,
+    }
 
 
 @router.post("/day-close")
@@ -87,4 +95,5 @@ async def day_close(
         "total_expected_cash": float(result.total_expected_cash),
         "total_counted_cash": float(result.total_counted_cash),
         "variance": float(result.variance),
+        "tender_breakdown": result.tender_breakdown,
     }

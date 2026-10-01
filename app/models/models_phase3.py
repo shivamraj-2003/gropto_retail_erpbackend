@@ -31,10 +31,36 @@ class Order(Base):
     delivery_address: Mapped[str | None] = mapped_column(Text)
     rider_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"))
     delivery_otp: Mapped[str | None] = mapped_column(String)
+    # Point 3 audit fix: blueprint's Picking/Packing Time KPIs had no stage
+    # timestamps anywhere on Order. start_picking() stamps picking_started_at,
+    # pick_order() (pack completion) stamps packed_at, dispatch_order() stamps
+    # dispatched_at — giving three real, separately-measurable durations
+    # instead of permanently-null placeholders.
+    picking_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    packed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    dispatched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     items: Mapped[list["OrderItem"]] = relationship(cascade="all, delete-orphan", lazy="selectin")
+
+
+class StoreFootfall(Base):
+    """Point 3 audit fix: blueprint's Conversion/Footfall KPI had no data
+    source anywhere — no visitor-counting hardware integration exists, so
+    this is a manual daily entry (store manager logs the day's walk-in
+    count), same pattern as a cash-drawer count. One row per store per day;
+    conversion = bills / footfall, computed from this against real sales."""
+
+    __tablename__ = "store_footfall"
+    id: Mapped[uuid.UUID] = uuid_pk()
+    store_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("stores.id"), nullable=False)
+    business_date: Mapped[date] = mapped_column(Date, nullable=False)
+    footfall_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    recorded_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (UniqueConstraint("store_id", "business_date", name="uq_store_footfall_store_date"),)
 
 
 class OrderItem(Base):

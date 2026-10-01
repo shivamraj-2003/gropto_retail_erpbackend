@@ -56,6 +56,17 @@ class Store(Base):
     city: Mapped[str | None] = mapped_column(String)
     cluster: Mapped[str | None] = mapped_column(String)
     region_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("regions.id"))
+    # Real FK counterpart to clusters.regional_manager_id (Point 2 audit fix —
+    # previously no Store ever pointed at a Cluster, so a manager's cluster
+    # assignment carried zero actual stores). `cluster` above stays as the
+    # pre-existing free-text tag, untouched, to avoid breaking anything that
+    # already reads it.
+    cluster_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("clusters.id"))
+    # Point 3 audit fix: blueprint's Sales/Sq Ft and Target Achievement KPIs
+    # had no backing columns anywhere — both NULL by default (no fabricated
+    # defaults), set per store by whoever owns store setup.
+    area_sqft: Mapped[float | None] = mapped_column(Numeric(10, 2))
+    target_revenue_monthly: Mapped[float | None] = mapped_column(Numeric(14, 2))
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
@@ -306,6 +317,10 @@ class SaleItem(Base):
     taxable_value: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False, default=0)
     cgst_amount: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False, default=0)
     sgst_amount: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False, default=0)
+    # Point 4 audit fix: MRP was never captured on the sale itself — only the
+    # selling price. Snapshotted at billing time (like product_name_snapshot)
+    # so it survives later MRP changes to the product catalogue.
+    mrp_snapshot: Mapped[float | None] = mapped_column(Numeric(12, 2))
 
 
 class Payment(Base):

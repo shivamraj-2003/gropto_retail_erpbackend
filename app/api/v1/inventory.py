@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import CurrentUser, require_permission, require_store_access
 from app.core.database import get_db
 from app.models.models import InventoryBalance, Product
+from app.models.models_phase4 import ReasonCodeMaster
 from app.schemas.schemas import InventoryBalanceOut, StockAdjustmentRequest
 from app.services.approvals import submit_or_apply
 from app.services.audit import write_audit
@@ -45,7 +46,18 @@ async def adjust_stock(
 ) -> dict:
     require_store_access(payload.store_id, current)
 
-    if abs(payload.delta) > HIGH_ADJUSTMENT_THRESHOLD and current.role_code != "super_admin":
+    # Point 4 audit fix: reason_code used to be a freeform string nobody ever
+    # checked against reason_codes_master — damage/expiry/wastage/shrinkage
+    # were indistinguishable in the data, and the master table's own
+    # requires_approval flag was dead config. Matched here (code lookup is
+    # lenient — an unmatched/legacy code like the "adjustment" default falls
+    # back to the old quantity-threshold-only behaviour rather than erroring).
+    reason_master = (
+        await db.execute(select(ReasonCodeMaster).where(ReasonCodeMaster.code == payload.reason_code))
+    ).scalar_one_or_none()
+    requires_approval_by_reason = bool(reason_master and reason_master.requires_approval)
+
+    if (abs(payload.delta) > HIGH_ADJUSTMENT_THRESHOLD or requires_approval_by_reason) and current.role_code != "super_admin":
         request = await submit_or_apply(
             db,
             current=current,
@@ -58,6 +70,7 @@ async def adjust_stock(
                 "store_id": str(payload.store_id),
                 "delta": payload.delta,
                 "reason_code": payload.reason_code,
+                "category": reason_master.category if reason_master else None,
             },
             reason=payload.reason,
             store_id=payload.store_id,
@@ -85,7 +98,7 @@ async def adjust_stock(
         action="inventory.adjusted",
         entity_type="inventory_balance",
         entity_id=payload.product_id,
-        new_value={"delta": payload.delta, "reason": payload.reason},
+        new_value={"delta": payload.delta, "reason": payload.reason, "category": reason_master.category if reason_master else None},
     )
     await db.commit()
     return {"movement_id": str(movement.id), "status": "applied"}

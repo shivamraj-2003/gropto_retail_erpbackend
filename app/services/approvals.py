@@ -205,12 +205,63 @@ async def _handle_high_stock_adjustment(db: AsyncSession, request: ApprovalReque
         product_id=uuid.UUID(payload["product_id"]),
         store_id=uuid.UUID(payload["store_id"]),
         delta=payload["delta"],
-        reason_code="adjustment",
+        reason_code=payload.get("reason_code", "adjustment"),
         source_type="approval",
         source_id=request.id,
         created_by=request.requested_by,
         device_id=None,
     )
+
+
+@register_handler("cash_movement_approval")
+async def _handle_cash_movement_approval(db: AsyncSession, request: ApprovalRequest) -> None:
+    """Point 4 audit fix: cash-in/out had no approval step at all — any user
+    with sale.create could move cash with no review. Large movements now
+    queue here (same Super-Admin-applies-immediately rule as everything
+    else) and only actually hit the CashMovement table on approval."""
+    from app.models.models_phase2 import CashierShift, CashMovement
+
+    payload = request.new_value
+    shift = await db.get(CashierShift, uuid.UUID(payload["shift_id"]))
+    if shift is None or shift.status != "open":
+        request.status = "stale"
+        return
+    db.add(CashMovement(shift_id=shift.id, direction=payload["direction"], amount=payload["amount"], reason=payload["reason"]))
+
+
+@register_handler("transfer_discrepancy_resolution")
+async def _handle_transfer_discrepancy_resolution(db: AsyncSession, request: ApprovalRequest) -> None:
+    from app.models.models_phase2 import Transfer
+
+    payload = request.new_value
+    transfer = await db.get(Transfer, uuid.UUID(payload["transfer_id"]))
+    if transfer is None or transfer.status != "discrepancy":
+        request.status = "stale"
+        return
+    transfer.status = "resolved"
+
+
+@register_handler("stock_count_adjustment")
+async def _handle_stock_count_adjustment(db: AsyncSession, request: ApprovalRequest) -> None:
+    """Applies every variant line of a finalized stock count as a real
+    inventory movement, once approved."""
+    from app.services.inventory import apply_movement
+
+    payload = request.new_value
+    for line in payload["lines"]:
+        if float(line["variance"]) == 0:
+            continue
+        await apply_movement(
+            db,
+            product_id=uuid.UUID(line["product_id"]),
+            store_id=uuid.UUID(payload["store_id"]),
+            delta=float(line["variance"]),
+            reason_code="stock_count_adjustment",
+            source_type="stock_count_line",
+            source_id=uuid.UUID(line["line_id"]),
+            created_by=request.requested_by,
+            device_id=None,
+        )
 
 
 @register_handler("user_permission_change")
@@ -289,6 +340,8 @@ async def _handle_store_create(db: AsyncSession, request: ApprovalRequest) -> No
         name=payload["name"],
         city=payload.get("city"),
         cluster=payload.get("cluster"),
+        area_sqft=payload.get("area_sqft"),
+        target_revenue_monthly=payload.get("target_revenue_monthly"),
     )
     db.add(store)
 
@@ -301,7 +354,7 @@ async def _handle_store_update(db: AsyncSession, request: ApprovalRequest) -> No
     if store is None:
         request.status = "stale"
         return
-    for field in ("name", "city", "cluster"):
+    for field in ("name", "city", "cluster", "area_sqft", "target_revenue_monthly"):
         if field in request.new_value:
             setattr(store, field, request.new_value[field])
 

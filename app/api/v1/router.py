@@ -9,9 +9,11 @@ from app.api.v1 import (
     control_tower,
     crm,
     crm_advanced,
+    customers,
     dashboard,
     enterprise,
     finance_advanced,
+    gift_vouchers,
     hr,
     hr_advanced,
     imports,
@@ -29,6 +31,7 @@ from app.api.v1 import (
     purchases,
     reports,
     returns,
+    stock_count,
     stores,
     sync,
     transfers,
@@ -61,6 +64,9 @@ api_router.include_router(transfers.router)
 api_router.include_router(cash.router)
 api_router.include_router(procurement.router)
 api_router.include_router(phase2_misc.router)
+api_router.include_router(stock_count.router)
+api_router.include_router(gift_vouchers.router)
+api_router.include_router(customers.router)
 
 # Phase 3
 api_router.include_router(orders.router)

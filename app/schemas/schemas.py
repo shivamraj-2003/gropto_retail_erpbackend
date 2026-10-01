@@ -148,6 +148,11 @@ ASSIGNABLE_ROLES = {
     "regional_manager",
     "inventory_user",
     "system_admin",
+    "department_head",
+    "associate",
+    "online_ops",
+    "packer",
+    "rider",
 }
 
 
@@ -290,6 +295,7 @@ class SaleItemIn(BaseModel):
     quantity: float
     unit_price: float
     line_discount: float = 0
+    mrp_snapshot: float | None = None
 
 
 class PaymentIn(BaseModel):

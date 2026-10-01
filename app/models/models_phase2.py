@@ -65,6 +65,8 @@ class Grn(Base):
 
     __tablename__ = "grn"
     id: Mapped[uuid.UUID] = uuid_pk()
+    # Point 5 audit fix: GRNs had no human-readable identifier, only a bare UUID.
+    grn_number: Mapped[str | None] = mapped_column(String, unique=True)
     purchase_order_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("purchase_orders.id"))
     warehouse_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("warehouses.id"))
     store_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("stores.id"))
@@ -83,8 +85,13 @@ class GrnItem(Base):
     expected_qty: Mapped[float] = mapped_column(Numeric(12, 3), default=0)
     received_qty: Mapped[float] = mapped_column(Numeric(12, 3), nullable=False)
     batch_number: Mapped[str | None] = mapped_column(String)
+    mfg_date: Mapped[date | None] = mapped_column(Date)
     expiry_date: Mapped[date | None] = mapped_column(Date)
     qc_status: Mapped[str] = mapped_column(String, default="accepted")  # accepted, rejected, damaged
+    # Point 5 audit fix: QC used to be a single tag applied by whoever receives,
+    # with no distinct reviewer or timestamp.
+    qc_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"))
+    qc_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class Transfer(Base):
@@ -204,6 +211,13 @@ class CashierShift(Base):
     expected_cash: Mapped[float | None] = mapped_column(Numeric(12, 2))
     counted_cash: Mapped[float | None] = mapped_column(Numeric(12, 2))
     variance: Mapped[float | None] = mapped_column(Numeric(12, 2))
+    # Point 4 audit fix: close used to take one lump counted-cash total only.
+    # denomination_breakdown is an optional {"500": 10, "100": 25, ...} note
+    # count, and tender_breakdown is the by-payment-mode total for the shift
+    # (cash/card/upi/wallet/gift_voucher) so day close can reconcile more than
+    # just cash.
+    denomination_breakdown: Mapped[dict | None] = mapped_column(JSONB)
+    tender_breakdown: Mapped[dict | None] = mapped_column(JSONB)
     status: Mapped[str] = mapped_column(String, default="open")  # open, closed
     opened_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -227,6 +241,9 @@ class DayClose(Base):
     total_expected_cash: Mapped[float] = mapped_column(Numeric(12, 2), default=0)
     total_counted_cash: Mapped[float] = mapped_column(Numeric(12, 2), default=0)
     variance: Mapped[float] = mapped_column(Numeric(12, 2), default=0)
+    # Point 4 audit fix: non-cash tenders (card/UPI/wallet/gift voucher) were
+    # never reconciled at day close — aggregated across the day's shifts here.
+    tender_breakdown: Mapped[dict | None] = mapped_column(JSONB)
     closed_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"))
     closed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
@@ -248,6 +265,11 @@ class Return(Base):
     refund_total: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False)
     status: Mapped[str] = mapped_column(String, default="pending")  # pending, approved, rejected, completed
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    # Point 4 audit fix: "Exchange" had no distinct workflow anywhere — modeled
+    # as a Return flagged as an exchange, linked to the replacement Sale once
+    # it's billed (exchange_sale_id set after the fact via /returns/{id}/link-exchange).
+    is_exchange: Mapped[bool] = mapped_column(Boolean, default=False)
+    exchange_sale_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("sales.id"))
 
     items: Mapped[list["ReturnItem"]] = relationship(cascade="all, delete-orphan", lazy="selectin")
 
@@ -261,6 +283,57 @@ class ReturnItem(Base):
     quantity: Mapped[float] = mapped_column(Numeric(12, 3), nullable=False)
     disposition: Mapped[str] = mapped_column(String, nullable=False)  # saleable, damaged, vendor_return
     refund_amount: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False)
+
+
+# ---------------------------------------------------------------------------
+# Stock count / cycle count (Point 4 audit fix — this workflow did not exist
+# at all: /inventory/reconcile only compares cached balance vs ledger sum,
+# never captures a physical count against expected quantity).
+# ---------------------------------------------------------------------------
+
+
+class StockCount(Base):
+    __tablename__ = "stock_counts"
+    id: Mapped[uuid.UUID] = uuid_pk()
+    store_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("stores.id"), nullable=False)
+    status: Mapped[str] = mapped_column(String, default="counting")  # counting, pending_approval, completed, cancelled
+    initiated_by: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    finalized_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    lines: Mapped[list["StockCountLine"]] = relationship(cascade="all, delete-orphan", lazy="selectin")
+
+
+class StockCountLine(Base):
+    __tablename__ = "stock_count_lines"
+    id: Mapped[uuid.UUID] = uuid_pk()
+    count_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("stock_counts.id", ondelete="CASCADE"))
+    product_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("products.id"), nullable=False)
+    expected_qty: Mapped[float] = mapped_column(Numeric(12, 3), nullable=False)
+    counted_qty: Mapped[float | None] = mapped_column(Numeric(12, 3))
+    variance: Mapped[float | None] = mapped_column(Numeric(12, 3))
+
+    __table_args__ = (UniqueConstraint("count_id", "product_id"),)
+
+
+# ---------------------------------------------------------------------------
+# Gift vouchers (Point 4 audit fix — listed as a payment mode in
+# PaymentModeMaster but had no balance/issuance model anywhere)
+# ---------------------------------------------------------------------------
+
+
+class GiftVoucher(Base):
+    __tablename__ = "gift_vouchers"
+    id: Mapped[uuid.UUID] = uuid_pk()
+    code: Mapped[str] = mapped_column(String, unique=True, nullable=False)
+    initial_value: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False)
+    balance: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False)
+    status: Mapped[str] = mapped_column(String, default="active")  # active, redeemed, expired, cancelled
+    issued_to_customer_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("customers.id"))
+    issued_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"))
+    expires_at: Mapped[date | None] = mapped_column(Date)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 # ---------------------------------------------------------------------------

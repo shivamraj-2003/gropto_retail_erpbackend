@@ -22,7 +22,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser
-from app.models.models import Customer, Store
+from app.models.models import Customer, Store, User
 from app.models.models_phase3 import Order, OrderItem
 from app.schemas.schemas_phase3 import OrderCreate, OrderDeliverRequest, OrderDispatchRequest, OrderPickRequest
 from app.services.audit import write_audit
@@ -113,6 +113,19 @@ async def create_order(db: AsyncSession, *, current: CurrentUser, payload: Order
     return order
 
 
+async def start_picking(db: AsyncSession, *, current: CurrentUser, order: Order) -> Order:
+    """Point 3 audit fix: the blueprint's Picking Time and Packing Time are
+    two distinct KPIs, but nothing marked when picking actually began — only
+    order-placed and pack-complete existed. This gives picking its own start
+    event so the two durations are separately measurable instead of one
+    combined "pick+pack" number."""
+    if order.status not in ("reserved", "allocated"):
+        raise HTTPException(status_code=409, detail=f"Cannot start picking an order in status {order.status}")
+    order.status = "picking"
+    order.picking_started_at = datetime.now(timezone.utc)
+    return order
+
+
 async def pick_order(db: AsyncSession, *, current: CurrentUser, order: Order, payload: OrderPickRequest) -> Order:
     if order.status not in ("reserved", "allocated", "picking"):
         raise HTTPException(status_code=409, detail=f"Cannot pick order in status {order.status}")
@@ -123,16 +136,29 @@ async def pick_order(db: AsyncSession, *, current: CurrentUser, order: Order, pa
             raise HTTPException(status_code=400, detail="Unknown order item")
         item.picked_qty = picked.picked_qty
         item.substituted_product_id = picked.substituted_product_id
+    # Caller skipped the explicit start-picking step (legacy direct-pack
+    # flow) — backfill a start time so packing-duration math stays sane
+    # instead of silently nulling out.
+    if order.picking_started_at is None:
+        order.picking_started_at = order.created_at
     order.status = "packed"
+    order.packed_at = datetime.now(timezone.utc)
     return order
 
 
 async def dispatch_order(db: AsyncSession, *, current: CurrentUser, order: Order, payload: OrderDispatchRequest) -> Order:
     if order.status != "packed":
         raise HTTPException(status_code=409, detail="Order must be packed before dispatch")
+    # Point 2 audit fix: rider_id used to be a bare, unvalidated UUID — any
+    # value was accepted and stamped on the order with no check it referred
+    # to a real person at all.
+    rider = await db.get(User, payload.rider_id)
+    if rider is None or not rider.is_active:
+        raise HTTPException(status_code=400, detail="rider_id does not match an active user")
     order.rider_id = payload.rider_id
     order.delivery_otp = f"{secrets.randbelow(10**6):06d}"
     order.status = "dispatched"
+    order.dispatched_at = datetime.now(timezone.utc)
     await write_audit(
         db,
         user_id=current.user_id,

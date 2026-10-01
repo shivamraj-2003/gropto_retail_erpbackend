@@ -10,10 +10,12 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.models import Customer, Device, Payment, Role, Sale, SaleItem, SyncFailure, User
+from app.models.models_phase2 import GiftVoucher
 from app.schemas.schemas import SaleIn, SyncItemVerdict
 from app.services.audit import write_audit
 from app.services.inventory import DuplicateMovement, apply_movement, get_balance as get_stock_balance
 from app.services.loyalty import DuplicateLedgerEntry, apply_ledger_entry, get_balance, get_config
+from app.services.wallet import DuplicateWalletEntry, InsufficientWalletBalance, debit_wallet
 
 
 async def _get_or_create_customer(db: AsyncSession, phone: str | None) -> Customer | None:
@@ -101,6 +103,35 @@ async def process_sale(db: AsyncSession, sale_in: SaleIn) -> SyncItemVerdict:
 
         customer = await _get_or_create_customer(db, sale_in.customer_phone)
 
+        # Point 4 audit fix: nothing previously validated that payments summed
+        # to the bill amount at all — "split amounts total exactly to bill
+        # amount" / "partial/overpayment is prevented" were unenforced. Loyalty
+        # redemption is treated like a tender here too (it reduces what's owed
+        # via other payment modes) rather than being a ledger-only side effect
+        # that left the customer still owing the full amount.
+        redeemed_value = 0.0
+        if sale_in.loyalty_points_redeemed > 0:
+            if customer is None:
+                raise ValueError("Loyalty redemption requires a customer")
+            config = await get_config(db)
+            current_balance = await get_balance(db, customer_id=customer.id)
+            if current_balance < float(config.min_balance_to_redeem):
+                raise ValueError(
+                    f"Customer loyalty balance {current_balance} is below the minimum "
+                    f"{float(config.min_balance_to_redeem)} points required to redeem"
+                )
+            redeemed_value = round(sale_in.loyalty_points_redeemed * float(config.redeem_value), 2)
+            if grand_total > 0 and redeemed_value > float(grand_total) * float(config.max_redeem_share):
+                raise ValueError(
+                    f"Loyalty redemption value {redeemed_value} exceeds the "
+                    f"{float(config.max_redeem_share) * 100:.0f}% cap on this bill"
+                )
+
+        amount_due = round(float(grand_total) - redeemed_value, 2)
+        tendered = round(sum(p.amount for p in sale_in.payments), 2)
+        if abs(tendered - amount_due) > 0.01:
+            raise ValueError(f"Payments total {tendered} does not match amount due {amount_due} (grand total {grand_total} less loyalty redemption {redeemed_value})")
+
         sale = Sale(
             id=sale_in.id,
             store_id=sale_in.store_id,
@@ -136,6 +167,7 @@ async def process_sale(db: AsyncSession, sale_in: SaleIn) -> SyncItemVerdict:
                     taxable_value=line_taxable,
                     cgst_amount=line_tax / 2,
                     sgst_amount=line_tax / 2,
+                    mrp_snapshot=item.mrp_snapshot,
                 )
             )
             try:
@@ -173,6 +205,43 @@ async def process_sale(db: AsyncSession, sale_in: SaleIn) -> SyncItemVerdict:
         for payment in sale_in.payments:
             db.add(Payment(sale_id=sale.id, mode=payment.mode, amount=payment.amount, reference=payment.reference))
 
+            # Point 4 audit fix: wallet and gift_voucher were listed as payment
+            # modes but nothing actually debited the underlying balance — a
+            # "wallet" payment used to just be a string with no money moved.
+            if payment.mode == "wallet":
+                if customer is None:
+                    raise ValueError("Wallet payment requires a customer")
+                try:
+                    await debit_wallet(
+                        db,
+                        customer_id=customer.id,
+                        amount=payment.amount,
+                        reference_type="pos_sale",
+                        source_type="sale_payment",
+                        source_id=sale.id,
+                    )
+                except InsufficientWalletBalance as exc:
+                    raise ValueError(str(exc)) from exc
+                except DuplicateWalletEntry:
+                    pass
+            elif payment.mode == "gift_voucher":
+                if not payment.reference:
+                    raise ValueError("Gift voucher payment requires the voucher code as the payment reference")
+                voucher = (
+                    await db.execute(select(GiftVoucher).where(GiftVoucher.code == payment.reference))
+                ).scalar_one_or_none()
+                if voucher is None:
+                    raise ValueError(f"No gift voucher found for code {payment.reference}")
+                if voucher.status != "active":
+                    raise ValueError(f"Gift voucher {payment.reference} is {voucher.status}, not active")
+                if payment.amount > float(voucher.balance):
+                    raise ValueError(
+                        f"Gift voucher {payment.reference} balance ₹{float(voucher.balance):.2f} is insufficient for ₹{payment.amount:.2f}"
+                    )
+                voucher.balance = float(voucher.balance) - payment.amount
+                if voucher.balance <= 0:
+                    voucher.status = "redeemed"
+
         # Loyalty: earn on net billed value; redeem against the till's cached balance.
         # Offline the cached balance may be stale — redemption still applies and a
         # resulting negative balance is flagged for review rather than blocked at
@@ -195,6 +264,9 @@ async def process_sale(db: AsyncSession, sale_in: SaleIn) -> SyncItemVerdict:
                     pass
 
             if sale_in.loyalty_points_redeemed > 0:
+                # min_balance_to_redeem / max_redeem_share / amount-due-vs-
+                # tendered were already validated up front, before any write —
+                # this just applies the ledger entry now that we know it's valid.
                 try:
                     await apply_ledger_entry(
                         db,

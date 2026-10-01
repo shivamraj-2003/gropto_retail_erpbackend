@@ -8,6 +8,37 @@ from app.models.models import PasswordResetOtp, RefreshToken
 
 logger = logging.getLogger("gropto.scheduler")
 
+
+async def refresh_rfm_cohorts_job() -> None:
+    """Point 3 audit fix: rfm_cohort_snapshots had zero write path anywhere
+    (see crm_advanced.py's _compute_rfm_cohorts) — now recomputed daily so
+    Cohort Performance reflects current purchase history, not a one-time
+    snapshot from whenever the table happened to first be read."""
+    from app.api.v1.crm_advanced import refresh_rfm_cohorts
+
+    async with SessionLocal() as db:
+        try:
+            await refresh_rfm_cohorts(db)
+        except Exception as e:
+            await db.rollback()
+            logger.error(f"Error during scheduled RFM cohort refresh: {e}")
+
+
+async def evaluate_ceo_alerts_job() -> None:
+    """Point 3 audit fix: _evaluate_ceo_alerts() used to run only as a side
+    effect of someone hitting GET /control-tower/alerts, so the CEO Command
+    Center's active-alert count could sit stale/zero for hours despite a real,
+    current risk condition. Runs the same evaluation on a schedule instead."""
+    from app.api.v1.control_tower import _evaluate_ceo_alerts
+
+    async with SessionLocal() as db:
+        try:
+            await _evaluate_ceo_alerts(db)
+            await db.commit()
+        except Exception as e:
+            await db.rollback()
+            logger.error(f"Error during scheduled CEO alert evaluation: {e}")
+
 scheduler = AsyncIOScheduler()
 
 
@@ -54,6 +85,20 @@ def start_scheduler() -> None:
             "interval",
             hours=1,
             id="purge_expired_auth_data",
+            replace_existing=True,
+        )
+        scheduler.add_job(
+            evaluate_ceo_alerts_job,
+            "interval",
+            minutes=15,
+            id="evaluate_ceo_alerts",
+            replace_existing=True,
+        )
+        scheduler.add_job(
+            refresh_rfm_cohorts_job,
+            "interval",
+            hours=24,
+            id="refresh_rfm_cohorts",
             replace_existing=True,
         )
         scheduler.start()

@@ -14,8 +14,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import CurrentUser
 from app.models.models_phase2 import Transfer, TransferItem
 from app.schemas.schemas_phase2 import TransferCreate, TransferReceive
+from app.services.approvals import submit_or_apply
 from app.services.audit import write_audit
 from app.services.inventory import adjust_warehouse_balance, apply_movement, get_balance, get_warehouse_balance
+
+DISCREPANCY_APPROVAL_THRESHOLD = 20  # absolute units variance on any one line; above this needs review before closing
 
 
 async def dispatch_transfer(db: AsyncSession, *, current: CurrentUser, payload: TransferCreate) -> Transfer:
@@ -120,5 +123,46 @@ async def receive_transfer(db: AsyncSession, *, current: CurrentUser, transfer: 
         entity_type="transfer",
         entity_id=transfer.id,
         new_value={"status": transfer.status},
+    )
+    return transfer
+
+
+async def resolve_discrepancy(db: AsyncSession, *, current: CurrentUser, transfer: Transfer, note: str | None) -> Transfer | dict:
+    """Point 5 audit fix: a transfer left at status="discrepancy" previously
+    had no further resolution path at all — this closes it out, routing
+    through the approval engine when any single line's variance is large
+    (same escalation pattern Returns/Stock Count already use), direct-closing
+    otherwise."""
+    if transfer.status != "discrepancy":
+        raise HTTPException(status_code=409, detail=f"Transfer is {transfer.status}, not in discrepancy")
+
+    max_variance = max(
+        (abs(float(i.dispatched_qty) - float(i.received_qty or 0)) for i in transfer.items), default=0.0
+    )
+    if max_variance > DISCREPANCY_APPROVAL_THRESHOLD and current.role_code != "super_admin":
+        request = await submit_or_apply(
+            db,
+            current=current,
+            request_type="transfer_discrepancy_resolution",
+            entity_type="transfer",
+            entity_id=transfer.id,
+            old_value=None,
+            new_value={"transfer_id": str(transfer.id), "note": note},
+            reason=note,
+            store_id=transfer.dest_id if transfer.dest_type == "store" else None,
+        )
+        return {"approval_request_id": request.id, "status": request.status}
+
+    transfer.status = "resolved"
+    await write_audit(
+        db,
+        user_id=current.user_id,
+        role_code=current.role_code,
+        store_id=transfer.dest_id if transfer.dest_type == "store" else None,
+        device_id=current.device_id,
+        action="transfer.discrepancy_resolved",
+        entity_type="transfer",
+        entity_id=transfer.id,
+        reason=note,
     )
     return transfer

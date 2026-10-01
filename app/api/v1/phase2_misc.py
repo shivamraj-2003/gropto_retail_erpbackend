@@ -12,6 +12,7 @@ from app.schemas.schemas import Page
 from app.schemas.schemas_phase2 import ExpenseCreate, FraudAlertOut, ReorderPointSet
 from app.services import finance as finance_service
 from app.services import fraud as fraud_service
+from app.services.audit import write_audit
 
 router = APIRouter(tags=["phase2-misc"])
 
@@ -49,7 +50,10 @@ async def replenishment_alerts(
         await db.execute(
             text(
                 """
-                select p.sku, p.name, coalesce(ib.quantity, 0) as quantity, rp.min_qty, rp.max_qty
+                select p.id as product_id, p.sku, p.name, coalesce(ib.quantity, 0) as quantity, rp.min_qty, rp.max_qty,
+                       (select max(created_at) from audit_log
+                        where action = 'inventory.replenishment_marked' and entity_type = 'reorder_point'
+                          and entity_id = rp.product_id and store_id = rp.store_id) as last_replenished_at
                 from reorder_points rp
                 join products p on p.id = rp.product_id
                 left join inventory_balances ib on ib.product_id = rp.product_id and ib.store_id = rp.store_id
@@ -60,7 +64,46 @@ async def replenishment_alerts(
             {"store_id": str(store_id)},
         )
     ).all()
-    return [{"sku": r.sku, "name": r.name, "quantity": float(r.quantity), "min_qty": float(r.min_qty), "max_qty": float(r.max_qty)} for r in rows]
+    return [
+        {
+            "product_id": str(r.product_id),
+            "sku": r.sku,
+            "name": r.name,
+            "quantity": float(r.quantity),
+            "min_qty": float(r.min_qty),
+            "max_qty": float(r.max_qty),
+            "last_replenished_at": r.last_replenished_at.isoformat() if r.last_replenished_at else None,
+        }
+        for r in rows
+    ]
+
+
+@router.post("/inventory/replenishment-alerts/{product_id}/mark-replenished")
+async def mark_replenished(
+    product_id: uuid.UUID,
+    store_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(require_permission("inventory.adjust")),
+) -> dict:
+    """Point 4 audit fix: the blueprint's "shelf replenishment" worklist had
+    config (reorder points) and a read-only OOS list, but no action a store
+    user could take to record "I walked the shelf and restocked this" — this
+    is that action, a real audited event a worklist can be keyed off of
+    (last_replenished_at above), not a cosmetic button."""
+    require_store_access(store_id, current)
+    await write_audit(
+        db,
+        user_id=current.user_id,
+        role_code=current.role_code,
+        store_id=store_id,
+        device_id=current.device_id,
+        action="inventory.replenishment_marked",
+        entity_type="reorder_point",
+        entity_id=product_id,
+        new_value={"store_id": str(store_id)},
+    )
+    await db.commit()
+    return {"status": "ok"}
 
 
 @router.post("/finance/expenses", status_code=201)

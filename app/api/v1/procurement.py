@@ -107,4 +107,4 @@ async def receive_grn(
         require_store_access(payload.store_id, current)
     grn = await procurement_service.receive_grn(db, current=current, payload=payload)
     await db.commit()
-    return {"grn_id": str(grn.id)}
+    return {"grn_id": str(grn.id), "grn_number": grn.grn_number}

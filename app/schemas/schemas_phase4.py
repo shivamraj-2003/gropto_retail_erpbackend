@@ -14,6 +14,7 @@ class InventoryBatchOut(BaseModel):
     product_id: uuid.UUID
     store_id: uuid.UUID | None
     warehouse_id: uuid.UUID | None
+    location_id: uuid.UUID | None
     batch_number: str
     mfg_date: date | None
     expiry_date: date | None
@@ -49,9 +50,28 @@ class PutawayTaskOut(BaseModel):
     status: str
 
 
+class PutawayTaskConfirm(BaseModel):
+    confirmed_location_id: uuid.UUID
+
+
+class StoreIndentItemIn(BaseModel):
+    product_id: uuid.UUID
+    quantity: float
+
+
+class StoreIndentItemOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: uuid.UUID
+    product_id: uuid.UUID
+    quantity: float
+
+
 class StoreIndentCreate(BaseModel):
     store_id: uuid.UUID
     warehouse_id: uuid.UUID
+    priority: str = "normal"
+    reason: str | None = None
+    items: list[StoreIndentItemIn]
 
 
 class StoreIndentOut(BaseModel):
@@ -59,8 +79,12 @@ class StoreIndentOut(BaseModel):
     id: uuid.UUID
     store_id: uuid.UUID
     warehouse_id: uuid.UUID
+    priority: str
+    reason: str | None
     status: str
+    transfer_id: uuid.UUID | None
     created_at: datetime
+    items: list[StoreIndentItemOut] = []
 
 
 # ---------------------------------------------------------------------------
@@ -471,6 +495,12 @@ class WmsPickListTaskOut(BaseModel):
 
 class PickConfirm(BaseModel):
     picked_qty: float
+    # Point 5 audit fix: nothing previously validated that the picker actually
+    # scanned the right item/location — these are optional for backwards
+    # compatibility with any existing caller, but when supplied the backend
+    # rejects a mismatch rather than trusting the quantity alone.
+    scanned_barcode: str | None = None
+    scanned_location_id: uuid.UUID | None = None
 
 
 class PickListDispatch(BaseModel):

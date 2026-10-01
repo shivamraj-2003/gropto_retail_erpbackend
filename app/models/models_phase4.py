@@ -10,6 +10,7 @@ from sqlalchemy import (
     Numeric,
     String,
     Text,
+    UniqueConstraint,
     func,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
@@ -29,6 +30,10 @@ class InventoryBatch(Base):
     product_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("products.id"), nullable=False)
     store_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("stores.id"))
     warehouse_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("warehouses.id"))
+    # Point 5 audit fix: batches had no location at all — zone/rack/bin was a
+    # disconnected reference table nothing was ever actually placed in.
+    # Populated by the putaway-confirm step (wms.py).
+    location_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("warehouse_zone_locations.id"))
     batch_number: Mapped[str] = mapped_column(String, nullable=False)
     mfg_date: Mapped[date | None] = mapped_column(Date)
     expiry_date: Mapped[date | None] = mapped_column(Date)
@@ -63,8 +68,25 @@ class StoreIndent(Base):
     id: Mapped[uuid.UUID] = uuid_pk()
     store_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("stores.id"), nullable=False)
     warehouse_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("warehouses.id"), nullable=False)
+    requested_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"))
+    priority: Mapped[str] = mapped_column(String, default="normal")  # low, normal, high, urgent
+    reason: Mapped[str | None] = mapped_column(Text)
     status: Mapped[str] = mapped_column(String, default="submitted")  # draft, submitted, converted_to_transfer, cancelled
+    transfer_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("transfers.id"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    items: Mapped[list["StoreIndentItem"]] = relationship(cascade="all, delete-orphan", lazy="selectin")
+
+
+class StoreIndentItem(Base):
+    """Point 5 audit fix: StoreIndent previously had no way to express what or
+    how much a store was actually requesting — a header row with no body."""
+
+    __tablename__ = "store_indent_items"
+    id: Mapped[uuid.UUID] = uuid_pk()
+    indent_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("store_indents.id", ondelete="CASCADE"))
+    product_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("products.id"), nullable=False)
+    quantity: Mapped[float] = mapped_column(Numeric(12, 3), nullable=False)
 
 
 # ---------------------------------------------------------------------------
@@ -98,10 +120,15 @@ class VendorDebitCreditNote(Base):
     __tablename__ = "vendor_debit_credit_notes"
     id: Mapped[uuid.UUID] = uuid_pk()
     vendor_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("vendors.id"), nullable=False)
+    # Point 5 audit fix: nothing ever wrote a row here — a rejected/damaged
+    # GRN line now auto-generates a debit note against the vendor.
+    grn_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("grn.id"))
+    grn_item_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("grn_items.id"))
     note_type: Mapped[str] = mapped_column(String, nullable=False)  # debit_note, credit_note
     amount: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False)
     reason: Mapped[str] = mapped_column(Text, nullable=False)
     status: Mapped[str] = mapped_column(String, default="issued")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 # ---------------------------------------------------------------------------
@@ -170,14 +197,23 @@ class ScheduledPriceChange(Base):
 
 
 class CustomerWalletLedger(Base):
+    """Point 4 audit fix: this table existed but nothing ever wrote to it —
+    wallet was listed as a payment mode in PaymentModeMaster with no actual
+    debit/credit path. source_type/source_id + the unique constraint give it
+    the same idempotent-replay safety loyalty_ledger already has."""
+
     __tablename__ = "customer_wallet_ledgers"
     id: Mapped[uuid.UUID] = uuid_pk()
     customer_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("customers.id"), nullable=False)
     transaction_type: Mapped[str] = mapped_column(String, nullable=False)  # credit, debit
     amount: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False)
     reference_type: Mapped[str] = mapped_column(String, default="store_credit")
+    source_type: Mapped[str] = mapped_column(String, nullable=False, default="manual")
+    source_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False, server_default=func.gen_random_uuid())
     balance_after: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (UniqueConstraint("source_type", "source_id", "transaction_type"),)
 
 
 # ---------------------------------------------------------------------------

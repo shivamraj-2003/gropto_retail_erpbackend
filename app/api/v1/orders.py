@@ -22,6 +22,8 @@ from app.services import oms
 
 router = APIRouter(prefix="/orders", tags=["orders"])
 
+DISPATCH_SLA_MINUTES = 120
+
 
 async def _get_order(db: AsyncSession, order_id: uuid.UUID) -> Order:
     stmt = select(Order).options(selectinload(Order.items)).where(Order.id == order_id)
@@ -38,9 +40,9 @@ async def order_kpis(
     _current: CurrentUser = Depends(require_permission("sale.create")),
 ) -> dict:
     """Blueprint §8 Online KPIs: fill rate, cancellation %, item-not-found %,
-    delivery TAT. Pick/pack time aren't tracked (no per-stage timestamp
-    columns on Order beyond created_at/delivered_at) — reported as null
-    rather than fabricated."""
+    delivery TAT, pick/pack/dispatch timing — all now backed by real
+    per-stage timestamps (Point 3 audit fix; start_picking()/pick_order()/
+    dispatch_order() stamp picking_started_at/packed_at/dispatched_at)."""
     store_filter = "and allocated_store_id = :store_id" if store_id else ""
     params = {"store_id": str(store_id)} if store_id else {}
 
@@ -52,7 +54,13 @@ async def order_kpis(
                     count(*) as total,
                     count(*) filter (where status = 'cancelled') as cancelled,
                     count(*) filter (where status = 'delivered') as delivered,
-                    avg(extract(epoch from (delivered_at - created_at)) / 60) filter (where delivered_at is not null) as avg_delivery_minutes
+                    avg(extract(epoch from (delivered_at - created_at)) / 60) filter (where delivered_at is not null) as avg_delivery_minutes,
+                    avg(extract(epoch from (picking_started_at - created_at)) / 60) filter (where picking_started_at is not null) as avg_pick_time_minutes,
+                    avg(extract(epoch from (packed_at - picking_started_at)) / 60) filter (where packed_at is not null and picking_started_at is not null) as avg_pack_time_minutes,
+                    avg(extract(epoch from (dispatched_at - packed_at)) / 60) filter (where dispatched_at is not null and packed_at is not null) as avg_dispatch_wait_minutes,
+                    count(*) filter (where dispatched_at is not null and packed_at is not null
+                        and dispatched_at - packed_at <= interval '{DISPATCH_SLA_MINUTES} minutes') as dispatched_within_sla,
+                    count(*) filter (where dispatched_at is not null and packed_at is not null) as dispatched_with_timing
                 from orders
                 where date_trunc('month', created_at) = date_trunc('month', now()) {store_filter}
                 """
@@ -84,14 +92,20 @@ async def order_kpis(
         round(int(items_row.not_found_lines) / int(items_row.total_lines) * 100, 1) if items_row.total_lines else None
     )
 
+    dispatched_with_timing = int(orders_row.dispatched_with_timing)
+    dispatch_sla_pct = round(int(orders_row.dispatched_within_sla) / dispatched_with_timing * 100, 1) if dispatched_with_timing else None
+
     return {
         "orders_mtd": total,
         "fill_rate_pct": fill_rate_pct,
         "cancellation_pct": cancellation_pct,
         "item_not_found_pct": item_not_found_pct,
         "avg_delivery_tat_minutes": round(float(orders_row.avg_delivery_minutes), 1) if orders_row.avg_delivery_minutes is not None else None,
-        "avg_pick_time_minutes": None,
-        "avg_pack_time_minutes": None,
+        "avg_pick_time_minutes": round(float(orders_row.avg_pick_time_minutes), 1) if orders_row.avg_pick_time_minutes is not None else None,
+        "avg_pack_time_minutes": round(float(orders_row.avg_pack_time_minutes), 1) if orders_row.avg_pack_time_minutes is not None else None,
+        "avg_dispatch_wait_minutes": round(float(orders_row.avg_dispatch_wait_minutes), 1) if orders_row.avg_dispatch_wait_minutes is not None else None,
+        "dispatch_sla_minutes_threshold": DISPATCH_SLA_MINUTES,
+        "dispatch_sla_pct": dispatch_sla_pct,
     }
 
 
@@ -133,6 +147,19 @@ async def create_order(
     current: CurrentUser = Depends(require_permission("sale.create")),
 ) -> Order:
     order = await oms.create_order(db, current=current, payload=payload)
+    await db.commit()
+    await db.refresh(order)
+    return order
+
+
+@router.post("/{order_id}/start-picking", response_model=OrderOut)
+async def start_picking(
+    order_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(require_permission("inventory.adjust")),
+) -> Order:
+    order = await _get_order(db, order_id)
+    order = await oms.start_picking(db, current=current, order=order)
     await db.commit()
     await db.refresh(order)
     return order
