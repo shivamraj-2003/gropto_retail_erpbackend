@@ -1,6 +1,6 @@
 import uuid
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -13,6 +13,7 @@ from app.schemas.schemas import Page
 from app.schemas.schemas_phase2 import (
     GrnCreate,
     GrnOut,
+    PurchaseOrderCancelIn,
     PurchaseOrderCreate,
     PurchaseOrderOut,
     RequisitionCreate,
@@ -83,6 +84,22 @@ async def create_purchase_order(
     return {"purchase_order_id": str(po.id), "status": po.status}
 
 
+@router.post("/purchase-orders/{po_id}/cancel", response_model=PurchaseOrderOut)
+async def cancel_purchase_order(
+    po_id: uuid.UUID,
+    payload: PurchaseOrderCancelIn,
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(require_permission("purchase.manage")),
+) -> PurchaseOrder:
+    po = await db.get(PurchaseOrder, po_id)
+    if po is None:
+        raise HTTPException(status_code=404, detail="Purchase order not found")
+    po = await procurement_service.cancel_purchase_order(db, current=current, po=po, reason=payload.reason)
+    await db.commit()
+    await db.refresh(po)
+    return po
+
+
 @router.get("/grn", response_model=Page[GrnOut])
 async def list_grns(
     limit: int = 20,
@@ -107,4 +124,4 @@ async def receive_grn(
         require_store_access(payload.store_id, current)
     grn = await procurement_service.receive_grn(db, current=current, payload=payload)
     await db.commit()
-    return {"grn_id": str(grn.id)}
+    return {"grn_id": str(grn.id), "grn_number": grn.grn_number}

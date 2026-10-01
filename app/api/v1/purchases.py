@@ -1,14 +1,14 @@
 
 import uuid
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser, require_permission, require_store_access
 from app.core.database import get_db
 from app.models.models import Purchase, PurchaseItem, Vendor
-from app.schemas.schemas import PurchaseCreate, PurchaseOut, VendorCreate, VendorOut
+from app.schemas.schemas import PurchaseCreate, PurchaseOut, VendorCreate, VendorOut, VendorUpdateIn
 from app.services.audit import write_audit
 from app.services.inventory import apply_movement
 
@@ -32,6 +32,12 @@ async def create_vendor(
     db: AsyncSession = Depends(get_db),
     current: CurrentUser = Depends(require_permission("vendor.manage")),
 ) -> Vendor:
+    # Point 6 audit fix: no duplicate-vendor prevention existed at all.
+    if payload.gst_number:
+        existing = (await db.execute(select(Vendor).where(Vendor.gst_number == payload.gst_number))).scalar_one_or_none()
+        if existing is not None:
+            raise HTTPException(status_code=409, detail=f"A vendor with GST number {payload.gst_number} already exists")
+
     vendor = Vendor(**payload.model_dump())
     db.add(vendor)
     await db.flush()
@@ -45,6 +51,69 @@ async def create_vendor(
         entity_type="vendor",
         entity_id=vendor.id,
         new_value=payload.model_dump(),
+    )
+    await db.commit()
+    await db.refresh(vendor)
+    return vendor
+
+
+@router.patch("/vendors/{vendor_id}", response_model=VendorOut)
+async def update_vendor(
+    vendor_id: uuid.UUID,
+    payload: VendorUpdateIn,
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(require_permission("vendor.manage")),
+) -> Vendor:
+    """Point 6 audit fix: vendors could previously be created but never
+    edited or deactivated — this is the entire missing update/deactivate
+    path, audited with before/after values."""
+    vendor = await db.get(Vendor, vendor_id)
+    if vendor is None:
+        raise HTTPException(status_code=404, detail="Vendor not found")
+
+    changes = payload.model_dump(exclude_unset=True)
+    if not changes:
+        raise HTTPException(status_code=400, detail="Provide at least one field to change")
+
+    if "gst_number" in changes and changes["gst_number"] and changes["gst_number"] != vendor.gst_number:
+        existing = (await db.execute(select(Vendor).where(Vendor.gst_number == changes["gst_number"]))).scalar_one_or_none()
+        if existing is not None:
+            raise HTTPException(status_code=409, detail=f"A vendor with GST number {changes['gst_number']} already exists")
+
+    # Point 6 audit fix edge case: deactivating a vendor with open POs used to
+    # have no guard at all.
+    if changes.get("is_active") is False:
+        from app.models.models_phase2 import PurchaseOrder
+
+        open_po_count = (
+            await db.execute(
+                select(PurchaseOrder).where(
+                    PurchaseOrder.vendor_id == vendor_id,
+                    PurchaseOrder.status.in_(["pending_approval", "approved", "partially_received"]),
+                )
+            )
+        ).scalars().all()
+        if open_po_count:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Cannot deactivate — vendor has {len(open_po_count)} open purchase order(s); close or cancel them first",
+            )
+
+    old_value = {field: getattr(vendor, field) for field in changes}
+    for field, value in changes.items():
+        setattr(vendor, field, value)
+
+    await write_audit(
+        db,
+        user_id=current.user_id,
+        role_code=current.role_code,
+        store_id=None,
+        device_id=current.device_id,
+        action="vendor.status_changed" if "is_active" in changes else "vendor.updated",
+        entity_type="vendor",
+        entity_id=vendor.id,
+        old_value={k: (str(v) if v is not None else None) for k, v in old_value.items()},
+        new_value={k: (str(v) if v is not None else None) for k, v in changes.items()},
     )
     await db.commit()
     await db.refresh(vendor)

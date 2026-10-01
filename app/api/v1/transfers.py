@@ -4,12 +4,12 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import CurrentUser, require_permission
+from app.api.deps import CurrentUser, require_permission, require_store_access
 from app.core.database import get_db
 from app.models.models_phase2 import Transfer
 from app.schemas.schemas import Page
-from app.schemas.schemas_phase2 import TransferCreate, TransferDetailOut, TransferOut, TransferReceive
-from app.services.transfers import dispatch_transfer, receive_transfer
+from app.schemas.schemas_phase2 import TransferCreate, TransferDetailOut, TransferDiscrepancyResolveIn, TransferOut, TransferReceive
+from app.services.transfers import dispatch_transfer, receive_transfer, resolve_discrepancy
 
 router = APIRouter(prefix="/transfers", tags=["transfers"])
 
@@ -49,6 +49,15 @@ async def create_transfer(
     db: AsyncSession = Depends(get_db),
     current: CurrentUser = Depends(require_permission("inventory.adjust")),
 ) -> Transfer:
+    # Point 5 audit fix: previously only the blanket inventory.adjust
+    # permission gated this — any holder could dispatch stock out of a store
+    # they have no assignment to. Warehouse legs have no per-user ownership
+    # model anywhere in this codebase (consistent with every other WMS
+    # endpoint), so only the store-side leg is scoped here.
+    if payload.source_type == "store":
+        require_store_access(payload.source_id, current)
+    if payload.dest_type == "store":
+        require_store_access(payload.dest_id, current)
     transfer = await dispatch_transfer(db, current=current, payload=payload)
     await db.commit()
     await db.refresh(transfer)
@@ -65,7 +74,28 @@ async def receive(
     transfer = await db.get(Transfer, transfer_id)
     if transfer is None:
         raise HTTPException(status_code=404, detail="Transfer not found")
+    if transfer.dest_type == "store":
+        require_store_access(transfer.dest_id, current)
     transfer = await receive_transfer(db, current=current, transfer=transfer, payload=payload)
     await db.commit()
     await db.refresh(transfer)
     return transfer
+
+
+@router.post("/{transfer_id}/resolve-discrepancy")
+async def resolve_transfer_discrepancy(
+    transfer_id: uuid.UUID,
+    payload: TransferDiscrepancyResolveIn,
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(require_permission("inventory.adjust")),
+) -> dict:
+    transfer = await db.get(Transfer, transfer_id)
+    if transfer is None:
+        raise HTTPException(status_code=404, detail="Transfer not found")
+    if transfer.dest_type == "store":
+        require_store_access(transfer.dest_id, current)
+    result = await resolve_discrepancy(db, current=current, transfer=transfer, note=payload.note)
+    await db.commit()
+    if isinstance(result, dict):
+        return {"approval_request_id": str(result["approval_request_id"]), "status": result["status"]}
+    return {"status": result.status}

@@ -83,14 +83,27 @@ async def store_pnl(db: AsyncSession, *, store_id: uuid.UUID) -> dict:
 
 
 async def payables_ageing(db: AsyncSession) -> list[dict]:
+    """Point 6 audit fix: Payable rows now actually exist (created by
+    services/vendor_invoices.py on invoice recording) — this also computes
+    overdue status live from due_date rather than relying on a status field
+    nothing ever flips, and surfaces original/paid amounts for ageing."""
+    from datetime import date as date_cls
+
     rows = (await db.execute(select(Payable).where(Payable.status != "paid"))).scalars().all()
-    return [
-        {
-            "id": str(p.id),
-            "vendor_id": str(p.vendor_id),
-            "amount_due": float(p.amount_due),
-            "due_date": p.due_date.isoformat() if p.due_date else None,
-            "status": p.status,
-        }
-        for p in rows
-    ]
+    today = date_cls.today()
+    result = []
+    for p in rows:
+        is_overdue = p.due_date is not None and p.due_date < today
+        days_overdue = (today - p.due_date).days if is_overdue else 0
+        result.append(
+            {
+                "id": str(p.id),
+                "vendor_id": str(p.vendor_id),
+                "original_amount": float(p.original_amount),
+                "amount_due": float(p.amount_due),
+                "due_date": p.due_date.isoformat() if p.due_date else None,
+                "status": "overdue" if is_overdue else p.status,
+                "days_overdue": days_overdue,
+            }
+        )
+    return result

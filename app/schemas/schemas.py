@@ -148,6 +148,11 @@ ASSIGNABLE_ROLES = {
     "regional_manager",
     "inventory_user",
     "system_admin",
+    "department_head",
+    "associate",
+    "online_ops",
+    "packer",
+    "rider",
 }
 
 
@@ -268,6 +273,13 @@ class StockAdjustmentRequest(BaseModel):
     reason: str | None = None
 
 
+class StockBlockRequest(BaseModel):
+    product_id: uuid.UUID
+    store_id: uuid.UUID
+    quantity: float = Field(gt=0)
+    reason: str
+
+
 class InventoryBalanceOut(BaseModel):
     product_id: uuid.UUID
     store_id: uuid.UUID
@@ -276,6 +288,10 @@ class InventoryBalanceOut(BaseModel):
     in_transit: float
     damaged: float
     blocked: float
+    # Point 7 audit fix: "available" previously had to be inferred by the
+    # caller (and the whole response was fabricated zeros) — now the real,
+    # explicit quantity-minus-unsellable-states figure.
+    available: float
 
 
 # ---------------------------------------------------------------------------
@@ -290,6 +306,7 @@ class SaleItemIn(BaseModel):
     quantity: float
     unit_price: float
     line_discount: float = 0
+    mrp_snapshot: float | None = None
 
 
 class PaymentIn(BaseModel):
@@ -398,12 +415,36 @@ class VendorCreate(BaseModel):
     gst_number: str | None = None
     phone: str | None = None
     email: str | None = None
+    category: str | None = None
+    service_area: str | None = None
+    credit_days: int = 30
+    bank_account_name: str | None = None
+    bank_account_number: str | None = None
+    bank_ifsc: str | None = None
+    bank_name: str | None = None
 
 
 class VendorOut(VendorCreate):
     model_config = ConfigDict(from_attributes=True)
     id: uuid.UUID
     is_active: bool
+
+
+class VendorUpdateIn(BaseModel):
+    """All optional — send just what's changing. Point 6 audit fix: there
+    was previously no way to ever edit or deactivate a vendor after creation."""
+    name: str | None = None
+    gst_number: str | None = None
+    phone: str | None = None
+    email: str | None = None
+    category: str | None = None
+    service_area: str | None = None
+    credit_days: int | None = None
+    bank_account_name: str | None = None
+    bank_account_number: str | None = None
+    bank_ifsc: str | None = None
+    bank_name: str | None = None
+    is_active: bool | None = None
 
 
 class PurchaseItemIn(BaseModel):

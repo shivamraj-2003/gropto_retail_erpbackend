@@ -20,6 +20,7 @@ from app.core.security import (
     verify_password,
 )
 from app.models.models import Device, PasswordResetOtp, RefreshToken, Role, Store, User, UserStore
+from app.models.models_phase4 import Cluster
 from app.schemas.schemas import (
     ChangePasswordIn,
     DeviceOut,
@@ -45,8 +46,20 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 
 
 async def _load_user_store_ids(db: AsyncSession, user_id: uuid.UUID) -> list[uuid.UUID]:
-    result = await db.execute(select(UserStore.store_id).where(UserStore.user_id == user_id))
-    return list(result.scalars().all())
+    """Direct user_stores assignment, UNIONed with every store belonging to a
+    Cluster this user manages (Point 2 audit fix — Cluster.regional_manager_id
+    previously carried zero actual stores; a Regional/Cluster Manager's real
+    access only ever came from the generic user_stores table, same as any
+    other store-scoped role, making the Cluster assignment pure write-only
+    decoration). A Regional Manager still never bypasses store scoping
+    entirely (ENTERPRISE_WIDE_ROLES in deps.py deliberately excludes them) —
+    this only widens *which* stores they're scoped to, same mechanism as
+    always."""
+    direct = await db.execute(select(UserStore.store_id).where(UserStore.user_id == user_id))
+    via_cluster = await db.execute(
+        select(Store.id).join(Cluster, Cluster.id == Store.cluster_id).where(Cluster.regional_manager_id == user_id)
+    )
+    return list({*direct.scalars().all(), *via_cluster.scalars().all()})
 
 
 async def _default_device_fingerprint(db: AsyncSession, user: User) -> str:

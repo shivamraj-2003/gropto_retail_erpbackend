@@ -22,6 +22,12 @@ from app.services.approvals import submit_or_apply
 
 router = APIRouter(prefix="/users", tags=["users"])
 
+# Floor-level roles tied to one physical location — same constraint Cashier/
+# Store Manager already had, extended to the new Associate/Packer/Rider
+# roles (Point 2 audit). Department Head and Online Operations are
+# deliberately left uncapped — nothing about either implies a single store.
+SINGLE_STORE_ROLES = ("cashier", "store_manager", "associate", "packer", "rider")
+
 
 async def _to_user_out(db: AsyncSession, user: User, role_code: str) -> UserOut:
     store_ids = list((await db.execute(select(UserStore.store_id).where(UserStore.user_id == user.id))).scalars().all())
@@ -70,7 +76,7 @@ async def create_user(
         raise HTTPException(status_code=400, detail=f"role_code must be one of: {', '.join(sorted(ASSIGNABLE_ROLES))}")
     if not payload.email and not payload.phone:
         raise HTTPException(status_code=400, detail="email or phone required")
-    if payload.role_code in ("cashier", "store_manager") and len(payload.store_ids) > 1:
+    if payload.role_code in SINGLE_STORE_ROLES and len(payload.store_ids) > 1:
         raise HTTPException(status_code=400, detail=f"{payload.role_code} can only be assigned to one store")
 
     if payload.email:
@@ -129,7 +135,7 @@ async def update_user(
     effective_role = payload.role_code or current_role_code
     if payload.role_code is not None and payload.role_code not in ASSIGNABLE_ROLES:
         raise HTTPException(status_code=400, detail=f"role_code must be one of: {', '.join(sorted(ASSIGNABLE_ROLES))}")
-    if payload.store_ids is not None and effective_role in ("cashier", "store_manager") and len(payload.store_ids) > 1:
+    if payload.store_ids is not None and effective_role in SINGLE_STORE_ROLES and len(payload.store_ids) > 1:
         raise HTTPException(status_code=400, detail=f"{effective_role} can only be assigned to one store")
 
     old_value: dict = {"role_code": current_role_code, "store_ids": [str(s) for s in current_store_ids]}

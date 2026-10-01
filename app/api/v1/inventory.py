@@ -1,16 +1,17 @@
 import uuid
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser, require_permission, require_store_access
 from app.core.database import get_db
 from app.models.models import InventoryBalance, Product
-from app.schemas.schemas import InventoryBalanceOut, StockAdjustmentRequest
+from app.models.models_phase4 import ReasonCodeMaster
+from app.schemas.schemas import InventoryBalanceOut, StockAdjustmentRequest, StockBlockRequest
 from app.services.approvals import submit_or_apply
 from app.services.audit import write_audit
-from app.services.inventory import apply_movement, get_balance
+from app.services.inventory import adjust_blocked, adjust_damaged, apply_movement, get_balance
 
 router = APIRouter(prefix="/inventory", tags=["inventory"])
 
@@ -24,16 +25,30 @@ async def read_balance(
     db: AsyncSession = Depends(get_db),
     current: CurrentUser = Depends(require_permission("inventory.view")),
 ) -> dict:
+    """Point 7 audit fix: this used to hardcode reserved/in_transit/damaged/
+    blocked to 0 regardless of the real column values — now reads the actual
+    InventoryBalance row, with in_transit/damaged/blocked now genuinely
+    written by transfers/returns/GRN/the block-release endpoints below."""
     require_store_access(store_id, current)
-    quantity = await get_balance(db, product_id=product_id, store_id=store_id)
+    row = (
+        await db.execute(
+            select(InventoryBalance).where(InventoryBalance.product_id == product_id, InventoryBalance.store_id == store_id)
+        )
+    ).scalar_one_or_none()
+    quantity = float(row.quantity) if row else 0.0
+    reserved = float(row.reserved) if row else 0.0
+    in_transit = float(row.in_transit) if row else 0.0
+    damaged = float(row.damaged) if row else 0.0
+    blocked = float(row.blocked) if row else 0.0
     return {
         "product_id": product_id,
         "store_id": store_id,
         "quantity": quantity,
-        "reserved": 0,
-        "in_transit": 0,
-        "damaged": 0,
-        "blocked": 0,
+        "reserved": reserved,
+        "in_transit": in_transit,
+        "damaged": damaged,
+        "blocked": blocked,
+        "available": quantity - reserved - damaged - blocked,
     }
 
 
@@ -45,7 +60,18 @@ async def adjust_stock(
 ) -> dict:
     require_store_access(payload.store_id, current)
 
-    if abs(payload.delta) > HIGH_ADJUSTMENT_THRESHOLD and current.role_code != "super_admin":
+    # Point 4 audit fix: reason_code used to be a freeform string nobody ever
+    # checked against reason_codes_master — damage/expiry/wastage/shrinkage
+    # were indistinguishable in the data, and the master table's own
+    # requires_approval flag was dead config. Matched here (code lookup is
+    # lenient — an unmatched/legacy code like the "adjustment" default falls
+    # back to the old quantity-threshold-only behaviour rather than erroring).
+    reason_master = (
+        await db.execute(select(ReasonCodeMaster).where(ReasonCodeMaster.code == payload.reason_code))
+    ).scalar_one_or_none()
+    requires_approval_by_reason = bool(reason_master and reason_master.requires_approval)
+
+    if (abs(payload.delta) > HIGH_ADJUSTMENT_THRESHOLD or requires_approval_by_reason) and current.role_code != "super_admin":
         request = await submit_or_apply(
             db,
             current=current,
@@ -58,6 +84,7 @@ async def adjust_stock(
                 "store_id": str(payload.store_id),
                 "delta": payload.delta,
                 "reason_code": payload.reason_code,
+                "category": reason_master.category if reason_master else None,
             },
             reason=payload.reason,
             store_id=payload.store_id,
@@ -85,10 +112,100 @@ async def adjust_stock(
         action="inventory.adjusted",
         entity_type="inventory_balance",
         entity_id=payload.product_id,
-        new_value={"delta": payload.delta, "reason": payload.reason},
+        new_value={"delta": payload.delta, "reason": payload.reason, "category": reason_master.category if reason_master else None},
     )
     await db.commit()
     return {"movement_id": str(movement.id), "status": "applied"}
+
+
+@router.post("/block")
+async def block_stock(
+    payload: StockBlockRequest,
+    db: AsyncSession = Depends(get_db),
+    # Point 7 audit fix: "blocked stock" previously didn't exist as a
+    # feature at all — no authorization model to release it either, since
+    # nothing could ever block it in the first place. Gated at the same
+    # authority as a manual stock adjustment.
+    current: CurrentUser = Depends(require_permission("inventory.adjust")),
+) -> dict:
+    require_store_access(payload.store_id, current)
+    await adjust_blocked(db, product_id=payload.product_id, store_id=payload.store_id, delta=payload.quantity)
+    await write_audit(
+        db,
+        user_id=current.user_id,
+        role_code=current.role_code,
+        store_id=payload.store_id,
+        device_id=current.device_id,
+        action="inventory.blocked",
+        entity_type="inventory_balance",
+        entity_id=payload.product_id,
+        new_value={"quantity": payload.quantity, "reason": payload.reason},
+    )
+    await db.commit()
+    return {"status": "blocked"}
+
+
+@router.post("/release-block")
+async def release_blocked_stock(
+    payload: StockBlockRequest,
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(require_permission("inventory.adjust")),
+) -> dict:
+    require_store_access(payload.store_id, current)
+    current_blocked = (
+        await db.execute(
+            select(InventoryBalance.blocked).where(
+                InventoryBalance.product_id == payload.product_id, InventoryBalance.store_id == payload.store_id
+            )
+        )
+    ).scalar_one_or_none()
+    if current_blocked is None or float(current_blocked) < payload.quantity - 0.001:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Only {float(current_blocked) if current_blocked is not None else 0} units are blocked for this product",
+        )
+    await adjust_blocked(db, product_id=payload.product_id, store_id=payload.store_id, delta=-payload.quantity)
+    await write_audit(
+        db,
+        user_id=current.user_id,
+        role_code=current.role_code,
+        store_id=payload.store_id,
+        device_id=current.device_id,
+        action="inventory.block_released",
+        entity_type="inventory_balance",
+        entity_id=payload.product_id,
+        new_value={"quantity": payload.quantity, "reason": payload.reason},
+    )
+    await db.commit()
+    return {"status": "released"}
+
+
+@router.post("/mark-damaged")
+async def mark_damaged(
+    payload: StockBlockRequest,
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(require_permission("inventory.adjust")),
+) -> dict:
+    """Point 7 audit fix: damage was previously only ever recordable at GRN
+    receiving or at return processing — a store discovering damage on a shelf
+    had no path to flag it as unsellable without a full manual quantity
+    adjustment (which just deletes the unit from the books instead of
+    tracking it as a real, distinct state)."""
+    require_store_access(payload.store_id, current)
+    await adjust_damaged(db, product_id=payload.product_id, store_id=payload.store_id, delta=payload.quantity)
+    await write_audit(
+        db,
+        user_id=current.user_id,
+        role_code=current.role_code,
+        store_id=payload.store_id,
+        device_id=current.device_id,
+        action="inventory.marked_damaged",
+        entity_type="inventory_balance",
+        entity_id=payload.product_id,
+        new_value={"quantity": payload.quantity, "reason": payload.reason},
+    )
+    await db.commit()
+    return {"status": "marked_damaged"}
 
 
 @router.get("/store-snapshot")

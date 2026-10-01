@@ -1,9 +1,13 @@
 """Warehouse-to-store, store-to-store and store-to-warehouse transfers (Phase 2).
 Two-sided document: dispatch decrements the source, receive increments the
-destination — deliberately two separate calls so in-transit stock is a real gap,
-not assumed. Store legs use the Phase 1 inventory_balances table; warehouse legs
-use warehouse_balances (see services/inventory.py's adjust_warehouse_balance) —
-both sides now actually move a balance, not just record the transfer document.
+destination — correctness never depended on an in_transit bucket (the source
+is already gone and the destination isn't credited until receipt). Point 7
+audit fix: a store destination's InventoryBalance.in_transit is now also
+bumped at dispatch and cleared at receipt, purely so "how much is inbound to
+this store" is queryable — it never feeds available-stock math. Store legs
+use the Phase 1 inventory_balances table; warehouse legs use warehouse_balances
+(see services/inventory.py's adjust_warehouse_balance) — both sides actually
+move a balance, not just record the transfer document.
 """
 
 from datetime import datetime, timezone
@@ -14,8 +18,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import CurrentUser
 from app.models.models_phase2 import Transfer, TransferItem
 from app.schemas.schemas_phase2 import TransferCreate, TransferReceive
+from app.services.approvals import submit_or_apply
 from app.services.audit import write_audit
-from app.services.inventory import adjust_warehouse_balance, apply_movement, get_balance, get_warehouse_balance
+from app.services.inventory import adjust_in_transit, adjust_warehouse_balance, apply_movement, get_balance, get_warehouse_balance
+
+DISCREPANCY_APPROVAL_THRESHOLD = 20  # absolute units variance on any one line; above this needs review before closing
 
 
 async def dispatch_transfer(db: AsyncSession, *, current: CurrentUser, payload: TransferCreate) -> Transfer:
@@ -61,6 +68,8 @@ async def dispatch_transfer(db: AsyncSession, *, current: CurrentUser, payload: 
             await adjust_warehouse_balance(
                 db, product_id=item.product_id, warehouse_id=payload.source_id, delta=-item.dispatched_qty
             )
+        if payload.dest_type == "store":
+            await adjust_in_transit(db, product_id=item.product_id, store_id=payload.dest_id, delta=item.dispatched_qty)
 
     await write_audit(
         db,
@@ -105,6 +114,11 @@ async def receive_transfer(db: AsyncSession, *, current: CurrentUser, transfer: 
             await adjust_warehouse_balance(
                 db, product_id=item.product_id, warehouse_id=transfer.dest_id, delta=received.received_qty
             )
+        if transfer.dest_type == "store":
+            # Clears the full dispatched amount, not just what was actually
+            # received — the entire dispatched quantity has left the pipeline
+            # either way; any shortfall is the discrepancy captured below.
+            await adjust_in_transit(db, product_id=item.product_id, store_id=transfer.dest_id, delta=-float(item.dispatched_qty))
 
     transfer.status = "discrepancy" if discrepancy else "received"
     transfer.received_by = current.user_id
@@ -120,5 +134,46 @@ async def receive_transfer(db: AsyncSession, *, current: CurrentUser, transfer: 
         entity_type="transfer",
         entity_id=transfer.id,
         new_value={"status": transfer.status},
+    )
+    return transfer
+
+
+async def resolve_discrepancy(db: AsyncSession, *, current: CurrentUser, transfer: Transfer, note: str | None) -> Transfer | dict:
+    """Point 5 audit fix: a transfer left at status="discrepancy" previously
+    had no further resolution path at all — this closes it out, routing
+    through the approval engine when any single line's variance is large
+    (same escalation pattern Returns/Stock Count already use), direct-closing
+    otherwise."""
+    if transfer.status != "discrepancy":
+        raise HTTPException(status_code=409, detail=f"Transfer is {transfer.status}, not in discrepancy")
+
+    max_variance = max(
+        (abs(float(i.dispatched_qty) - float(i.received_qty or 0)) for i in transfer.items), default=0.0
+    )
+    if max_variance > DISCREPANCY_APPROVAL_THRESHOLD and current.role_code != "super_admin":
+        request = await submit_or_apply(
+            db,
+            current=current,
+            request_type="transfer_discrepancy_resolution",
+            entity_type="transfer",
+            entity_id=transfer.id,
+            old_value=None,
+            new_value={"transfer_id": str(transfer.id), "note": note},
+            reason=note,
+            store_id=transfer.dest_id if transfer.dest_type == "store" else None,
+        )
+        return {"approval_request_id": request.id, "status": request.status}
+
+    transfer.status = "resolved"
+    await write_audit(
+        db,
+        user_id=current.user_id,
+        role_code=current.role_code,
+        store_id=transfer.dest_id if transfer.dest_type == "store" else None,
+        device_id=current.device_id,
+        action="transfer.discrepancy_resolved",
+        entity_type="transfer",
+        entity_id=transfer.id,
+        reason=note,
     )
     return transfer

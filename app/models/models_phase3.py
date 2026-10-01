@@ -24,17 +24,124 @@ class Order(Base):
     allocated_store_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("stores.id"))
     status: Mapped[str] = mapped_column(
         String, default="placed"
-    )  # placed, reserved, allocated, picking, packed, dispatched, delivered, cancelled, refunded
+    )  # placed, reserved, allocated, picking, picked, packed, dispatched, delivered, cancelled, returned, refunded
     subtotal: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False)
     delivery_fee: Mapped[float] = mapped_column(Numeric(12, 2), default=0)
+    # Point 9 audit fix: OMS had no promotion/coupon discount path at all —
+    # unit_price was taken on faith from the client and nothing was ever
+    # subtracted from subtotal for a promotion or coupon.
+    discount_total: Mapped[float] = mapped_column(Numeric(12, 2), default=0)
+    coupon_code: Mapped[str | None] = mapped_column(String)
     grand_total: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False)
     delivery_address: Mapped[str | None] = mapped_column(Text)
     rider_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"))
     delivery_otp: Mapped[str | None] = mapped_column(String)
+    # Point 8 audit fix: OTP never expired and was returned to anyone who
+    # could read the order, not just the assigned rider post-dispatch.
+    delivery_otp_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Point 3 audit fix: blueprint's Picking/Packing Time KPIs had no stage
+    # timestamps anywhere on Order. start_picking() stamps picking_started_at,
+    # pick_order() (pack completion) stamps packed_at, dispatch_order() stamps
+    # dispatched_at — giving three real, separately-measurable durations
+    # instead of permanently-null placeholders.
+    picking_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Point 8 audit fix: picking and packing used to be the same function
+    # call — picked_by/packed_by are now distinct identities, picked_at vs
+    # packed_at distinct timestamps, confirm_pack() a distinct status step.
+    picked_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"))
+    picked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    packed_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"))
+    packed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    dispatched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Point 8 audit fix: no payment field existed on Order at all — nothing
+    # to refund, no way to even know whether an order was prepaid or COD.
+    payment_mode: Mapped[str] = mapped_column(String, default="cod")  # cod, prepaid
+    payment_reference: Mapped[str | None] = mapped_column(String)
+    payment_status: Mapped[str] = mapped_column(
+        String, default="pending"
+    )  # pending, paid, cod_pending, refund_initiated, refunded
+    # Point 8 audit fix: a retried "place order" call used to create a full
+    # second order (and a second stock reservation) — no idempotency key existed.
+    client_idempotency_key: Mapped[str | None] = mapped_column(String, unique=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     items: Mapped[list["OrderItem"]] = relationship(cascade="all, delete-orphan", lazy="selectin")
+
+
+class OrderStatusHistory(Base):
+    """Point 8 audit fix: only the current status was ever stored — no
+    history of how an order got there, when, or by whom."""
+
+    __tablename__ = "order_status_history"
+    id: Mapped[uuid.UUID] = uuid_pk()
+    order_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("orders.id", ondelete="CASCADE"), nullable=False)
+    from_status: Mapped[str | None] = mapped_column(String)
+    to_status: Mapped[str] = mapped_column(String, nullable=False)
+    changed_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"))
+    reason: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class OrderRefund(Base):
+    """Point 8 audit fix: refund didn't exist anywhere in the OMS — nothing
+    linked a cancellation/return back to the original payment."""
+
+    __tablename__ = "order_refunds"
+    id: Mapped[uuid.UUID] = uuid_pk()
+    order_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("orders.id"), nullable=False)
+    amount: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False)
+    method: Mapped[str] = mapped_column(String, nullable=False)  # razorpay, manual, not_required (cod never collected)
+    gateway_refund_id: Mapped[str | None] = mapped_column(String)
+    status: Mapped[str] = mapped_column(String, default="initiated")  # initiated, completed, failed
+    reason: Mapped[str | None] = mapped_column(Text)
+    created_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class OrderReturn(Base):
+    """Point 8 audit fix: reverse logistics for online orders didn't exist —
+    the in-store Return model is keyed to a POS Sale, not an Order."""
+
+    __tablename__ = "order_returns"
+    id: Mapped[uuid.UUID] = uuid_pk()
+    order_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("orders.id"), nullable=False)
+    requested_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"))
+    reason: Mapped[str | None] = mapped_column(Text)
+    refund_total: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False, default=0)
+    status: Mapped[str] = mapped_column(String, default="pending")  # pending, completed
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    items: Mapped[list["OrderReturnItem"]] = relationship(cascade="all, delete-orphan", lazy="selectin")
+
+
+class OrderReturnItem(Base):
+    __tablename__ = "order_return_items"
+    id: Mapped[uuid.UUID] = uuid_pk()
+    return_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("order_returns.id", ondelete="CASCADE"))
+    order_item_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("order_items.id"), nullable=False)
+    product_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("products.id"), nullable=False)
+    quantity: Mapped[float] = mapped_column(Numeric(12, 3), nullable=False)
+    disposition: Mapped[str] = mapped_column(String, nullable=False)  # saleable, damaged
+    refund_amount: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False)
+
+
+class StoreFootfall(Base):
+    """Point 3 audit fix: blueprint's Conversion/Footfall KPI had no data
+    source anywhere — no visitor-counting hardware integration exists, so
+    this is a manual daily entry (store manager logs the day's walk-in
+    count), same pattern as a cash-drawer count. One row per store per day;
+    conversion = bills / footfall, computed from this against real sales."""
+
+    __tablename__ = "store_footfall"
+    id: Mapped[uuid.UUID] = uuid_pk()
+    store_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("stores.id"), nullable=False)
+    business_date: Mapped[date] = mapped_column(Date, nullable=False)
+    footfall_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    recorded_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (UniqueConstraint("store_id", "business_date", name="uq_store_footfall_store_date"),)
 
 
 class OrderItem(Base):

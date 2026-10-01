@@ -60,6 +60,7 @@ async def request_loyalty_config_change(
         "redeem_value": float(config.redeem_value),
         "min_balance_to_redeem": float(config.min_balance_to_redeem),
         "max_redeem_share": float(config.max_redeem_share),
+        "points_expiry_days": config.points_expiry_days,
     }
     new_value = {k: v for k, v in payload.model_dump(exclude={"reason"}).items() if v is not None}
     if not new_value:

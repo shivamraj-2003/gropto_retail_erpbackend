@@ -8,13 +8,31 @@ from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import CurrentUser
+from app.api.deps import ENTERPRISE_WIDE_ROLES, CurrentUser
 from app.models.models import Payment, Sale
 from app.models.models_phase2 import CashierShift, CashMovement, DayClose
 from app.schemas.schemas_phase2 import CashMovementIn, DayCloseRequest, ShiftClose, ShiftOpen
+from app.services.approvals import submit_or_apply
 from app.services.audit import write_audit
 
 VARIANCE_TOLERANCE = 50.0
+# Point 4 audit fix: cash-in/out had no approval gate at all before this —
+# any amount, no review. Store managers and above can still move cash
+# directly; a plain cashier's movement above this queues for approval.
+CASH_MOVEMENT_APPROVAL_THRESHOLD = 2000.0
+SHIFT_OWNERSHIP_BYPASS_ROLES = ENTERPRISE_WIDE_ROLES + ("store_manager", "regional_manager")
+
+
+def _assert_owns_shift(current: CurrentUser, shift: CashierShift) -> None:
+    """Point 4 audit fix: previously only store access was checked, so any
+    same-store cashier could close or move cash on a colleague's open
+    shift. A shift's own cashier, or a store-manager-and-above role, may
+    act on it; a peer cashier may not."""
+    if shift.cashier_id == current.user_id:
+        return
+    if current.role_code in SHIFT_OWNERSHIP_BYPASS_ROLES:
+        return
+    raise HTTPException(status_code=403, detail="You do not own this shift")
 
 
 async def open_shift(db: AsyncSession, *, current: CurrentUser, payload: ShiftOpen) -> CashierShift:
@@ -41,7 +59,25 @@ async def open_shift(db: AsyncSession, *, current: CurrentUser, payload: ShiftOp
     return shift
 
 
-async def record_cash_movement(db: AsyncSession, *, current: CurrentUser, shift: CashierShift, payload: CashMovementIn) -> CashMovement:
+async def record_cash_movement(
+    db: AsyncSession, *, current: CurrentUser, shift: CashierShift, payload: CashMovementIn
+) -> CashMovement | dict:
+    _assert_owns_shift(current, shift)
+
+    if payload.amount > CASH_MOVEMENT_APPROVAL_THRESHOLD and current.role_code != "super_admin":
+        request = await submit_or_apply(
+            db,
+            current=current,
+            request_type="cash_movement_approval",
+            entity_type="cashier_shift",
+            entity_id=shift.id,
+            old_value=None,
+            new_value={"shift_id": str(shift.id), "direction": payload.direction, "amount": payload.amount, "reason": payload.reason},
+            reason=payload.reason,
+            store_id=shift.store_id,
+        )
+        return {"approval_request_id": request.id, "status": request.status}
+
     movement = CashMovement(shift_id=shift.id, direction=payload.direction, amount=payload.amount, reason=payload.reason)
     db.add(movement)
     await write_audit(
@@ -71,14 +107,43 @@ async def _expected_cash(db: AsyncSession, shift: CashierShift) -> float:
     return float(shift.opening_float) + float(sum(cash_sales)) + movement_total
 
 
+async def _tender_breakdown(db: AsyncSession, *, device_id, since: datetime) -> dict:
+    """Point 4 audit fix: close used to reconcile cash only. Every tender's
+    total for the shift window is captured here so day close can at least
+    report non-cash totals alongside cash, instead of silently dropping them."""
+    rows = (
+        await db.execute(
+            select(Payment.mode, Payment.amount)
+            .join(Sale, Sale.id == Payment.sale_id)
+            .where(Sale.device_id == device_id, Sale.billed_at >= since)
+        )
+    ).all()
+    breakdown: dict[str, float] = {}
+    for mode, amount in rows:
+        breakdown[mode] = breakdown.get(mode, 0.0) + float(amount)
+    return breakdown
+
+
 async def close_shift(db: AsyncSession, *, current: CurrentUser, shift: CashierShift, payload: ShiftClose) -> CashierShift:
     if shift.status != "open":
         raise HTTPException(status_code=409, detail="Shift already closed")
+    _assert_owns_shift(current, shift)
+
+    counted_cash = payload.counted_cash
+    if payload.denomination_breakdown is not None:
+        denom_total = sum(int(note) * count for note, count in payload.denomination_breakdown.items())
+        if abs(denom_total - payload.counted_cash) > 0.01:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Denomination breakdown sums to {denom_total}, which does not match counted_cash {payload.counted_cash}",
+            )
 
     expected = await _expected_cash(db, shift)
     shift.expected_cash = expected
-    shift.counted_cash = payload.counted_cash
-    shift.variance = payload.counted_cash - expected
+    shift.counted_cash = counted_cash
+    shift.variance = counted_cash - expected
+    shift.denomination_breakdown = payload.denomination_breakdown
+    shift.tender_breakdown = await _tender_breakdown(db, device_id=shift.device_id, since=shift.opened_at)
     shift.status = "closed"
     shift.closed_at = datetime.now(timezone.utc)
 
@@ -91,7 +156,7 @@ async def close_shift(db: AsyncSession, *, current: CurrentUser, shift: CashierS
         action="shift.closed",
         entity_type="cashier_shift",
         entity_id=shift.id,
-        new_value={"expected": expected, "counted": payload.counted_cash, "variance": shift.variance},
+        new_value={"expected": expected, "counted": counted_cash, "variance": shift.variance, "tender_breakdown": shift.tender_breakdown},
     )
     return shift
 
@@ -111,12 +176,18 @@ async def close_day(db: AsyncSession, *, current: CurrentUser, payload: DayClose
     total_counted = sum(float(s.counted_cash or 0) for s in day_shifts)
     variance = total_counted - total_expected
 
+    tender_breakdown: dict[str, float] = {}
+    for s in day_shifts:
+        for mode, amount in (s.tender_breakdown or {}).items():
+            tender_breakdown[mode] = tender_breakdown.get(mode, 0.0) + float(amount)
+
     day_close = DayClose(
         store_id=payload.store_id,
         business_date=payload.business_date,
         total_expected_cash=total_expected,
         total_counted_cash=total_counted,
         variance=variance,
+        tender_breakdown=tender_breakdown,
         closed_by=current.user_id,
     )
     db.add(day_close)
@@ -129,6 +200,6 @@ async def close_day(db: AsyncSession, *, current: CurrentUser, payload: DayClose
         action="day.closed",
         entity_type="day_close",
         entity_id=None,
-        new_value={"variance": variance, "shift_count": len(day_shifts)},
+        new_value={"variance": variance, "shift_count": len(day_shifts), "tender_breakdown": tender_breakdown},
     )
     return day_close

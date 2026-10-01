@@ -20,6 +20,17 @@ class OrderCreate(BaseModel):
     preferred_store_id: uuid.UUID | None = None
     delivery_address: str | None = None
     items: list[OrderItemIn]
+    # Point 8 audit fix: a retried "place order" call used to create a full
+    # second order (and a second stock reservation) — no idempotency key
+    # existed. Optional for backward compatibility; strongly recommended.
+    client_idempotency_key: str | None = None
+    payment_mode: str = "cod"  # cod, prepaid
+    payment_reference: str | None = None  # pre-verified gateway payment id, required when prepaid
+    # Point 9 audit fix: coupon_code didn't exist anywhere in OMS. unit_price
+    # on each item is accepted for client display continuity only — the
+    # server re-resolves the real applicable price server-side and ignores
+    # the client's value (see services/pricing.py::resolve_price).
+    coupon_code: str | None = None
 
 
 class OrderOut(BaseModel):
@@ -30,9 +41,13 @@ class OrderOut(BaseModel):
     allocated_store_id: uuid.UUID | None
     status: str
     subtotal: float
+    discount_total: float
+    coupon_code: str | None
     grand_total: float
     delivery_address: str | None
     rider_id: uuid.UUID | None
+    payment_mode: str
+    payment_status: str
     created_at: datetime
 
 
@@ -48,13 +63,20 @@ class OrderItemOut(BaseModel):
 
 class OrderDetailOut(OrderOut):
     items: list[OrderItemOut]
-    delivery_otp: str | None
+    # Point 8 audit fix: delivery_otp used to be in this general response,
+    # readable by anyone who could view order detail — now omitted here and
+    # only ever surfaced via the rider-scoped /orders/{id}/delivery-otp
+    # endpoint, which checks the caller is the assigned rider.
 
 
 class OrderPickItem(BaseModel):
     order_item_id: uuid.UUID
     picked_qty: float
     substituted_product_id: uuid.UUID | None = None
+    # Point 8 audit fix: picking previously had zero scan verification —
+    # when supplied, this is checked against the (possibly substituted)
+    # product's barcode before the pick is accepted.
+    scanned_barcode: str | None = None
 
 
 class OrderPickRequest(BaseModel):
@@ -67,6 +89,58 @@ class OrderDispatchRequest(BaseModel):
 
 class OrderDeliverRequest(BaseModel):
     otp: str
+
+
+class OrderDeliveryOtpOut(BaseModel):
+    otp: str
+    expires_at: datetime | None
+
+
+class OrderCancelIn(BaseModel):
+    reason: str | None = None
+
+
+class OrderReturnItemIn(BaseModel):
+    order_item_id: uuid.UUID
+    product_id: uuid.UUID
+    quantity: float
+    disposition: str  # saleable, damaged
+    refund_amount: float
+
+
+class OrderReturnCreate(BaseModel):
+    reason: str | None = None
+    items: list[OrderReturnItemIn]
+
+
+class OrderReturnOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: uuid.UUID
+    order_id: uuid.UUID
+    reason: str | None
+    refund_total: float
+    status: str
+    created_at: datetime
+
+
+class OrderRefundOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: uuid.UUID
+    order_id: uuid.UUID
+    amount: float
+    method: str
+    status: str
+    created_at: datetime
+
+
+class OrderStatusHistoryOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: uuid.UUID
+    from_status: str | None
+    to_status: str
+    changed_by: uuid.UUID | None
+    reason: str | None
+    created_at: datetime
 
 
 # ---------------------------------------------------------------------------

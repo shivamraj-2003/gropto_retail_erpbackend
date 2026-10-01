@@ -7,11 +7,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser, require_permission, require_store_access
 from app.core.database import get_db
+from app.models.models import Product
 from app.models.models_phase2 import Transfer
 from app.models.models_phase4 import (
     InventoryBatch,
     PutawayTask,
     StoreIndent,
+    StoreIndentItem,
     WarehouseZoneLocation,
     WmsPickListTask,
 )
@@ -22,6 +24,7 @@ from app.schemas.schemas_phase4 import (
     PickConfirm,
     PickListCreate,
     PickListDispatch,
+    PutawayTaskConfirm,
     PutawayTaskCreate,
     PutawayTaskOut,
     StoreIndentCreate,
@@ -29,6 +32,7 @@ from app.schemas.schemas_phase4 import (
     WarehouseZoneLocationOut,
     WmsPickListTaskOut,
 )
+from app.services.audit import write_audit
 from app.services.transfers import dispatch_transfer
 
 router = APIRouter(prefix="/wms", tags=["wms"])
@@ -67,10 +71,85 @@ async def list_locations(
 async def create_putaway_task(
     payload: PutawayTaskCreate,
     db: AsyncSession = Depends(get_db),
-    _current: CurrentUser = Depends(require_permission("inventory.adjust")),
+    current: CurrentUser = Depends(require_permission("inventory.adjust")),
 ) -> PutawayTask:
     task = PutawayTask(**payload.model_dump())
     db.add(task)
+    await db.flush()
+    await write_audit(
+        db,
+        user_id=current.user_id,
+        role_code=current.role_code,
+        store_id=None,
+        device_id=current.device_id,
+        action="putaway.created",
+        entity_type="putaway_task",
+        entity_id=task.id,
+        new_value={"grn_id": str(payload.grn_id), "product_id": str(payload.product_id)},
+    )
+    await db.commit()
+    await db.refresh(task)
+    return task
+
+
+@router.get("/putaway", response_model=list[PutawayTaskOut])
+async def list_putaway_tasks(
+    status_filter: str | None = None,
+    db: AsyncSession = Depends(get_db),
+    _current: CurrentUser = Depends(require_permission("inventory.view")),
+) -> list[PutawayTask]:
+    stmt = select(PutawayTask)
+    if status_filter:
+        stmt = stmt.where(PutawayTask.status == status_filter)
+    result = await db.execute(stmt)
+    return list(result.scalars().all())
+
+
+@router.post("/putaway/{task_id}/confirm", response_model=PutawayTaskOut)
+async def confirm_putaway_task(
+    task_id: uuid.UUID,
+    payload: PutawayTaskConfirm,
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(require_permission("inventory.adjust")),
+) -> PutawayTask:
+    """Point 5 audit fix: there was previously no way to ever complete a
+    putaway task — this confirms the location and actually moves the batch
+    there, so zone/rack/bin becomes real placement instead of a disconnected
+    reference table."""
+    task = await db.get(PutawayTask, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Putaway task not found")
+    if task.status != "pending":
+        raise HTTPException(status_code=409, detail=f"Putaway task is {task.status}, not pending")
+
+    location = await db.get(WarehouseZoneLocation, payload.confirmed_location_id)
+    if location is None or not location.is_active:
+        raise HTTPException(status_code=400, detail="Confirmed location is not a valid active location")
+
+    batches = (
+        await db.execute(
+            select(InventoryBatch).where(
+                InventoryBatch.product_id == task.product_id,
+                InventoryBatch.location_id.is_(None),
+            )
+        )
+    ).scalars().all()
+    for batch in batches:
+        batch.location_id = location.id
+
+    task.confirmed_location_id = location.id
+    task.status = "completed"
+    await write_audit(
+        db,
+        user_id=current.user_id,
+        role_code=current.role_code,
+        store_id=None,
+        device_id=current.device_id,
+        action="putaway.confirmed",
+        entity_type="putaway_task",
+        entity_id=task.id,
+        new_value={"confirmed_location_id": str(location.id), "batches_placed": len(batches)},
+    )
     await db.commit()
     await db.refresh(task)
     return task
@@ -99,21 +178,90 @@ async def create_indent(
     db: AsyncSession = Depends(get_db),
     current: CurrentUser = Depends(require_permission("inventory.adjust")),
 ) -> StoreIndent:
+    """Point 5 audit fix: an indent used to be a bare header row with no way
+    to say what or how much was being requested — now carries real line
+    items, same pattern as PurchaseRequisition."""
     require_store_access(payload.store_id, current)
-    indent = StoreIndent(**payload.model_dump())
+    if not payload.items:
+        raise HTTPException(status_code=400, detail="An indent needs at least one line item")
+    indent = StoreIndent(
+        store_id=payload.store_id,
+        warehouse_id=payload.warehouse_id,
+        requested_by=current.user_id,
+        priority=payload.priority,
+        reason=payload.reason,
+        status="submitted",
+    )
     db.add(indent)
+    await db.flush()
+    for item in payload.items:
+        db.add(StoreIndentItem(indent_id=indent.id, product_id=item.product_id, quantity=item.quantity))
+    await write_audit(
+        db,
+        user_id=current.user_id,
+        role_code=current.role_code,
+        store_id=payload.store_id,
+        device_id=current.device_id,
+        action="indent.submitted",
+        entity_type="store_indent",
+        entity_id=indent.id,
+        new_value={"line_count": len(payload.items), "priority": payload.priority},
+    )
     await db.commit()
     await db.refresh(indent)
     return indent
 
 
+@router.post("/indents/{indent_id}/convert-to-transfer")
+async def convert_indent_to_transfer(
+    indent_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(require_permission("inventory.adjust")),
+) -> dict:
+    """Point 5 audit fix: 'converted_to_transfer' was a documented status
+    value nothing ever actually set — this is the real conversion, building a
+    warehouse-to-store Transfer (dispatch_transfer) from the indent's lines."""
+    indent = await db.get(StoreIndent, indent_id)
+    if indent is None:
+        raise HTTPException(status_code=404, detail="Indent not found")
+    if indent.status != "submitted":
+        raise HTTPException(status_code=409, detail=f"Indent is {indent.status}, not submitted")
+    require_store_access(indent.store_id, current)
+
+    transfer_payload = TransferCreate(
+        source_type="warehouse",
+        source_id=indent.warehouse_id,
+        dest_type="store",
+        dest_id=indent.store_id,
+        items=[TransferItemIn(product_id=i.product_id, dispatched_qty=float(i.quantity)) for i in indent.items],
+    )
+    transfer = await dispatch_transfer(db, current=current, payload=transfer_payload)
+    indent.status = "converted_to_transfer"
+    indent.transfer_id = transfer.id
+    await write_audit(
+        db,
+        user_id=current.user_id,
+        role_code=current.role_code,
+        store_id=indent.store_id,
+        device_id=current.device_id,
+        action="indent.converted_to_transfer",
+        entity_type="store_indent",
+        entity_id=indent.id,
+        new_value={"transfer_id": str(transfer.id)},
+    )
+    await db.commit()
+    return {"transfer_id": str(transfer.id), "status": indent.status}
+
+
 async def _fefo_suggestion(db: AsyncSession, warehouse_id: uuid.UUID, product_id: uuid.UUID) -> InventoryBatch | None:
-    """First-Expiry-First-Out: the batch expiring soonest (nulls last, since a
-    batch with no expiry date is never prioritised for depletion)."""
+    """FEFO primary, FIFO fallback (Point 5 audit fix): the batch expiring
+    soonest wins; among batches with no expiry date at all (nulls last),
+    the oldest-received one wins instead of being left effectively
+    unordered."""
     stmt = (
         select(InventoryBatch)
         .where(InventoryBatch.warehouse_id == warehouse_id, InventoryBatch.product_id == product_id, InventoryBatch.quantity > 0)
-        .order_by(InventoryBatch.expiry_date.asc().nulls_last())
+        .order_by(InventoryBatch.expiry_date.asc().nulls_last(), InventoryBatch.created_at.asc())
         .limit(1)
     )
     return (await db.execute(stmt)).scalars().first()
@@ -123,7 +271,7 @@ async def _fefo_suggestion(db: AsyncSession, warehouse_id: uuid.UUID, product_id
 async def create_pick_list(
     payload: PickListCreate,
     db: AsyncSession = Depends(get_db),
-    _current: CurrentUser = Depends(require_permission("inventory.adjust")),
+    current: CurrentUser = Depends(require_permission("inventory.adjust")),
 ) -> list[dict]:
     """Blueprint §5: "pick list, scan-based picking" + FEFO. Each requested
     line gets a real FEFO batch suggestion (soonest-expiring stock first) and
@@ -156,6 +304,17 @@ async def create_pick_list(
                 "fefo_expiry_date": fefo_batch.expiry_date if fefo_batch else None,
             }
         )
+    await write_audit(
+        db,
+        user_id=current.user_id,
+        role_code=current.role_code,
+        store_id=None,
+        device_id=current.device_id,
+        action="pick_list.created",
+        entity_type="wms_pick_list_task",
+        entity_id=None,
+        new_value={"line_count": len(payload.lines)},
+    )
     await db.commit()
     return created
 
@@ -183,20 +342,33 @@ async def confirm_pick(
     db: AsyncSession = Depends(get_db),
     current: CurrentUser = Depends(require_permission("inventory.adjust")),
 ) -> WmsPickListTask:
-    """Scan-based picking confirmation. Depletes the FEFO batch by the picked
-    quantity — real batch-level stock movement, not just a status flip."""
+    """Scan-based picking confirmation. Depletes the FEFO/FIFO batch by the
+    picked quantity — real batch-level stock movement, not just a status
+    flip. Point 5 audit fix: when the caller supplies scanned_barcode/
+    scanned_location_id, both are now verified against the task before the
+    pick is accepted — previously picked_qty was the only input, so any
+    quantity against any task_id was accepted with zero integrity check."""
     task = await db.get(WmsPickListTask, task_id)
     if task is None:
         raise HTTPException(status_code=404, detail="Pick list task not found")
     if payload.picked_qty <= 0 or payload.picked_qty > task.requested_qty:
         raise HTTPException(status_code=400, detail="picked_qty must be between 0 and requested_qty")
 
+    if payload.scanned_barcode is not None:
+        product = await db.get(Product, task.product_id)
+        if product is None or product.barcode != payload.scanned_barcode:
+            raise HTTPException(status_code=409, detail="Scanned barcode does not match this pick task's product")
+
+    if payload.scanned_location_id is not None:
+        if task.zone_location_id is None or payload.scanned_location_id != task.zone_location_id:
+            raise HTTPException(status_code=409, detail="Scanned location does not match this pick task's assigned location")
+
     remaining = payload.picked_qty
     batches = (
         await db.execute(
             select(InventoryBatch)
             .where(InventoryBatch.warehouse_id == task.warehouse_id, InventoryBatch.product_id == task.product_id, InventoryBatch.quantity > 0)
-            .order_by(InventoryBatch.expiry_date.asc().nulls_last())
+            .order_by(InventoryBatch.expiry_date.asc().nulls_last(), InventoryBatch.created_at.asc())
         )
     ).scalars().all()
     for batch in batches:
@@ -211,6 +383,17 @@ async def confirm_pick(
     task.picked_qty = payload.picked_qty
     task.picker_id = current.user_id
     task.status = "picked" if payload.picked_qty >= task.requested_qty else "picking"
+    await write_audit(
+        db,
+        user_id=current.user_id,
+        role_code=current.role_code,
+        store_id=None,
+        device_id=current.device_id,
+        action="pick_list.picked",
+        entity_type="wms_pick_list_task",
+        entity_id=task.id,
+        new_value={"picked_qty": payload.picked_qty, "scan_verified": payload.scanned_barcode is not None},
+    )
     await db.commit()
     await db.refresh(task)
     return task
@@ -220,7 +403,7 @@ async def confirm_pick(
 async def pack_pick_list(
     task_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    _current: CurrentUser = Depends(require_permission("inventory.adjust")),
+    current: CurrentUser = Depends(require_permission("inventory.adjust")),
 ) -> WmsPickListTask:
     task = await db.get(WmsPickListTask, task_id)
     if task is None:
@@ -228,6 +411,16 @@ async def pack_pick_list(
     if task.status != "picked":
         raise HTTPException(status_code=400, detail="Task must be fully picked before it can be packed")
     task.status = "packed"
+    await write_audit(
+        db,
+        user_id=current.user_id,
+        role_code=current.role_code,
+        store_id=None,
+        device_id=current.device_id,
+        action="pick_list.packed",
+        entity_type="wms_pick_list_task",
+        entity_id=task.id,
+    )
     await db.commit()
     await db.refresh(task)
     return task

@@ -1,23 +1,34 @@
 import uuid
+from datetime import date
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser, require_permission
 from app.core.database import get_db
+from app.models.models_phase2 import Payable, VendorInvoice, VendorPerformanceSnapshot
 from app.models.models_phase4 import (
     VendorDebitCreditNote,
-    VendorInvoiceMatch,
     VendorRfq,
 )
+from app.schemas.schemas import Page
+from app.schemas.schemas_phase2 import (
+    PayableOut,
+    ThreeWayMatchResultOut,
+    VendorInvoiceCreate,
+    VendorInvoiceOut,
+    VendorPaymentIn,
+    VendorPerformanceOut,
+)
 from app.schemas.schemas_phase4 import (
-    VendorInvoiceMatchOut,
     VendorNoteCreate,
     VendorNoteOut,
     VendorRfqCreate,
     VendorRfqOut,
 )
+from app.services.vendor_invoices import create_vendor_invoice, force_match_invoice
+from app.services.vendor_payments import record_payment
 
 router = APIRouter(prefix="/procurement-advanced", tags=["procurement-advanced"])
 
@@ -76,7 +87,12 @@ async def demand_forecast(
         lead_time_days = float(r.lead_time_days)
         current_qty = float(r.current_qty)
         forecast_demand_during_lead_time = daily_velocity * lead_time_days
-        suggested_order_qty = max(0.0, forecast_demand_during_lead_time + float(r.safety_stock) - current_qty)
+        uncapped_suggested_qty = max(0.0, forecast_demand_during_lead_time + float(r.safety_stock) - current_qty)
+        # Point 7 audit fix: max_qty was selected in this query but never
+        # actually used anywhere — a pure decorative ceiling. Now caps the
+        # suggestion so current_qty + suggested never exceeds it.
+        max_qty = float(r.max_qty)
+        suggested_order_qty = min(uncapped_suggested_qty, max(0.0, max_qty - current_qty)) if max_qty > 0 else uncapped_suggested_qty
         result.append(
             {
                 "product_id": str(r.product_id),
@@ -86,6 +102,7 @@ async def demand_forecast(
                 "daily_velocity_28d": round(daily_velocity, 2),
                 "lead_time_days": lead_time_days,
                 "safety_stock": float(r.safety_stock),
+                "max_qty": max_qty,
                 "forecast_demand_during_lead_time": round(forecast_demand_during_lead_time, 1),
                 "suggested_order_qty": round(suggested_order_qty, 1),
                 "reorder_needed": current_qty <= float(r.min_qty),
@@ -120,35 +137,110 @@ async def create_rfq_quote(
     return rfq
 
 
-@router.post("/three-way-match", response_model=VendorInvoiceMatchOut)
-async def execute_three_way_match(
-    po_id: uuid.UUID,
-    grn_id: uuid.UUID,
-    vendor_invoice_no: str,
-    invoice_amount: float,
+@router.get("/vendor-invoices", response_model=Page[VendorInvoiceOut])
+async def list_vendor_invoices(
+    vendor_id: uuid.UUID | None = None,
+    status_filter: str | None = None,
+    limit: int = 20,
+    offset: int = 0,
     db: AsyncSession = Depends(get_db),
     _current: CurrentUser = Depends(require_permission("purchase.manage")),
-) -> VendorInvoiceMatch:
-    # Estimate PO amount vs GRN amount vs invoice
-    po_amount = invoice_amount
-    grn_amount = invoice_amount
-    variance = abs(invoice_amount - po_amount)
-    status = "matched" if variance == 0 else "discrepancy_flagged"
+) -> Page[VendorInvoiceOut]:
+    stmt = select(VendorInvoice)
+    if vendor_id:
+        stmt = stmt.where(VendorInvoice.vendor_id == vendor_id)
+    if status_filter:
+        stmt = stmt.where(VendorInvoice.status == status_filter)
+    capped_limit = min(limit, 200)
+    total = (await db.execute(select(func.count()).select_from(stmt.subquery()))).scalar_one()
+    result = await db.execute(stmt.order_by(VendorInvoice.created_at.desc()).limit(capped_limit).offset(offset))
+    return Page(items=list(result.scalars().all()), total=total, limit=capped_limit, offset=offset)
 
-    match_record = VendorInvoiceMatch(
-        po_id=po_id,
-        grn_id=grn_id,
-        vendor_invoice_no=vendor_invoice_no,
-        po_amount=po_amount,
-        grn_amount=grn_amount,
-        invoice_amount=invoice_amount,
-        variance_amount=variance,
-        status=status,
-    )
-    db.add(match_record)
+
+@router.post("/vendor-invoices", response_model=ThreeWayMatchResultOut, status_code=201)
+async def record_vendor_invoice(
+    payload: VendorInvoiceCreate,
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(require_permission("purchase.manage")),
+) -> dict:
+    """Point 6 audit fix: this is the real three-way match — PO vs GRN vs
+    invoice amounts are actually looked up and compared (the previous
+    /three-way-match endpoint hardcoded po_amount=grn_amount=invoice_amount,
+    so it always reported a match regardless of real data). A clean match
+    also creates the resulting Payable; a discrepancy blocks it pending
+    review via POST /vendor-invoices/{id}/force-match."""
+    result = await create_vendor_invoice(db, current=current, payload=payload)
     await db.commit()
-    await db.refresh(match_record)
-    return match_record
+    await db.refresh(result["invoice"])
+    return {
+        "invoice": result["invoice"],
+        "po_amount": result["po_amount"],
+        "grn_amount": result["grn_amount"],
+        "variance_amount": result["variance_amount"],
+        "match_status": result["match_status"],
+        "payable_id": result["payable"].id if result["payable"] else None,
+    }
+
+
+@router.post("/vendor-invoices/{invoice_id}/force-match", response_model=PayableOut)
+async def force_match_vendor_invoice(
+    invoice_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    # Deliberately a narrower gate than purchase.manage — overriding a real
+    # mismatch is a financial-authority decision, not routine data entry.
+    current: CurrentUser = Depends(require_permission("purchase.manage")),
+) -> Payable:
+    if current.role_code not in ("super_admin", "purchase_head", "finance_head"):
+        raise HTTPException(status_code=403, detail="Only Purchase Head, Finance Head, or Super Admin can override a flagged mismatch")
+    invoice = await db.get(VendorInvoice, invoice_id)
+    if invoice is None:
+        raise HTTPException(status_code=404, detail="Vendor invoice not found")
+    payable = await force_match_invoice(db, current=current, invoice=invoice)
+    await db.commit()
+    await db.refresh(payable)
+    return payable
+
+
+@router.get("/vendor-performance", response_model=list[VendorPerformanceOut])
+async def list_vendor_performance(
+    vendor_id: uuid.UUID | None = None,
+    date_from: date | None = None,
+    date_to: date | None = None,
+    db: AsyncSession = Depends(get_db),
+    _current: CurrentUser = Depends(require_permission("purchase.manage")),
+) -> list[VendorPerformanceSnapshot]:
+    stmt = select(VendorPerformanceSnapshot)
+    if vendor_id:
+        stmt = stmt.where(VendorPerformanceSnapshot.vendor_id == vendor_id)
+    if date_from:
+        stmt = stmt.where(VendorPerformanceSnapshot.snapshot_date >= date_from)
+    if date_to:
+        stmt = stmt.where(VendorPerformanceSnapshot.snapshot_date <= date_to)
+    result = await db.execute(stmt.order_by(VendorPerformanceSnapshot.snapshot_date.desc()))
+    return list(result.scalars().all())
+
+
+@router.post("/payables/{payable_id}/payments")
+async def pay_payable(
+    payable_id: uuid.UUID,
+    payload: VendorPaymentIn,
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(require_permission("purchase.manage")),
+) -> dict:
+    payable = await db.get(Payable, payable_id)
+    if payable is None:
+        raise HTTPException(status_code=404, detail="Payable not found")
+    result = await record_payment(db, current=current, payable=payable, payload=payload)
+    await db.commit()
+    if isinstance(result, dict):
+        return {"approval_request_id": str(result["approval_request_id"]), "status": result["status"]}
+    await db.refresh(result)
+    return {
+        "payment_id": str(result.id),
+        "payable_id": str(result.payable_id),
+        "amount": float(result.amount),
+        "status": result.status,
+    }
 
 
 @router.get("/vendor-notes", response_model=list[VendorNoteOut])

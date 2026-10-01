@@ -1,6 +1,6 @@
 import uuid
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -8,8 +8,8 @@ from app.api.deps import CurrentUser, require_permission, require_store_access
 from app.core.database import get_db
 from app.models.models_phase2 import Return
 from app.schemas.schemas import Page
-from app.schemas.schemas_phase2 import ReturnCreate, ReturnOut
-from app.services.returns import create_return
+from app.schemas.schemas_phase2 import ReturnCreate, ReturnLinkExchangeIn, ReturnOut
+from app.services.returns import create_return, link_exchange
 
 router = APIRouter(prefix="/returns", tags=["returns"])
 
@@ -42,6 +42,23 @@ async def submit_return(
 ) -> Return:
     require_store_access(payload.store_id, current)
     ret = await create_return(db, current=current, payload=payload)
+    await db.commit()
+    await db.refresh(ret)
+    return ret
+
+
+@router.post("/{return_id}/link-exchange", response_model=ReturnOut)
+async def link_return_exchange(
+    return_id: uuid.UUID,
+    payload: ReturnLinkExchangeIn,
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(require_permission("sale.void")),
+) -> Return:
+    ret = await db.get(Return, return_id)
+    if ret is None:
+        raise HTTPException(status_code=404, detail="Return not found")
+    require_store_access(ret.store_id, current)
+    ret = await link_exchange(db, current=current, ret=ret, exchange_sale_id=payload.exchange_sale_id)
     await db.commit()
     await db.refresh(ret)
     return ret

@@ -4,14 +4,19 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import CurrentUser, require_admin_or_super, require_permission
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+from app.api.deps import CurrentUser, require_admin_or_super, require_permission, require_store_access
 from app.core.database import get_db
 from app.models.models import Role, Store
 from app.models.models_phase2 import Warehouse
+from app.models.models_phase3 import StoreFootfall
 from app.schemas.schemas_phase2 import (
     RoleOut,
     StoreCreateIn,
     StoreCreateResult,
+    StoreFootfallIn,
+    StoreFootfallOut,
     StoreOut,
     StoreUpdateIn,
     StoreUpdateResult,
@@ -66,6 +71,8 @@ async def create_store(
         "name": payload.name,
         "city": payload.city,
         "cluster": payload.cluster,
+        "area_sqft": payload.area_sqft,
+        "target_revenue_monthly": payload.target_revenue_monthly,
     }
     request = await submit_or_apply(
         db,
@@ -93,14 +100,26 @@ async def update_store(
     current: CurrentUser = Depends(require_admin_or_super),
     db: AsyncSession = Depends(get_db),
 ) -> StoreUpdateResult:
-    if payload.name is None and payload.city is None and payload.cluster is None:
+    if (
+        payload.name is None
+        and payload.city is None
+        and payload.cluster is None
+        and payload.area_sqft is None
+        and payload.target_revenue_monthly is None
+    ):
         raise HTTPException(status_code=400, detail="Provide at least one field to change")
 
     store = await db.get(Store, store_id)
     if store is None:
         raise HTTPException(status_code=404, detail="Store not found")
 
-    old_value = {"name": store.name, "city": store.city, "cluster": store.cluster}
+    old_value = {
+        "name": store.name,
+        "city": store.city,
+        "cluster": store.cluster,
+        "area_sqft": float(store.area_sqft) if store.area_sqft is not None else None,
+        "target_revenue_monthly": float(store.target_revenue_monthly) if store.target_revenue_monthly is not None else None,
+    }
     new_value: dict = {}
     if payload.name is not None:
         new_value["name"] = payload.name
@@ -108,6 +127,10 @@ async def update_store(
         new_value["city"] = payload.city
     if payload.cluster is not None:
         new_value["cluster"] = payload.cluster
+    if payload.area_sqft is not None:
+        new_value["area_sqft"] = payload.area_sqft
+    if payload.target_revenue_monthly is not None:
+        new_value["target_revenue_monthly"] = payload.target_revenue_monthly
 
     request = await submit_or_apply(
         db,
@@ -125,6 +148,42 @@ async def update_store(
     if request.status == "approved":
         return StoreUpdateResult(status="updated")
     return StoreUpdateResult(status="pending_approval", request_id=request.id)
+
+
+@router.put("/stores/{store_id}/footfall", response_model=StoreFootfallOut)
+async def log_store_footfall(
+    store_id: uuid.UUID,
+    payload: StoreFootfallIn,
+    current: CurrentUser = Depends(require_permission("inventory.adjust")),
+    db: AsyncSession = Depends(get_db),
+) -> StoreFootfall:
+    """Point 3 audit fix: the Conversion % KPI needs a visitor count, and no
+    footfall-counting hardware exists anywhere in this system — this is a
+    manual daily entry (store manager logs the day's walk-in count), same
+    trust model as a manual cash-drawer count. One row per store per day;
+    re-submitting the same date corrects it rather than duplicating."""
+    require_store_access(store_id, current)
+    store = await db.get(Store, store_id)
+    if store is None:
+        raise HTTPException(status_code=404, detail="Store not found")
+
+    stmt = (
+        pg_insert(StoreFootfall)
+        .values(
+            store_id=store_id,
+            business_date=payload.business_date,
+            footfall_count=payload.footfall_count,
+            recorded_by=current.user_id,
+        )
+        .on_conflict_do_update(
+            index_elements=["store_id", "business_date"],
+            set_={"footfall_count": payload.footfall_count, "recorded_by": current.user_id},
+        )
+        .returning(StoreFootfall)
+    )
+    row = (await db.execute(stmt)).scalar_one()
+    await db.commit()
+    return row
 
 
 @router.get("/warehouses", response_model=list[WarehouseOut])

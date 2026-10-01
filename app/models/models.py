@@ -56,6 +56,17 @@ class Store(Base):
     city: Mapped[str | None] = mapped_column(String)
     cluster: Mapped[str | None] = mapped_column(String)
     region_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("regions.id"))
+    # Real FK counterpart to clusters.regional_manager_id (Point 2 audit fix —
+    # previously no Store ever pointed at a Cluster, so a manager's cluster
+    # assignment carried zero actual stores). `cluster` above stays as the
+    # pre-existing free-text tag, untouched, to avoid breaking anything that
+    # already reads it.
+    cluster_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("clusters.id"))
+    # Point 3 audit fix: blueprint's Sales/Sq Ft and Target Achievement KPIs
+    # had no backing columns anywhere — both NULL by default (no fabricated
+    # defaults), set per store by whoever owns store setup.
+    area_sqft: Mapped[float | None] = mapped_column(Numeric(10, 2))
+    target_revenue_monthly: Mapped[float | None] = mapped_column(Numeric(14, 2))
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
@@ -232,6 +243,9 @@ class LoyaltyConfig(Base):
     redeem_value: Mapped[float] = mapped_column(Numeric(6, 4), default=0.5)
     min_balance_to_redeem: Mapped[float] = mapped_column(Numeric(12, 2), default=50)
     max_redeem_share: Mapped[float] = mapped_column(Numeric(4, 3), default=0.5)
+    # Point 9 audit fix: points never expired under any code path. Null/0 =
+    # never expire (opt-in), preserving existing behaviour by default.
+    points_expiry_days: Mapped[int | None] = mapped_column(Integer)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -306,6 +320,10 @@ class SaleItem(Base):
     taxable_value: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False, default=0)
     cgst_amount: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False, default=0)
     sgst_amount: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False, default=0)
+    # Point 4 audit fix: MRP was never captured on the sale itself — only the
+    # selling price. Snapshotted at billing time (like product_name_snapshot)
+    # so it survives later MRP changes to the product catalogue.
+    mrp_snapshot: Mapped[float | None] = mapped_column(Numeric(12, 2))
 
 
 class Payment(Base):
@@ -359,9 +377,19 @@ class Vendor(Base):
     __tablename__ = "vendors"
     id: Mapped[uuid.UUID] = uuid_pk()
     name: Mapped[str] = mapped_column(String, nullable=False)
-    gst_number: Mapped[str | None] = mapped_column(String)
+    # Point 6 audit fix: Vendor used to be name/gst/phone/email/is_active
+    # only — no bank details, category, terms, or service area, and no
+    # update/deactivate path existed at all.
+    gst_number: Mapped[str | None] = mapped_column(String, unique=True)
     phone: Mapped[str | None] = mapped_column(String)
     email: Mapped[str | None] = mapped_column(String)
+    category: Mapped[str | None] = mapped_column(String)
+    service_area: Mapped[str | None] = mapped_column(String)
+    credit_days: Mapped[int] = mapped_column(Integer, default=30)
+    bank_account_name: Mapped[str | None] = mapped_column(String)
+    bank_account_number: Mapped[str | None] = mapped_column(String)
+    bank_ifsc: Mapped[str | None] = mapped_column(String)
+    bank_name: Mapped[str | None] = mapped_column(String)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
 
 
