@@ -189,20 +189,43 @@ class CampaignSendResult(BaseModel):
 # ---------------------------------------------------------------------------
 
 class EmployeeCreate(BaseModel):
+    name: str
     user_id: uuid.UUID | None = None
     store_id: uuid.UUID
+    department_id: uuid.UUID | None = None
+    warehouse_id: uuid.UUID | None = None
     designation: str
     reporting_manager_id: uuid.UUID | None = None
     joined_at: date | None = None
 
 
+class EmployeeUpdate(BaseModel):
+    """Point 12 audit fix: no update/deactivate endpoint existed at all —
+    is_active was write-once at creation. store_id is deliberately excluded
+    here; a store reassignment must go through POST /hr-advanced/transfers
+    so the transfer log stays the authoritative record of every move."""
+    name: str | None = None
+    designation: str | None = None
+    department_id: uuid.UUID | None = None
+    warehouse_id: uuid.UUID | None = None
+    reporting_manager_id: uuid.UUID | None = None
+    user_id: uuid.UUID | None = None
+    is_active: bool | None = None
+    exited_at: date | None = None
+
+
 class EmployeeOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: uuid.UUID
+    name: str | None
     user_id: uuid.UUID | None
     store_id: uuid.UUID
+    department_id: uuid.UUID | None
+    warehouse_id: uuid.UUID | None
     designation: str
+    reporting_manager_id: uuid.UUID | None
     joined_at: date | None
+    exited_at: date | None
     is_active: bool
 
 

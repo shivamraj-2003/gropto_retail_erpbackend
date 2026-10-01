@@ -229,8 +229,17 @@ class CampaignRecipient(Base):
 class Employee(Base):
     __tablename__ = "employees"
     id: Mapped[uuid.UUID] = uuid_pk()
+    # Point 12 audit fix: Employee had no name field at all — the UI was
+    # displaying `designation` (a job title, e.g. "Cashier") as the person's
+    # identity label because there was nothing else to show.
+    name: Mapped[str | None] = mapped_column(String)
     user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"))
     store_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("stores.id"), nullable=False)
+    # Point 12 audit fix: Department/Warehouse existed as standalone master
+    # data with zero relationship to Employee — an employee could never
+    # actually be assigned to either.
+    department_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("departments.id"))
+    warehouse_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("warehouses.id"))
     designation: Mapped[str] = mapped_column(String, nullable=False)
     reporting_manager_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("employees.id"))
     joined_at: Mapped[date | None] = mapped_column(Date)
