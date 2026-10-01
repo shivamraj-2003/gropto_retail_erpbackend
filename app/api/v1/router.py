@@ -6,18 +6,26 @@ from app.api.v1 import (
     audit,
     auth,
     cash,
+    control_tower,
     crm,
+    crm_advanced,
     dashboard,
     enterprise,
+    finance_advanced,
     hr,
+    hr_advanced,
     imports,
     inventory,
+    inventory_intelligence,
     loyalty,
+    master_data,
     orders,
     payments,
     phase2_misc,
     procurement,
+    procurement_advanced,
     products,
+    promotions,
     purchases,
     reports,
     returns,
@@ -25,6 +33,7 @@ from app.api.v1 import (
     sync,
     transfers,
     users,
+    wms,
 )
 
 api_router = APIRouter(prefix="/api/v1")
@@ -58,3 +67,14 @@ api_router.include_router(orders.router)
 api_router.include_router(crm.router)
 api_router.include_router(hr.router)
 api_router.include_router(enterprise.router)
+
+# Phase 4 - Blueprint Full Architecture
+api_router.include_router(wms.router)
+api_router.include_router(procurement_advanced.router)
+api_router.include_router(inventory_intelligence.router)
+api_router.include_router(promotions.router)
+api_router.include_router(finance_advanced.router)
+api_router.include_router(crm_advanced.router)
+api_router.include_router(hr_advanced.router)
+api_router.include_router(control_tower.router)
+api_router.include_router(master_data.router)

@@ -11,6 +11,25 @@ from app.models.models import Device, Permission, Role, RolePermission, User
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login")
 
+# Central enterprise scoping for the blueprint roles that see every store
+# platform-wide. Regional/Cluster Manager is deliberately excluded — per
+# blueprint §14 ("Regional/Cluster Manager: Assigned stores and operational
+# exceptions") they're scoped like Admin/Store Manager, via the normal
+# user_stores assignment, not a full bypass. Shared with auth.py's login
+# device-binding check so the two can't drift out of sync (they did once:
+# login() only exempted super_admin/admin, locking every other enterprise
+# role out with "User not assigned to this store" since they carry zero
+# store_ids by design).
+ENTERPRISE_WIDE_ROLES = (
+    "super_admin",
+    "admin",
+    "system_admin",
+    "ceo",
+    "coo",
+    "finance_head",
+    "purchase_head",
+)
+
 
 class CurrentUser:
     def __init__(self, user_id: uuid.UUID, role_code: str, store_ids: list[uuid.UUID], device_id: uuid.UUID | None):
@@ -20,11 +39,7 @@ class CurrentUser:
         self.device_id = device_id
 
     def sees_all_stores(self) -> bool:
-        """Admin sees every store, same as Super Admin — the franchise-owner
-        model here is: Admin's mutating actions still queue for Super Admin
-        approval (handled separately by the approval engine), but reads are
-        never restricted to whichever stores they happen to be assigned to."""
-        return self.role_code in ("super_admin", "admin")
+        return self.role_code in ENTERPRISE_WIDE_ROLES
 
     def owns_store(self, store_id: uuid.UUID) -> bool:
         return self.sees_all_stores() or store_id in self.store_ids

@@ -40,6 +40,33 @@ class TokenResponse(BaseModel):
     token_type: str = "bearer"
 
 
+class LoginResponse(BaseModel):
+    """Superset of TokenResponse: normal logins populate access_token/
+    refresh_token exactly as before; a login for an MFA-enabled user instead
+    returns mfa_required=True with a short-lived challenge_token, and no
+    tokens, until /auth/mfa/login-verify is called with a valid TOTP code."""
+
+    access_token: str | None = None
+    refresh_token: str | None = None
+    token_type: str = "bearer"
+    mfa_required: bool = False
+    mfa_challenge_token: str | None = None
+
+
+class MfaSetupOut(BaseModel):
+    secret: str
+    provisioning_uri: str
+
+
+class MfaVerifySetupIn(BaseModel):
+    code: str
+
+
+class MfaLoginVerifyIn(BaseModel):
+    challenge_token: str
+    code: str
+
+
 class AuditEntryOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: uuid.UUID
@@ -110,7 +137,18 @@ class ResetPasswordIn(BaseModel):
 # User management
 # ---------------------------------------------------------------------------
 
-ASSIGNABLE_ROLES = {"admin", "cashier", "store_manager"}
+ASSIGNABLE_ROLES = {
+    "admin",
+    "cashier",
+    "store_manager",
+    "ceo",
+    "coo",
+    "finance_head",
+    "purchase_head",
+    "regional_manager",
+    "inventory_user",
+    "system_admin",
+}
 
 
 class UserCreateIn(BaseModel):

@@ -1,33 +1,78 @@
 """Omnichannel order management (Phase 3): one order queue, stock reservation
 against available-to-promise, allocation, pick/pack with substitution, dispatch,
-OTP delivery confirmation, cancellation. Allocation here is deliberately simple
-(caller-specified preferred store, checked for ATP) — multi-store allocation by
-distance/workload is a further refinement on the same structure, not a rewrite.
+OTP delivery confirmation, cancellation.
+
+Allocation (blueprint §8: "serviceability, stock availability, distance,
+workload and SLA"): distance is not computed — stores/customers have no
+geocoordinates anywhere in the schema, and adding real distance would mean
+either lat/long columns plus an external geocoding API for delivery
+addresses, or a fabricated proxy, neither of which belongs in this pass.
+Serviceability, stock availability and workload ARE real here: when the
+caller doesn't pin a preferred_store_id, every active store is checked for
+full ATP across all order lines (serviceability + availability), and the
+candidate with the fewest currently-open orders wins (workload balancing).
 """
 
 import secrets
+import uuid
 from datetime import datetime, timezone
 
 from fastapi import HTTPException
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser
-from app.models.models import Customer
+from app.models.models import Customer, Store
 from app.models.models_phase3 import Order, OrderItem
 from app.schemas.schemas_phase3 import OrderCreate, OrderDeliverRequest, OrderDispatchRequest, OrderPickRequest
 from app.services.audit import write_audit
 from app.services.inventory import adjust_reserved, apply_movement, get_available_to_promise
 
 
+async def _allocate_store(db: AsyncSession, *, items: list) -> uuid.UUID:
+    stores = list((await db.execute(select(Store.id).where(Store.is_active.is_(True)))).scalars().all())
+    if not stores:
+        raise HTTPException(status_code=409, detail="No active stores exist to allocate this order to")
+
+    workload_rows = (
+        await db.execute(
+            select(Order.allocated_store_id, func.count())
+            .where(Order.status.notin_(["delivered", "cancelled", "refunded"]))
+            .group_by(Order.allocated_store_id)
+        )
+    ).all()
+    workload = {row[0]: row[1] for row in workload_rows}
+
+    serviceable: list[tuple[uuid.UUID, int]] = []
+    for store_id in stores:
+        fully_stocked = True
+        for item in items:
+            atp = await get_available_to_promise(db, product_id=item.product_id, store_id=store_id)
+            if atp < item.quantity:
+                fully_stocked = False
+                break
+        if fully_stocked:
+            serviceable.append((store_id, workload.get(store_id, 0)))
+
+    if not serviceable:
+        raise HTTPException(status_code=409, detail="No store currently has stock to fulfil every line of this order")
+
+    serviceable.sort(key=lambda pair: pair[1])
+    return serviceable[0][0]
+
+
 async def create_order(db: AsyncSession, *, current: CurrentUser, payload: OrderCreate) -> Order:
-    for item in payload.items:
-        atp = await get_available_to_promise(db, product_id=item.product_id, store_id=payload.preferred_store_id)
-        if atp < item.quantity:
-            raise HTTPException(
-                status_code=409,
-                detail=f"Insufficient available-to-promise stock for product {item.product_id}: have {atp}, need {item.quantity}",
-            )
+    if payload.preferred_store_id is not None:
+        target_store_id = payload.preferred_store_id
+        for item in payload.items:
+            atp = await get_available_to_promise(db, product_id=item.product_id, store_id=target_store_id)
+            if atp < item.quantity:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Insufficient available-to-promise stock for product {item.product_id}: have {atp}, need {item.quantity}",
+                )
+    else:
+        target_store_id = await _allocate_store(db, items=payload.items)
 
     result = await db.execute(select(Customer).where(Customer.phone == payload.customer_phone))
     customer = result.scalar_one_or_none()
@@ -41,7 +86,7 @@ async def create_order(db: AsyncSession, *, current: CurrentUser, payload: Order
     order = Order(
         channel=payload.channel,
         customer_id=customer_id,
-        allocated_store_id=payload.preferred_store_id,
+        allocated_store_id=target_store_id,
         status="reserved",
         subtotal=subtotal,
         grand_total=subtotal,
@@ -52,13 +97,13 @@ async def create_order(db: AsyncSession, *, current: CurrentUser, payload: Order
 
     for item in payload.items:
         db.add(OrderItem(order_id=order.id, product_id=item.product_id, quantity=item.quantity, unit_price=item.unit_price))
-        await adjust_reserved(db, product_id=item.product_id, store_id=payload.preferred_store_id, delta=item.quantity)
+        await adjust_reserved(db, product_id=item.product_id, store_id=target_store_id, delta=item.quantity)
 
     await write_audit(
         db,
         user_id=current.user_id if current else None,
         role_code=current.role_code if current else None,
-        store_id=payload.preferred_store_id,
+        store_id=target_store_id,
         device_id=None,
         action="order.reserved",
         entity_type="order",
