@@ -364,7 +364,9 @@ async def change_password(
 ) -> None:
     user = await db.get(User, current.user_id)
     if user is None or not verify_password(payload.current_password, user.password_hash):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Current password is incorrect")
+        # 400, not 401: a 401 makes the client treat the access token as
+        # expired and run a refresh/retry instead of showing this message.
+        raise HTTPException(status_code=400, detail="Current password is incorrect")
     if payload.new_password == payload.current_password:
         raise HTTPException(status_code=400, detail="New password must differ from the current one")
     user.password_hash = hash_password(payload.new_password)

@@ -11,7 +11,7 @@ from app.core.security import hash_password
 from app.models.models import Device, Role, Store, User, UserStore
 
 SUPER_ADMIN_EMAIL = "admin@gropto.local"
-SUPER_ADMIN_PASSWORD = "ChangeMe!123"
+SUPER_ADMIN_PASSWORD = "SuperAdmin@123"
 
 
 async def main() -> None:
