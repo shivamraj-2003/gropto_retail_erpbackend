@@ -1,6 +1,6 @@
 import uuid
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import func, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -10,8 +10,10 @@ from app.core.database import get_db
 from app.models.models_phase2 import Expense, FraudAlert, ReorderPoint
 from app.schemas.schemas import Page
 from app.schemas.schemas_phase2 import ExpenseCreate, FraudAlertOut, ReorderPointSet
+from app.schemas.schemas_phase4 import AlertAssign, AlertResolve
 from app.services import finance as finance_service
 from app.services import fraud as fraud_service
+from app.services import fraud_notify
 from app.services.audit import write_audit
 
 router = APIRouter(tags=["phase2-misc"])
@@ -21,7 +23,7 @@ router = APIRouter(tags=["phase2-misc"])
 async def set_reorder_point(
     payload: ReorderPointSet,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("inventory.adjust")),
+    current: CurrentUser = Depends(require_permission("inventory.reorder.configure")),
 ) -> dict:
     require_store_access(payload.store_id, current)
     stmt = select(ReorderPoint).where(
@@ -62,7 +64,7 @@ async def set_reorder_point(
 async def replenishment_alerts(
     store_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("inventory.view")),
+    current: CurrentUser = Depends(require_permission("inventory.replenishment.view")),
 ) -> list[dict]:
     require_store_access(store_id, current)
     rows = (
@@ -102,7 +104,7 @@ async def mark_replenished(
     product_id: uuid.UUID,
     store_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("inventory.adjust")),
+    current: CurrentUser = Depends(require_permission("inventory.replenishment.update")),
 ) -> dict:
     """Point 4 audit fix: the blueprint's "shelf replenishment" worklist had
     config (reorder points) and a read-only OOS list, but no action a store
@@ -129,7 +131,7 @@ async def mark_replenished(
 async def create_expense(
     payload: ExpenseCreate,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("purchase.manage")),
+    current: CurrentUser = Depends(require_permission("finance.expense.create")),
 ) -> dict:
     require_store_access(payload.store_id, current)
     expense = await finance_service.create_expense(db, current=current, payload=payload)
@@ -143,7 +145,7 @@ async def list_expenses(
     limit: int = 50,
     offset: int = 0,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("report.export")),
+    current: CurrentUser = Depends(require_permission("finance.expense.view")),
 ) -> list[dict]:
     stmt = select(Expense).order_by(Expense.created_at.desc()).offset(offset).limit(limit)
     if store_id:
@@ -169,7 +171,7 @@ async def list_expenses(
 async def store_pnl(
     store_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("report.export")),
+    current: CurrentUser = Depends(require_permission("finance.pnl.view")),
 ) -> dict:
     require_store_access(store_id, current)
     return await finance_service.store_pnl(db, store_id=store_id)
@@ -178,7 +180,7 @@ async def store_pnl(
 @router.get("/finance/payables")
 async def payables(
     db: AsyncSession = Depends(get_db),
-    _current: CurrentUser = Depends(require_permission("report.export")),
+    _current: CurrentUser = Depends(require_permission("finance.payable.view")),
 ) -> list[dict]:
     return await finance_service.payables_ageing(db)
 
@@ -186,23 +188,72 @@ async def payables(
 @router.post("/fraud/scan", response_model=list[FraudAlertOut])
 async def run_scan(
     db: AsyncSession = Depends(get_db),
-    _current: CurrentUser = Depends(require_permission("approval.decide")),
+    _current: CurrentUser = Depends(require_permission("fraud.alert.create")),
 ) -> list[FraudAlert]:
     alerts = await fraud_service.run_fraud_scan(db)
     await db.commit()
+    if alerts:
+        await fraud_notify.notify_new_alerts(
+            db,
+            subject=f"Gropto Fraud Scan: {len(alerts)} new alert(s)",
+            lines=[f"[{a.severity.upper()}] {a.rule_code.replace('_', ' ')} — {a.details}" for a in alerts],
+        )
     return alerts
 
 
 @router.get("/fraud/alerts", response_model=Page[FraudAlertOut])
 async def list_alerts(
+    store_id: uuid.UUID | None = None,
     status_filter: str = "open",
     limit: int = 20,
     offset: int = 0,
     db: AsyncSession = Depends(get_db),
-    _current: CurrentUser = Depends(require_permission("approval.decide")),
+    current: CurrentUser = Depends(require_permission("fraud.alert.view")),
 ) -> Page[FraudAlertOut]:
     stmt = select(FraudAlert).where(FraudAlert.status == status_filter)
+    if store_id:
+        require_store_access(store_id, current)
+        stmt = stmt.where(FraudAlert.store_id == store_id)
+    elif not current.sees_all_stores():
+        # Point 13 audit fix: previously unscoped for any approval.decide
+        # holder — now restricted to the caller's own stores (global,
+        # store_id-null alerts stay visible to everyone with fraud.view).
+        stmt = stmt.where((FraudAlert.store_id.in_(current.store_ids)) | (FraudAlert.store_id.is_(None)))
     capped_limit = min(limit, 200)
     total = (await db.execute(select(func.count()).select_from(stmt.subquery()))).scalar_one()
     result = await db.execute(stmt.order_by(FraudAlert.created_at.desc()).limit(capped_limit).offset(offset))
     return Page(items=list(result.scalars().all()), total=total, limit=capped_limit, offset=offset)
+
+
+@router.post("/fraud/alerts/{alert_id}/assign", response_model=FraudAlertOut)
+async def assign_fraud_alert(
+    alert_id: uuid.UUID,
+    payload: AlertAssign,
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(require_permission("fraud.alert.assign")),
+) -> FraudAlert:
+    alert = await db.get(FraudAlert, alert_id)
+    if alert is not None and alert.store_id is not None:
+        require_store_access(alert.store_id, current)
+    alert = await fraud_service.assign_alert(db, current=current, alert_id=alert_id, assignee_id=payload.assignee_id)
+    await db.commit()
+    await db.refresh(alert)
+    return alert
+
+
+@router.post("/fraud/alerts/{alert_id}/resolve", response_model=FraudAlertOut)
+async def resolve_fraud_alert(
+    alert_id: uuid.UUID,
+    payload: AlertResolve,
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(require_permission("fraud.alert.close")),
+) -> FraudAlert:
+    if payload.status is None:
+        raise HTTPException(status_code=400, detail="status is required ('reviewed' or 'dismissed')")
+    existing = await db.get(FraudAlert, alert_id)
+    if existing is not None and existing.store_id is not None:
+        require_store_access(existing.store_id, current)
+    alert = await fraud_service.resolve_alert(db, current=current, alert_id=alert_id, status=payload.status, note=payload.note)
+    await db.commit()
+    await db.refresh(alert)
+    return alert

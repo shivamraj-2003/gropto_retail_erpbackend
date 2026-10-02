@@ -39,6 +39,44 @@ async def evaluate_ceo_alerts_job() -> None:
             await db.rollback()
             logger.error(f"Error during scheduled CEO alert evaluation: {e}")
 
+async def run_fraud_scan_job() -> None:
+    """Point 13 audit fix: run_fraud_scan's own docstring admitted this was
+    "on demand ... call from a scheduler in production" and never was —
+    fraud_alerts only ever populated if a Super Admin remembered to click
+    the manual scan button. Now runs on the same cadence as CEO alerts."""
+    from app.services import fraud as fraud_service
+    from app.services import fraud_notify
+
+    async with SessionLocal() as db:
+        try:
+            alerts = await fraud_service.run_fraud_scan(db)
+            await db.commit()
+            if alerts:
+                await fraud_notify.notify_new_alerts(
+                    db,
+                    subject=f"Gropto Fraud Scan: {len(alerts)} new alert(s)",
+                    lines=[f"[{a.severity.upper()}] {a.rule_code.replace('_', ' ')} — {a.details}" for a in alerts],
+                )
+        except Exception as e:
+            await db.rollback()
+            logger.error(f"Error during scheduled fraud scan: {e}")
+
+
+async def scan_suspicious_billing_job() -> None:
+    """Point 13 audit fix: scan_suspicious_billing was reachable only by a
+    direct API call nobody in the UI ever makes — dead code end-to-end.
+    Scheduled the same way as the fraud scan so suspicious_billing_logs
+    actually gets populated in production."""
+    from app.api.v1.control_tower import _run_suspicious_billing_scan
+
+    async with SessionLocal() as db:
+        try:
+            await _run_suspicious_billing_scan(db)
+        except Exception as e:
+            await db.rollback()
+            logger.error(f"Error during scheduled suspicious billing scan: {e}")
+
+
 async def refresh_abc_xyz_job() -> None:
     """Point 7 audit fix: ABC/XYZ classification was computed once per store,
     lazily, and never refreshed afterward."""
@@ -226,6 +264,20 @@ def start_scheduler() -> None:
             "interval",
             minutes=15,
             id="evaluate_ceo_alerts",
+            replace_existing=True,
+        )
+        scheduler.add_job(
+            run_fraud_scan_job,
+            "interval",
+            minutes=30,
+            id="run_fraud_scan",
+            replace_existing=True,
+        )
+        scheduler.add_job(
+            scan_suspicious_billing_job,
+            "interval",
+            minutes=30,
+            id="scan_suspicious_billing",
             replace_existing=True,
         )
         scheduler.add_job(

@@ -16,7 +16,7 @@ router = APIRouter(prefix="/enterprise", tags=["enterprise"])
 async def store_sku_drilldown(
     store_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("report.export")),
+    current: CurrentUser = Depends(require_permission("dashboard.drilldown.view")),
 ) -> list[dict]:
     """Company -> store -> SKU drill-down: revenue and margin by product for one
     store, the level below the per-store dashboard in app/api/v1/dashboard.py."""
@@ -48,7 +48,7 @@ async def store_sku_drilldown(
 @router.get("/fleet-health")
 async def fleet_health(
     db: AsyncSession = Depends(get_db),
-    _current: CurrentUser = Depends(require_permission("device.manage")),
+    _current: CurrentUser = Depends(require_permission("device.health.view")),
 ) -> list[dict]:
     """Device health and fleet monitoring: status, last sync, and how many bills
     are still sitting in the failed queue for each device."""
@@ -82,7 +82,7 @@ async def fleet_health(
 @router.get("/exceptions")
 async def exception_feed(
     db: AsyncSession = Depends(get_db),
-    _current: CurrentUser = Depends(require_permission("report.export")),
+    _current: CurrentUser = Depends(require_permission("dashboard.exception.view")),
 ) -> dict:
     """The CEO command-center exception feed: what's wrong right now, not a wall
     of reports — pending approvals, open fraud alerts, unresolved sync failures."""
@@ -112,7 +112,7 @@ async def push_device_config(
     device_id: uuid.UUID,
     config: dict,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("config.manage")),
+    current: CurrentUser = Depends(require_permission("device.config.configure")),
 ) -> dict:
     """Blueprint §19 "centralized configuration pushed to every device" — the
     DeviceConfig table existed with no API surface at all before this. A
@@ -135,7 +135,7 @@ async def push_device_config(
 async def get_device_config(
     device_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("device.manage")),
+    current: CurrentUser = Depends(require_permission("device.config.view")),
 ) -> dict:
     device = await db.get(Device, device_id)
     if device is None:
@@ -149,7 +149,7 @@ async def get_device_config(
 async def broadcast_config(
     config: dict,
     db: AsyncSession = Depends(get_db),
-    _current: CurrentUser = Depends(require_permission("config.manage")),
+    _current: CurrentUser = Depends(require_permission("device.config.configure")),
 ) -> dict:
     """Pushes the same config to every active device in one call — the
     fleet-wide half of centralized configuration, not just per-device."""

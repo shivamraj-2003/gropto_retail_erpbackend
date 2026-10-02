@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import CurrentUser
 from app.models.models_phase2 import Expense, Payable
 from app.schemas.schemas_phase2 import ExpenseCreate
-from app.services.approvals import submit_or_apply
+from app.services.approvals import approval_threshold, submit_or_apply
 from app.services.audit import write_audit
 
 EXPENSE_APPROVAL_THRESHOLD = 5000.0
@@ -28,7 +28,7 @@ async def create_expense(db: AsyncSession, *, current: CurrentUser, payload: Exp
     db.add(expense)
     await db.flush()
 
-    if payload.amount > EXPENSE_APPROVAL_THRESHOLD and current.role_code != "super_admin":
+    if payload.amount > await approval_threshold(db, "expense_approval", EXPENSE_APPROVAL_THRESHOLD) and not current.is_super_admin:
         await submit_or_apply(
             db,
             current=current,
@@ -95,6 +95,16 @@ async def payables_ageing(db: AsyncSession) -> list[dict]:
     for p in rows:
         is_overdue = p.due_date is not None and p.due_date < today
         days_overdue = (today - p.due_date).days if is_overdue else 0
+        # Point 18 audit fix: a raw days_overdue number with no bucketing —
+        # the standard 0-30/31-60/60+ ageing-bucket breakdown didn't exist.
+        if not is_overdue:
+            bucket = "not_due"
+        elif days_overdue <= 30:
+            bucket = "0-30"
+        elif days_overdue <= 60:
+            bucket = "31-60"
+        else:
+            bucket = "60+"
         result.append(
             {
                 "id": str(p.id),
@@ -104,6 +114,7 @@ async def payables_ageing(db: AsyncSession) -> list[dict]:
                 "due_date": p.due_date.isoformat() if p.due_date else None,
                 "status": "overdue" if is_overdue else p.status,
                 "days_overdue": days_overdue,
+                "ageing_bucket": bucket,
             }
         )
     return result

@@ -30,7 +30,7 @@ async def list_requisitions(
     limit: int = 20,
     offset: int = 0,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("purchase.manage")),
+    current: CurrentUser = Depends(require_permission("procurement.requisition.view")),
 ) -> Page[RequisitionOut]:
     stmt = select(PurchaseRequisition).options(selectinload(PurchaseRequisition.items))
     if not current.sees_all_stores():
@@ -48,7 +48,7 @@ async def list_requisitions(
 async def create_requisition(
     payload: RequisitionCreate,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("purchase.manage")),
+    current: CurrentUser = Depends(require_permission("procurement.requisition.create")),
 ) -> dict:
     require_store_access(payload.store_id, current)
     req = await procurement_service.create_requisition(db, current=current, payload=payload)
@@ -62,7 +62,7 @@ async def list_purchase_orders(
     limit: int = 20,
     offset: int = 0,
     db: AsyncSession = Depends(get_db),
-    _current: CurrentUser = Depends(require_permission("purchase.manage")),
+    _current: CurrentUser = Depends(require_permission("procurement.purchase_order.view")),
 ) -> Page[PurchaseOrderOut]:
     stmt = select(PurchaseOrder).options(selectinload(PurchaseOrder.items))
     if status_filter:
@@ -77,7 +77,7 @@ async def list_purchase_orders(
 async def create_purchase_order(
     payload: PurchaseOrderCreate,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("purchase.manage")),
+    current: CurrentUser = Depends(require_permission("procurement.purchase_order.create")),
 ) -> dict:
     po = await procurement_service.create_purchase_order(db, current=current, payload=payload)
     await db.commit()
@@ -89,7 +89,7 @@ async def cancel_purchase_order(
     po_id: uuid.UUID,
     payload: PurchaseOrderCancelIn,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("purchase.manage")),
+    current: CurrentUser = Depends(require_permission("procurement.purchase_order.cancel")),
 ) -> PurchaseOrder:
     po = await db.get(PurchaseOrder, po_id)
     if po is None:
@@ -105,7 +105,7 @@ async def list_grns(
     limit: int = 20,
     offset: int = 0,
     db: AsyncSession = Depends(get_db),
-    _current: CurrentUser = Depends(require_permission("purchase.manage")),
+    _current: CurrentUser = Depends(require_permission("receiving.grn.view")),
 ) -> Page[GrnOut]:
     stmt = select(Grn)
     capped_limit = min(limit, 200)
@@ -118,7 +118,7 @@ async def list_grns(
 async def receive_grn(
     payload: GrnCreate,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("purchase.manage")),
+    current: CurrentUser = Depends(require_permission("receiving.grn.create")),
 ) -> dict:
     if payload.store_id:
         require_store_access(payload.store_id, current)

@@ -465,6 +465,111 @@ class PayrollSummaryExport(Base):
 
 
 # ---------------------------------------------------------------------------
+# HR & Workforce continued: leave, document checklist, incentive/penalty
+# workflow (Point 12 audit fix — none of this existed before).
+# ---------------------------------------------------------------------------
+
+class LeaveType(Base):
+    """Master data: Casual/Sick/Earned leave etc. paid=False (e.g. Loss of
+    Pay) skips the balance check entirely in services/leave.py."""
+
+    __tablename__ = "leave_types"
+    id: Mapped[uuid.UUID] = uuid_pk()
+    name: Mapped[str] = mapped_column(String, nullable=False)
+    code: Mapped[str] = mapped_column(String, unique=True, nullable=False)
+    paid: Mapped[bool] = mapped_column(Boolean, default=True)
+    default_annual_days: Mapped[float] = mapped_column(Numeric(5, 1), default=0.0)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+
+
+class LeaveBalance(Base):
+    __tablename__ = "leave_balances"
+    id: Mapped[uuid.UUID] = uuid_pk()
+    employee_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("employees.id"), nullable=False)
+    leave_type_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("leave_types.id"), nullable=False)
+    year: Mapped[int] = mapped_column(Integer, nullable=False)
+    allocated_days: Mapped[float] = mapped_column(Numeric(5, 1), default=0.0)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (UniqueConstraint("employee_id", "leave_type_id", "year", name="uq_leave_balance_period"),)
+
+
+class LeaveRequest(Base):
+    """used_days (approved+pending) is always summed live from this table in
+    services/leave.py, never cached on LeaveBalance — same "ledger, not a
+    running total" principle as loyalty_ledger/inventory_movements."""
+
+    __tablename__ = "leave_requests"
+    id: Mapped[uuid.UUID] = uuid_pk()
+    employee_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("employees.id"), nullable=False)
+    leave_type_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("leave_types.id"), nullable=False)
+    start_date: Mapped[date] = mapped_column(Date, nullable=False)
+    end_date: Mapped[date] = mapped_column(Date, nullable=False)
+    days: Mapped[float] = mapped_column(Numeric(5, 1), nullable=False)
+    reason: Mapped[str | None] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String, default="pending")  # pending, approved, rejected, cancelled
+    requested_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"))
+    decided_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"))
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    decision_note: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class DocumentChecklistItem(Base):
+    """Master checklist definition — which documents are required at
+    joining vs. exit, company-wide."""
+
+    __tablename__ = "document_checklist_items"
+    id: Mapped[uuid.UUID] = uuid_pk()
+    name: Mapped[str] = mapped_column(String, nullable=False)
+    applies_to: Mapped[str] = mapped_column(String, nullable=False)  # joining, exit
+    required: Mapped[bool] = mapped_column(Boolean, default=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+
+
+class EmployeeDocument(Base):
+    """One row per (employee, checklist item) — auto-seeded from
+    DocumentChecklistItem when an employee joins (hr.py::create_employee)
+    or exits (hr.py::update_employee, on is_active=False). No file-storage
+    backend exists in this codebase (no S3/blob config anywhere), so
+    `reference` is a text reference (document number / filename a staff
+    member records), not a binary upload — status tracking is real;
+    building actual file storage would be a separate infrastructure piece."""
+
+    __tablename__ = "employee_documents"
+    id: Mapped[uuid.UUID] = uuid_pk()
+    employee_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("employees.id", ondelete="CASCADE"), nullable=False)
+    checklist_item_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("document_checklist_items.id"), nullable=False)
+    status: Mapped[str] = mapped_column(String, default="pending")  # pending, submitted, verified, waived
+    reference: Mapped[str | None] = mapped_column(String)
+    notes: Mapped[str | None] = mapped_column(Text)
+    updated_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (UniqueConstraint("employee_id", "checklist_item_id", name="uq_employee_document"),)
+
+
+class HrAdjustment(Base):
+    """Incentive/penalty workflow — amounts above HR_ADJUSTMENT_APPROVAL_THRESHOLD
+    (services/hr_adjustments.py) route through the same approval engine every
+    other financial action in this codebase uses; approved rows are summed
+    live into payroll-summary's penalties_total/incentives_total instead of
+    those fields ever being a hardcoded/fabricated number again."""
+
+    __tablename__ = "hr_adjustments"
+    id: Mapped[uuid.UUID] = uuid_pk()
+    employee_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("employees.id"), nullable=False)
+    store_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("stores.id"), nullable=False)
+    adjustment_type: Mapped[str] = mapped_column(String, nullable=False)  # incentive, penalty
+    amount: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False)
+    month_year: Mapped[str] = mapped_column(String, nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(String, default="pending")  # pending, approved, rejected
+    requested_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+# ---------------------------------------------------------------------------
 # CEO Alerts & Fraud Control Tower (Section 13 & 17)
 # ---------------------------------------------------------------------------
 
@@ -479,6 +584,17 @@ class CeoAlert(Base):
     action_required: Mapped[str] = mapped_column(String, nullable=False)
     status: Mapped[str] = mapped_column(String, default="active")  # active, resolved
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    # Point 17 audit fix: per-entity alert types (vendor_deterioration,
+    # transfer_discrepancy) previously had no way to dedup per-subject since
+    # store_id is NULL for them — _already_active() collapsed onto a single
+    # global row, so a second vendor/transfer deteriorating while the first
+    # alert was still active silently never got its own alert.
+    source_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    # Point 13 audit fix: same investigation-workflow gap as FraudAlert.
+    assigned_to: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"))
+    resolved_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"))
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    resolution_note: Mapped[str | None] = mapped_column(Text)
 
 
 class SuspiciousBillingLog(Base):
@@ -491,6 +607,15 @@ class SuspiciousBillingLog(Base):
     details_json: Mapped[dict] = mapped_column(JSONB, default=dict)
     reviewed: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    # Point 13 audit fix: `reviewed` was a dead-end binary flag nothing ever
+    # set past creation. `status` carries the same open/reviewed/dismissed
+    # vocabulary as fraud_alerts/ceo_alerts; `reviewed` is kept (unused by
+    # new code) only so no historical row loses data.
+    status: Mapped[str] = mapped_column(String, default="open")  # open, reviewed, dismissed
+    assigned_to: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"))
+    resolved_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"))
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    resolution_note: Mapped[str | None] = mapped_column(Text)
 
 
 # ---------------------------------------------------------------------------
@@ -519,6 +644,9 @@ class Company(Base):
     # due, not a hardcoded business rule.
     einvoice_applicable: Mapped[bool] = mapped_column(Boolean, default=False)
     aato_threshold: Mapped[float | None] = mapped_column(Numeric(14, 2))
+    # Point 15 audit fix: no deactivate path existed for any Point-15 master
+    # catalogue entity — once created, a legal entity could never be retired.
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -528,6 +656,7 @@ class Cluster(Base):
     name: Mapped[str] = mapped_column(String, nullable=False)  # e.g. North Zone, South Cluster
     region_code: Mapped[str] = mapped_column(String, nullable=False)
     regional_manager_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"))
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -536,6 +665,7 @@ class Department(Base):
     id: Mapped[uuid.UUID] = uuid_pk()
     name: Mapped[str] = mapped_column(String, nullable=False)  # e.g. Staples, FMCG, Dairy, Produce
     code: Mapped[str] = mapped_column(String, nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
 
 
 class PaymentModeMaster(Base):
@@ -553,6 +683,7 @@ class ReasonCodeMaster(Base):
     code: Mapped[str] = mapped_column(String, nullable=False)
     description: Mapped[str] = mapped_column(String, nullable=False)
     requires_approval: Mapped[bool] = mapped_column(Boolean, default=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
 
 
 class ChartOfAccount(Base):
@@ -561,6 +692,7 @@ class ChartOfAccount(Base):
     account_code: Mapped[str] = mapped_column(String, nullable=False)
     account_name: Mapped[str] = mapped_column(String, nullable=False)
     account_type: Mapped[str] = mapped_column(String, nullable=False)  # Asset, Liability, Revenue, Expense, Equity
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
 
 
 class WmsPickListTask(Base):
@@ -575,4 +707,40 @@ class WmsPickListTask(Base):
     picker_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"))
     status: Mapped[str] = mapped_column(String, default="pending")  # pending, picking, packed, dispatched
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+# ---------------------------------------------------------------------------
+# Operations: Audit Checklist (Point 18 audit fix — a literal operational/
+# compliance checklist, distinct from both the HR joining/exit document
+# checklist (DocumentChecklistItem) and the immutable audit_log change
+# trail (AuditLog). Neither of those satisfied this report; nothing like
+# it existed anywhere before this.
+# ---------------------------------------------------------------------------
+
+
+class OperationalChecklistItem(Base):
+    __tablename__ = "operational_checklist_items"
+    id: Mapped[uuid.UUID] = uuid_pk()
+    name: Mapped[str] = mapped_column(String, nullable=False)
+    category: Mapped[str] = mapped_column(String, nullable=False)  # opening, closing, safety, hygiene
+    frequency: Mapped[str] = mapped_column(String, default="daily")  # daily, weekly
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+
+
+class StoreChecklistCompletion(Base):
+    """One row per (checklist item, store, business date) — auto-seeded as
+    'pending' the first time a store's checklist is viewed for a date
+    (services/checklist.py), marked 'completed' by whoever actually did it."""
+
+    __tablename__ = "store_checklist_completions"
+    id: Mapped[uuid.UUID] = uuid_pk()
+    checklist_item_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("operational_checklist_items.id"), nullable=False)
+    store_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("stores.id"), nullable=False)
+    business_date: Mapped[date] = mapped_column(Date, nullable=False)
+    status: Mapped[str] = mapped_column(String, default="pending")  # pending, completed, skipped
+    completed_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    notes: Mapped[str | None] = mapped_column(Text)
+
+    __table_args__ = (UniqueConstraint("checklist_item_id", "store_id", "business_date", name="uq_store_checklist_completion"),)
 

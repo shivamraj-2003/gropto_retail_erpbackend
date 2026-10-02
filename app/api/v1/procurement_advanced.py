@@ -37,7 +37,7 @@ router = APIRouter(prefix="/procurement-advanced", tags=["procurement-advanced"]
 async def demand_forecast(
     store_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    _current: CurrentUser = Depends(require_permission("purchase.manage")),
+    _current: CurrentUser = Depends(require_permission("procurement.forecast.view")),
 ) -> list[dict]:
     """Blueprint §6 "Purchase Planning": demand forecast, min/max, reorder
     point and lead time in one suggestion list — reorder_points previously
@@ -115,7 +115,7 @@ async def demand_forecast(
 async def list_rfqs(
     requisition_id: uuid.UUID | None = None,
     db: AsyncSession = Depends(get_db),
-    _current: CurrentUser = Depends(require_permission("purchase.manage")),
+    _current: CurrentUser = Depends(require_permission("procurement.rfq.view")),
 ) -> list[VendorRfq]:
     stmt = select(VendorRfq).order_by(VendorRfq.quoted_unit_cost.asc())
     if requisition_id:
@@ -128,7 +128,7 @@ async def list_rfqs(
 async def create_rfq_quote(
     payload: VendorRfqCreate,
     db: AsyncSession = Depends(get_db),
-    _current: CurrentUser = Depends(require_permission("purchase.manage")),
+    _current: CurrentUser = Depends(require_permission("procurement.rfq.create")),
 ) -> VendorRfq:
     rfq = VendorRfq(**payload.model_dump())
     db.add(rfq)
@@ -144,7 +144,7 @@ async def list_vendor_invoices(
     limit: int = 20,
     offset: int = 0,
     db: AsyncSession = Depends(get_db),
-    _current: CurrentUser = Depends(require_permission("purchase.manage")),
+    _current: CurrentUser = Depends(require_permission("procurement.vendor_invoice.view")),
 ) -> Page[VendorInvoiceOut]:
     stmt = select(VendorInvoice)
     if vendor_id:
@@ -161,7 +161,7 @@ async def list_vendor_invoices(
 async def record_vendor_invoice(
     payload: VendorInvoiceCreate,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("purchase.manage")),
+    current: CurrentUser = Depends(require_permission("procurement.vendor_invoice.create")),
 ) -> dict:
     """Point 6 audit fix: this is the real three-way match — PO vs GRN vs
     invoice amounts are actually looked up and compared (the previous
@@ -188,10 +188,8 @@ async def force_match_vendor_invoice(
     db: AsyncSession = Depends(get_db),
     # Deliberately a narrower gate than purchase.manage — overriding a real
     # mismatch is a financial-authority decision, not routine data entry.
-    current: CurrentUser = Depends(require_permission("purchase.manage")),
+    current: CurrentUser = Depends(require_permission("procurement.vendor_invoice.override")),
 ) -> Payable:
-    if current.role_code not in ("super_admin", "purchase_head", "finance_head"):
-        raise HTTPException(status_code=403, detail="Only Purchase Head, Finance Head, or Super Admin can override a flagged mismatch")
     invoice = await db.get(VendorInvoice, invoice_id)
     if invoice is None:
         raise HTTPException(status_code=404, detail="Vendor invoice not found")
@@ -207,7 +205,7 @@ async def list_vendor_performance(
     date_from: date | None = None,
     date_to: date | None = None,
     db: AsyncSession = Depends(get_db),
-    _current: CurrentUser = Depends(require_permission("purchase.manage")),
+    _current: CurrentUser = Depends(require_permission("vendor.performance.view")),
 ) -> list[VendorPerformanceSnapshot]:
     stmt = select(VendorPerformanceSnapshot)
     if vendor_id:
@@ -225,7 +223,7 @@ async def pay_payable(
     payable_id: uuid.UUID,
     payload: VendorPaymentIn,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("purchase.manage")),
+    current: CurrentUser = Depends(require_permission("finance.payable.create")),
 ) -> dict:
     payable = await db.get(Payable, payable_id)
     if payable is None:
@@ -247,7 +245,7 @@ async def pay_payable(
 async def list_vendor_notes(
     vendor_id: uuid.UUID | None = None,
     db: AsyncSession = Depends(get_db),
-    _current: CurrentUser = Depends(require_permission("purchase.manage")),
+    _current: CurrentUser = Depends(require_permission("vendor.note.view")),
 ) -> list[VendorDebitCreditNote]:
     stmt = select(VendorDebitCreditNote)
     if vendor_id:
@@ -260,7 +258,7 @@ async def list_vendor_notes(
 async def create_vendor_note(
     payload: VendorNoteCreate,
     db: AsyncSession = Depends(get_db),
-    _current: CurrentUser = Depends(require_permission("purchase.manage")),
+    _current: CurrentUser = Depends(require_permission("vendor.note.create")),
 ) -> VendorDebitCreditNote:
     note = VendorDebitCreditNote(**payload.model_dump())
     db.add(note)

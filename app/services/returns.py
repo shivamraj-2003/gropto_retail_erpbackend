@@ -9,10 +9,11 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser
-from app.models.models import Payment, Sale, SaleItem
+from app.models.models import Payment, Sale, SaleItem, User
 from app.models.models_phase2 import Return, ReturnItem
 from app.schemas.schemas_phase2 import ReturnCreate
-from app.services.approvals import submit_or_apply
+from app.services import email as email_service
+from app.services.approvals import approval_threshold, submit_or_apply
 from app.services.audit import write_audit
 from app.services.inventory import adjust_damaged, apply_movement
 from app.services.loyalty import DuplicateLedgerEntry, apply_ledger_entry
@@ -21,6 +22,23 @@ from app.services.wallet import DuplicateWalletEntry, credit_wallet
 REFUND_APPROVAL_THRESHOLD = 1000.0
 AGE_APPROVAL_THRESHOLD_DAYS = 30
 REFUND_TOLERANCE = 0.01  # paise rounding slack when comparing against the original line
+
+
+async def notify_requester(db: AsyncSession, *, ret: Return, decision: str) -> None:
+    """Point 16 audit fix: a return's requester previously had no way to
+    learn their approval decision except by reopening the Returns screen —
+    honest is_configured()-gated email, same pattern as every other
+    provider in this codebase."""
+    if not email_service.is_configured():
+        return
+    requester = await db.get(User, ret.requested_by)
+    if requester is None or not requester.email:
+        return
+    await email_service.send_email(
+        requester.email,
+        f"Return {decision}",
+        f"<p>Your return request for sale {ret.sale_id} (₹{float(ret.refund_total):.2f}) was {decision}.</p>",
+    )
 
 
 async def create_return(db: AsyncSession, *, current: CurrentUser, payload: ReturnCreate) -> Return:
@@ -95,8 +113,8 @@ async def create_return(db: AsyncSession, *, current: CurrentUser, payload: Retu
         sale_age_days = (datetime.now(timezone.utc) - billed_at).days
 
     needs_approval = (
-        refund_total > REFUND_APPROVAL_THRESHOLD or sale_age_days > AGE_APPROVAL_THRESHOLD_DAYS
-    ) and current.role_code != "super_admin"
+        refund_total > await approval_threshold(db, "return_approval", REFUND_APPROVAL_THRESHOLD) or sale_age_days > AGE_APPROVAL_THRESHOLD_DAYS
+    ) and not current.is_super_admin
 
     if needs_approval:
         await submit_or_apply(

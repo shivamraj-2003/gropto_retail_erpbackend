@@ -14,7 +14,7 @@ router = APIRouter(prefix="/payments", tags=["payments"])
 
 
 @router.get("/config", response_model=PaymentConfigOut)
-async def payment_config(_current: CurrentUser = Depends(require_permission("sale.create"))):
+async def payment_config(_current: CurrentUser = Depends(require_permission("pos.payment.view"))):
     if not payments_service.is_configured():
         return PaymentConfigOut(enabled=False)
     return PaymentConfigOut(enabled=True, key_id=settings.razorpay_key_id)
@@ -22,7 +22,7 @@ async def payment_config(_current: CurrentUser = Depends(require_permission("sal
 
 @router.post("/razorpay/order", response_model=RazorpayOrderOut)
 async def create_razorpay_order(
-    body: RazorpayOrderRequest, current: CurrentUser = Depends(require_permission("sale.create"))
+    body: RazorpayOrderRequest, current: CurrentUser = Depends(require_permission("pos.payment.create"))
 ):
     if not payments_service.is_configured():
         raise HTTPException(status_code=409, detail="Payment gateway is not configured")
@@ -36,7 +36,7 @@ async def create_razorpay_order(
 
 @router.post("/razorpay/verify")
 async def verify_razorpay_payment(
-    body: RazorpayVerifyRequest, _current: CurrentUser = Depends(require_permission("sale.create"))
+    body: RazorpayVerifyRequest, _current: CurrentUser = Depends(require_permission("pos.payment.create"))
 ):
     if not payments_service.is_configured():
         raise HTTPException(status_code=409, detail="Payment gateway is not configured")

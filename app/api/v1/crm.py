@@ -30,7 +30,7 @@ async def list_campaigns(
     limit: int = 20,
     offset: int = 0,
     db: AsyncSession = Depends(get_db),
-    _current: CurrentUser = Depends(require_permission("report.export")),
+    _current: CurrentUser = Depends(require_permission("crm.campaign.view")),
 ) -> Page[CampaignOut]:
     stmt = select(Campaign)
     capped_limit = min(limit, 200)
@@ -43,7 +43,7 @@ async def list_campaigns(
 async def customer_360(
     customer_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    _current: CurrentUser = Depends(require_permission("crm.view")),
+    _current: CurrentUser = Depends(require_permission("crm.customer.view")),
 ) -> dict:
     return await crm_service.customer_360(db, customer_id=customer_id)
 
@@ -51,7 +51,7 @@ async def customer_360(
 @router.get("/segments/rfm")
 async def rfm_segments(
     db: AsyncSession = Depends(get_db),
-    _current: CurrentUser = Depends(require_permission("crm.view")),
+    _current: CurrentUser = Depends(require_permission("crm.analytics.view")),
 ) -> list[dict]:
     return await crm_service.rfm_segments(db)
 
@@ -61,7 +61,7 @@ async def update_consent(
     customer_id: uuid.UUID,
     payload: ConsentUpdate,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("crm.consent")),
+    current: CurrentUser = Depends(require_permission("crm.consent.update")),
 ) -> dict:
     await crm_service.update_consent(
         db,
@@ -80,7 +80,7 @@ async def update_consent(
 async def consent_history(
     customer_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    _current: CurrentUser = Depends(require_permission("crm.view")),
+    _current: CurrentUser = Depends(require_permission("crm.customer.view")),
 ) -> list[ConsentHistory]:
     result = await db.execute(
         select(ConsentHistory).where(ConsentHistory.customer_id == customer_id).order_by(ConsentHistory.created_at.desc())
@@ -92,7 +92,7 @@ async def consent_history(
 async def create_campaign(
     payload: CampaignCreate,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("crm.campaign")),
+    current: CurrentUser = Depends(require_permission("crm.campaign.create")),
 ) -> dict:
     """Audience is either a saved audience (payload.saved_audience_id) or an
     inline segment_query — {"segment": "<rfm band>"} or {"criteria": {...}}
@@ -133,7 +133,7 @@ async def create_campaign(
 async def send_campaign(
     campaign_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("crm.campaign")),
+    current: CurrentUser = Depends(require_permission("crm.campaign.approve")),
 ) -> dict:
     return await crm_service.send_campaign(db, campaign_id=campaign_id, user_id=current.user_id)
 
@@ -142,7 +142,7 @@ async def send_campaign(
 async def campaign_analytics(
     campaign_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    _current: CurrentUser = Depends(require_permission("report.export")),
+    _current: CurrentUser = Depends(require_permission("crm.campaign.view")),
 ) -> dict:
     return await crm_service.campaign_analytics(db, campaign_id=campaign_id)
 
@@ -154,7 +154,7 @@ async def list_customers(
     limit: int = 50,
     offset: int = 0,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("crm.view")),
+    current: CurrentUser = Depends(require_permission("crm.customer.view")),
 ) -> Page:
     """Search/list customers by phone or name. When store_id is supplied,
     scoped to customers who have at least one sale at that store (and the
@@ -191,7 +191,7 @@ async def list_customers(
 @router.get("/analytics/clv")
 async def clv_dashboard(
     db: AsyncSession = Depends(get_db),
-    _current: CurrentUser = Depends(require_permission("crm.view")),
+    _current: CurrentUser = Depends(require_permission("crm.analytics.view")),
 ) -> dict:
     from app.models.models_phase4 import ClvSnapshot
     from app.services.clv import compute_clv_snapshots, get_clv_summary
@@ -205,7 +205,7 @@ async def clv_dashboard(
 @router.post("/analytics/clv/refresh")
 async def refresh_clv(
     db: AsyncSession = Depends(get_db),
-    _current: CurrentUser = Depends(require_permission("crm.view")),
+    _current: CurrentUser = Depends(require_permission("crm.analytics.update")),
 ) -> dict:
     from app.services.clv import compute_clv_snapshots
 
@@ -216,7 +216,7 @@ async def refresh_clv(
 @router.get("/analytics/retention")
 async def retention_dashboard(
     db: AsyncSession = Depends(get_db),
-    _current: CurrentUser = Depends(require_permission("crm.view")),
+    _current: CurrentUser = Depends(require_permission("crm.analytics.view")),
 ) -> dict:
     from app.services.clv import get_retention_metrics
 
@@ -226,7 +226,7 @@ async def retention_dashboard(
 @router.get("/analytics/churn")
 async def churn_analysis(
     db: AsyncSession = Depends(get_db),
-    _current: CurrentUser = Depends(require_permission("crm.view")),
+    _current: CurrentUser = Depends(require_permission("crm.analytics.view")),
 ) -> dict:
     from app.models.models_phase4 import RfmCohortSnapshot
 
@@ -248,7 +248,7 @@ async def churn_analysis(
 
 @router.get("/channels")
 async def list_channels(
-    _current: CurrentUser = Depends(require_permission("crm.view")),
+    _current: CurrentUser = Depends(require_permission("crm.audience.view")),
 ) -> list[dict]:
     return get_supported_channels()
 
@@ -257,7 +257,7 @@ async def list_channels(
 async def preview_audience(
     payload: AudiencePreviewIn,
     db: AsyncSession = Depends(get_db),
-    _current: CurrentUser = Depends(require_permission("crm.campaign")),
+    _current: CurrentUser = Depends(require_permission("crm.audience.create")),
 ) -> dict:
     customer_ids = await crm_service.build_audience(db, payload.criteria.model_dump(exclude_none=True, mode="json"))
     return {"estimated_size": len(customer_ids), "sample_customer_ids": [str(c) for c in customer_ids[:20]]}
@@ -267,7 +267,7 @@ async def preview_audience(
 async def create_audience(
     payload: SavedAudienceCreate,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("crm.campaign")),
+    current: CurrentUser = Depends(require_permission("crm.audience.create")),
 ) -> SavedAudience:
     audience = await crm_service.save_audience(
         db,
@@ -283,7 +283,7 @@ async def create_audience(
 @router.get("/audiences", response_model=list[SavedAudienceOut])
 async def list_audiences(
     db: AsyncSession = Depends(get_db),
-    _current: CurrentUser = Depends(require_permission("crm.view")),
+    _current: CurrentUser = Depends(require_permission("crm.audience.view")),
 ) -> list[SavedAudience]:
     result = await db.execute(select(SavedAudience).order_by(SavedAudience.created_at.desc()))
     return list(result.scalars().all())

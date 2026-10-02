@@ -408,6 +408,19 @@ class ApprovalOut(BaseModel):
     review_note: str | None
     created_at: datetime
     reviewed_at: datetime | None
+    required_levels: int = 1
+    approved_levels: int = 0
+
+
+class ApprovalStepOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: uuid.UUID
+    level: int
+    approver_id: uuid.UUID
+    approver_role_code: str | None
+    decision: str
+    note: str | None
+    created_at: datetime
 
 
 # ---------------------------------------------------------------------------

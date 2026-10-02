@@ -9,7 +9,6 @@ from app.core.database import get_db
 from app.core.security import hash_password
 from app.models.models import Role, User, UserStore
 from app.schemas.schemas import (
-    ASSIGNABLE_ROLES,
     ResetPasswordIn,
     UserCreateIn,
     UserCreateResult,
@@ -19,6 +18,7 @@ from app.schemas.schemas import (
     UserUpdateResult,
 )
 from app.services.approvals import submit_or_apply
+from app.services.rbac import assert_can_grant_role, assert_can_manage_user
 
 router = APIRouter(prefix="/users", tags=["users"])
 
@@ -47,7 +47,7 @@ async def _to_user_out(db: AsyncSession, user: User, role_code: str) -> UserOut:
 async def list_users(
     limit: int = 20,
     offset: int = 0,
-    current: CurrentUser = Depends(require_permission("user.manage")),
+    current: CurrentUser = Depends(require_permission("user.user.view")),
     db: AsyncSession = Depends(get_db),
 ) -> UsersPage:
     stmt = select(User, Role.code).join(Role, Role.id == User.role_id)
@@ -65,15 +65,21 @@ async def list_users(
 @router.post("", response_model=UserCreateResult, status_code=201)
 async def create_user(
     payload: UserCreateIn,
-    current: CurrentUser = Depends(require_permission("user.manage")),
+    current: CurrentUser = Depends(require_permission("user.user.create")),
     db: AsyncSession = Depends(get_db),
 ) -> UserCreateResult:
     """Super Admin's call applies immediately (submit_or_apply's own rule);
     an Admin's call queues for Super Admin approval — same engine every
     other sensitive change in this app already goes through, nothing
     user-management-specific about the gate itself."""
-    if payload.role_code not in ASSIGNABLE_ROLES:
-        raise HTTPException(status_code=400, detail=f"role_code must be one of: {', '.join(sorted(ASSIGNABLE_ROLES))}")
+    # Point 14: any active role (custom roles included) is assignable, but
+    # never one granting more than the caller holds, and super_admin only by
+    # a Super Admin. Store assignment is limited to the caller's own scope.
+    role = (await db.execute(select(Role).where(Role.code == payload.role_code))).scalar_one_or_none()
+    await assert_can_grant_role(db, current, role, payload.role_code)
+    for store_id in payload.store_ids:
+        if not current.owns_store(store_id):
+            raise HTTPException(status_code=403, detail="Cannot assign a store outside your scope")
     if not payload.email and not payload.phone:
         raise HTTPException(status_code=400, detail="email or phone required")
     if payload.role_code in SINGLE_STORE_ROLES and len(payload.store_ids) > 1:
@@ -116,7 +122,7 @@ async def create_user(
 async def update_user(
     user_id: uuid.UUID,
     payload: UserUpdateIn,
-    current: CurrentUser = Depends(require_permission("user.manage")),
+    current: CurrentUser = Depends(require_permission("user.user.update")),
     db: AsyncSession = Depends(get_db),
 ) -> UserUpdateResult:
     """Reassigning a Cashier/Store Manager to a different store, or changing
@@ -132,9 +138,14 @@ async def update_user(
     user, current_role_code = row
     current_store_ids = list((await db.execute(select(UserStore.store_id).where(UserStore.user_id == user.id))).scalars().all())
 
+    await assert_can_manage_user(db, current, user)
     effective_role = payload.role_code or current_role_code
-    if payload.role_code is not None and payload.role_code not in ASSIGNABLE_ROLES:
-        raise HTTPException(status_code=400, detail=f"role_code must be one of: {', '.join(sorted(ASSIGNABLE_ROLES))}")
+    if payload.role_code is not None:
+        role = (await db.execute(select(Role).where(Role.code == payload.role_code))).scalar_one_or_none()
+        await assert_can_grant_role(db, current, role, payload.role_code)
+    for store_id in payload.store_ids or []:
+        if not current.owns_store(store_id):
+            raise HTTPException(status_code=403, detail="Cannot assign a store outside your scope")
     if payload.store_ids is not None and effective_role in SINGLE_STORE_ROLES and len(payload.store_ids) > 1:
         raise HTTPException(status_code=400, detail=f"{effective_role} can only be assigned to one store")
 
@@ -167,7 +178,7 @@ async def update_user(
 async def reset_password(
     user_id: uuid.UUID,
     payload: ResetPasswordIn,
-    current: CurrentUser = Depends(require_permission("user.manage")),
+    current: CurrentUser = Depends(require_permission("user.password.update")),
     db: AsyncSession = Depends(get_db),
 ) -> None:
     """Direct reset by an Admin/Super Admin — the practical "forgot password"
@@ -179,6 +190,7 @@ async def reset_password(
     user = await db.get(User, user_id)
     if user is None:
         raise HTTPException(status_code=404, detail="User not found")
+    await assert_can_manage_user(db, current, user)
     user.password_hash = hash_password(payload.new_password)
     await write_audit(
         db,

@@ -19,7 +19,7 @@ async def list_products(
     q: str | None = None,
     active_only: bool = True,
     db: AsyncSession = Depends(get_db),
-    _current: CurrentUser = Depends(require_permission("inventory.view")),
+    _current: CurrentUser = Depends(require_permission("catalog.product.view")),
 ) -> list[Product]:
     stmt = select(Product)
     if active_only:
@@ -35,7 +35,7 @@ async def pull_catalogue(
     since_revision: int = 0,
     page_size: int = 1000,
     db: AsyncSession = Depends(get_db),
-    _current: CurrentUser = Depends(require_permission("inventory.view")),
+    _current: CurrentUser = Depends(require_permission("catalog.product.view")),
 ) -> ProductPullResponse:
     """Master-data pull against a revision watermark, for device catalogue bootstrap/sync."""
     stmt = select(Product).where(Product.revision > since_revision).order_by(Product.revision).limit(page_size)
@@ -48,7 +48,7 @@ async def pull_catalogue(
 async def create_product(
     payload: ProductCreate,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("product.update")),
+    current: CurrentUser = Depends(require_permission("catalog.product.create")),
 ) -> Product:
     product = Product(**payload.model_dump())
     db.add(product)
@@ -74,7 +74,7 @@ async def request_price_change(
     product_id: uuid.UUID,
     payload: ProductPriceChangeRequest,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("product.update")),
+    current: CurrentUser = Depends(require_permission("pricing.price.update")),
 ) -> dict:
     """Price changes are financially sensitive: routed through the approval engine.
     A Super Admin caller applies immediately; anyone else creates a pending request."""
@@ -105,7 +105,7 @@ async def request_deactivation(
     product_id: uuid.UUID,
     reason: str | None = None,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("product.deactivate")),
+    current: CurrentUser = Depends(require_permission("catalog.product.delete")),
 ) -> dict:
     product = await db.get(Product, product_id)
     if product is None:

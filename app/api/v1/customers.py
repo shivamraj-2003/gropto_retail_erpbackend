@@ -17,7 +17,7 @@ router = APIRouter(prefix="/customers", tags=["customers"])
 async def lookup_customer(
     phone: str,
     db: AsyncSession = Depends(get_db),
-    _current: CurrentUser = Depends(require_permission("sale.create")),
+    _current: CurrentUser = Depends(require_permission("pos.customer.view")),
 ) -> dict:
     """Point 4 audit fix: the POS had no way to show a cashier how many
     loyalty points or how much wallet balance a customer could actually

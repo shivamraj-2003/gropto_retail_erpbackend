@@ -45,6 +45,11 @@ class Region(Base):
     id: Mapped[uuid.UUID] = uuid_pk()
     name: Mapped[str] = mapped_column(String, nullable=False)
     code: Mapped[str] = mapped_column(String, unique=True, nullable=False)
+    # Point 15 audit fix: Region had a model and a live FK from Store.region_id
+    # but no API/UI anywhere — a dead table nothing could create a row in
+    # except a seed script. is_active added for parity with every other
+    # Point-15 catalogue entity's deactivate support.
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -89,12 +94,30 @@ class Role(Base):
     name: Mapped[str] = mapped_column(String, nullable=False)
     max_discount_percent: Mapped[float] = mapped_column(Numeric(5, 2), default=0)
     max_discount_value: Mapped[float] = mapped_column(Numeric(12, 2), default=0)
+    # Point 14: custom roles. is_system marks the seeded blueprint roles (they
+    # can be edited but never deleted); scope_level 'global' = sees every store
+    # unless narrowed by a company scope, 'assigned' = only explicitly scoped
+    # stores/clusters/companies (replaces the hardcoded ENTERPRISE_WIDE_ROLES).
+    description: Mapped[str | None] = mapped_column(Text)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, server_default=text("true"))
+    is_system: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
+    scope_level: Mapped[str] = mapped_column(String, default="assigned", server_default="assigned")
+    created_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class Permission(Base):
     __tablename__ = "permissions"
     id: Mapped[uuid.UUID] = uuid_pk()
     code: Mapped[str] = mapped_column(String, unique=True, nullable=False)
+    # Point 14 catalogue metadata (app/core/permission_catalog.py). Pre-Point-14
+    # coarse codes are kept, flagged is_deprecated, so existing grants survive
+    # but the admin matrix no longer offers them.
+    module: Mapped[str | None] = mapped_column(String)
+    feature: Mapped[str | None] = mapped_column(String)
+    action: Mapped[str | None] = mapped_column(String)
+    description: Mapped[str | None] = mapped_column(Text)
+    is_deprecated: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
 
 
 class RolePermission(Base):
@@ -116,6 +139,9 @@ class User(Base):
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     mfa_secret: Mapped[str | None] = mapped_column(String)
     mfa_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Point 14: full-authority override independent of role. Only an existing
+    # Super Admin can set it (rbac.py); the `super_admin` role code implies it.
+    is_super_admin: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
@@ -126,6 +152,70 @@ class UserStore(Base):
     __tablename__ = "user_stores"
     user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"), primary_key=True)
     store_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("stores.id"), primary_key=True)
+
+
+class UserRole(Base):
+    """Point 14: additional roles beyond users.role_id (the primary role, which
+    still drives approval/discount behaviour). Effective permissions are the
+    union over the primary and every active additional role."""
+
+    __tablename__ = "user_roles"
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"), primary_key=True)
+    role_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("roles.id"), primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class UserScope(Base):
+    """Point 14: WHERE a user may act, beyond direct store assignment
+    (user_stores). company/region/cluster/city expand to their stores;
+    warehouse and department narrow WMS and HR respectively."""
+
+    __tablename__ = "user_scopes"
+    id: Mapped[uuid.UUID] = uuid_pk()
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False, index=True)
+    scope_type: Mapped[str] = mapped_column(String, nullable=False)  # company|region|cluster|city|warehouse|department
+    scope_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    scope_value: Mapped[str | None] = mapped_column(String)  # city name (cities aren't a table)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class ApprovalRule(Base):
+    """Point 14 approval matrix. For a request_type (optionally an amount band):
+    whether it needs approval at all (threshold), who may approve, how many
+    distinct approvals, and whether the maker may be the checker."""
+
+    __tablename__ = "approval_rules"
+    id: Mapped[uuid.UUID] = uuid_pk()
+    request_type: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String, nullable=False)
+    # Amounts at or below this apply without approval (only meaningful for the
+    # request types whose service checks a threshold); NULL = always approve.
+    threshold_amount: Mapped[float | None] = mapped_column(Numeric(14, 2))
+    min_amount: Mapped[float | None] = mapped_column(Numeric(14, 2))
+    max_amount: Mapped[float | None] = mapped_column(Numeric(14, 2))
+    approver_permission: Mapped[str] = mapped_column(String, default="approval.request.approve", server_default="approval.request.approve")
+    approver_role_codes: Mapped[list[str] | None] = mapped_column(ARRAY(String))
+    levels: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    maker_checker: Mapped[bool] = mapped_column(Boolean, default=True, server_default=text("true"))
+    conditions: Mapped[dict | None] = mapped_column(JSONB)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, server_default=text("true"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class ApprovalStep(Base):
+    """One approver's decision on one level of an approval request — the
+    approval history, and the record multi-level approval counts against."""
+
+    __tablename__ = "approval_steps"
+    id: Mapped[uuid.UUID] = uuid_pk()
+    request_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("approval_requests.id"), nullable=False, index=True)
+    level: Mapped[int] = mapped_column(Integer, nullable=False)
+    approver_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    approver_role_code: Mapped[str | None] = mapped_column(String)
+    decision: Mapped[str] = mapped_column(String, nullable=False)  # approved|rejected
+    note: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class Device(Base):
@@ -382,6 +472,10 @@ class ApprovalRequest(Base):
     status: Mapped[str] = mapped_column(String, default="pending")
     reviewed_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"))
     review_note: Mapped[str | None] = mapped_column(Text)
+    # Point 14 multi-level approval: how many distinct approvals the matching
+    # ApprovalRule demands, and how many have been recorded so far.
+    required_levels: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    approved_levels: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 

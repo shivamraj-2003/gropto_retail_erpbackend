@@ -7,7 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import ENTERPRISE_WIDE_ROLES, CurrentUser, get_current_user, require_permission, require_store_access
+from app.api.deps import CurrentUser, get_current_user, require_permission, require_store_access
 from app.core.database import get_db
 from app.core.security import (
     create_access_token,
@@ -38,6 +38,7 @@ from app.schemas.schemas import (
 )
 from app.services import email as email_service
 from app.services.audit import write_audit
+from app.services.rbac import resolve_access
 from app.services.rate_limit import is_login_locked, record_login_failure, record_login_success
 
 OTP_EXPIRY_MINUTES = 10
@@ -133,12 +134,14 @@ async def login(payload: LoginRequest, db: AsyncSession = Depends(get_db)) -> Lo
     if device.status == "revoked":
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Device has been revoked")
 
-    # Enterprise-wide roles (see ENTERPRISE_WIDE_ROLES / CurrentUser.sees_all_stores())
+    # Users whose scope is enterprise-wide (a 'global' role, or Super Admin)
     # must be able to log in even though they carry zero store_ids by design —
-    # they aren't tied to a device's home store the way a Cashier/Store Manager is.
-    if role.code not in ENTERPRISE_WIDE_ROLES:
-        store_ids = await _load_user_store_ids(db, user.id)
-        if device.store_id and device.store_id not in store_ids:
+    # they aren't tied to a device's home store the way a Cashier/Store Manager
+    # is. Point 14: resolved from roles.scope_level + user_scopes (a cluster/
+    # company scope counts as assignment) instead of a hardcoded role list.
+    access = await resolve_access(db, user)
+    if not access.global_scope:
+        if device.store_id and device.store_id not in access.store_ids:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="User not assigned to this store")
     device.last_seen_at = datetime.now(timezone.utc)
 
@@ -493,7 +496,7 @@ async def register_device(
     store_id: uuid.UUID,
     code: str,
     fingerprint: str,
-    current: CurrentUser = Depends(require_permission("device.manage")),
+    current: CurrentUser = Depends(require_permission("device.terminal.create")),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
     """Pre-registers a device before it ever logs in. Created active
@@ -521,7 +524,7 @@ async def list_devices(
     status_filter: str | None = None,
     limit: int = 20,
     offset: int = 0,
-    current: CurrentUser = Depends(require_permission("device.manage")),
+    current: CurrentUser = Depends(require_permission("device.terminal.view")),
     db: AsyncSession = Depends(get_db),
 ) -> Page[DeviceOut]:
     stmt = select(Device, Store.name).join(Store, Store.id == Device.store_id)
@@ -546,7 +549,7 @@ async def list_devices(
 @router.post("/devices/{device_id}/revoke", status_code=204)
 async def revoke_device(
     device_id: uuid.UUID,
-    current: CurrentUser = Depends(require_permission("device.manage")),
+    current: CurrentUser = Depends(require_permission("device.terminal.delete")),
     db: AsyncSession = Depends(get_db),
 ) -> None:
     device = await db.get(Device, device_id)
@@ -572,7 +575,7 @@ async def revoke_device(
 @router.get("/store-credentials", response_model=list[StoreCredentialRow])
 async def store_credentials(
     store_id: uuid.UUID,
-    current: CurrentUser = Depends(require_permission("inventory.view")),
+    current: CurrentUser = Depends(require_permission("device.credential.view")),
     db: AsyncSession = Depends(get_db),
 ) -> list[User]:
     """The password-hash mirror an activated device caches locally so login still
@@ -616,9 +619,16 @@ async def me(current: CurrentUser = Depends(get_current_user), db: AsyncSession 
         store = await db.get(Store, current.store_ids[0])
         primary_store_code = store.code if store else None
 
+    access = current.access
     return {
         "user_id": str(current.user_id),
         "role": current.role_code,
+        # Point 14: what the UI needs to gate routes/buttons. Display only —
+        # every endpoint re-checks server-side.
+        "role_codes": list(access.role_codes) if access else [current.role_code],
+        "is_super_admin": current.is_super_admin,
+        "all_stores": current.sees_all_stores(),
+        "permissions": sorted(current.permissions),
         "stores": [str(s) for s in current.store_ids],
         "device_id": str(current.device_id) if current.device_id else None,
         # Needed on-device to format bill numbers as store_code-device_code-seq

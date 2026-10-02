@@ -53,7 +53,7 @@ async def _get_order_scoped(db: AsyncSession, order_id: uuid.UUID, current: Curr
 async def order_kpis(
     store_id: uuid.UUID | None = None,
     db: AsyncSession = Depends(get_db),
-    _current: CurrentUser = Depends(require_permission("sale.create")),
+    _current: CurrentUser = Depends(require_permission("oms.order.view")),
 ) -> dict:
     """Blueprint §8 Online KPIs: fill rate, cancellation %, item-not-found %,
     delivery TAT, pick/pack/dispatch timing — all now backed by real
@@ -132,7 +132,7 @@ async def list_orders(
     limit: int = 20,
     offset: int = 0,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("sale.create")),
+    current: CurrentUser = Depends(require_permission("oms.order.view")),
 ) -> Page[OrderOut]:
     """The order queue: every online order, optionally filtered by status/store —
     the packer/dispatcher screen's main list."""
@@ -156,7 +156,7 @@ async def list_orders(
 async def get_order(
     order_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("sale.create")),
+    current: CurrentUser = Depends(require_permission("oms.order.view")),
 ) -> Order:
     return await _get_order_scoped(db, order_id, current)
 
@@ -165,7 +165,7 @@ async def get_order(
 async def get_delivery_otp(
     order_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("inventory.adjust")),
+    current: CurrentUser = Depends(require_permission("oms.delivery.view")),
 ) -> dict:
     order = await _get_order(db, order_id)
     return await oms.get_delivery_otp(current=current, order=order)
@@ -175,7 +175,7 @@ async def get_delivery_otp(
 async def get_order_status_history(
     order_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("sale.create")),
+    current: CurrentUser = Depends(require_permission("oms.order.view")),
 ) -> list[OrderStatusHistory]:
     await _get_order_scoped(db, order_id, current)
     result = await db.execute(
@@ -188,7 +188,7 @@ async def get_order_status_history(
 async def create_order(
     payload: OrderCreate,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("sale.create")),
+    current: CurrentUser = Depends(require_permission("oms.order.create")),
 ) -> Order:
     order = await oms.create_order(db, current=current, payload=payload)
     await db.commit()
@@ -200,7 +200,7 @@ async def create_order(
 async def start_picking(
     order_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("inventory.adjust")),
+    current: CurrentUser = Depends(require_permission("oms.fulfilment.update")),
 ) -> Order:
     order = await _get_order_scoped(db, order_id, current)
     order = await oms.start_picking(db, current=current, order=order)
@@ -214,7 +214,7 @@ async def pick_order(
     order_id: uuid.UUID,
     payload: OrderPickRequest,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("inventory.adjust")),
+    current: CurrentUser = Depends(require_permission("oms.fulfilment.update")),
 ) -> Order:
     order = await _get_order_scoped(db, order_id, current)
     order = await oms.pick_order(db, current=current, order=order, payload=payload)
@@ -227,7 +227,7 @@ async def pick_order(
 async def confirm_pack(
     order_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("inventory.adjust")),
+    current: CurrentUser = Depends(require_permission("oms.fulfilment.update")),
 ) -> Order:
     order = await _get_order_scoped(db, order_id, current)
     order = await oms.confirm_pack(db, current=current, order=order)
@@ -241,7 +241,7 @@ async def dispatch_order(
     order_id: uuid.UUID,
     payload: OrderDispatchRequest,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("inventory.adjust")),
+    current: CurrentUser = Depends(require_permission("oms.delivery.transfer")),
 ) -> Order:
     order = await _get_order_scoped(db, order_id, current)
     order = await oms.dispatch_order(db, current=current, order=order, payload=payload)
@@ -255,7 +255,7 @@ async def deliver_order(
     order_id: uuid.UUID,
     payload: OrderDeliverRequest,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("inventory.adjust")),
+    current: CurrentUser = Depends(require_permission("oms.delivery.close")),
 ) -> Order:
     order = await _get_order(db, order_id)  # rider may not be store-assigned; oms.deliver_order enforces rider identity itself
     order = await oms.deliver_order(db, current=current, order=order, payload=payload)
@@ -269,7 +269,7 @@ async def cancel_order(
     order_id: uuid.UUID,
     payload: OrderCancelIn = OrderCancelIn(),
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("sale.void")),
+    current: CurrentUser = Depends(require_permission("oms.order.cancel")),
 ) -> Order:
     order = await _get_order_scoped(db, order_id, current)
     order = await oms.cancel_order(db, current=current, order=order, reason=payload.reason)
@@ -283,7 +283,7 @@ async def recall_dispatched_order(
     order_id: uuid.UUID,
     payload: OrderCancelIn = OrderCancelIn(),
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("sale.void")),
+    current: CurrentUser = Depends(require_permission("oms.order.void")),
 ) -> Order:
     order = await _get_order_scoped(db, order_id, current)
     order = await oms.recall_dispatched_order(db, current=current, order=order, reason=payload.reason)
@@ -296,7 +296,7 @@ async def recall_dispatched_order(
 async def list_order_refunds(
     order_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("sale.void")),
+    current: CurrentUser = Depends(require_permission("oms.refund.view")),
 ) -> list[OrderRefund]:
     await _get_order_scoped(db, order_id, current)
     result = await db.execute(select(OrderRefund).where(OrderRefund.order_id == order_id).order_by(OrderRefund.created_at.desc()))
@@ -308,7 +308,7 @@ async def create_order_return(
     order_id: uuid.UUID,
     payload: OrderReturnCreate,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("sale.void")),
+    current: CurrentUser = Depends(require_permission("oms.refund.refund")),
 ) -> Order:
     order = await _get_order_scoped(db, order_id, current)
     ret = await oms.create_order_return(db, current=current, order=order, payload=payload)

@@ -18,7 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import CurrentUser
 from app.models.models_phase2 import Transfer, TransferItem
 from app.schemas.schemas_phase2 import TransferCreate, TransferReceive
-from app.services.approvals import submit_or_apply
+from app.services.approvals import approval_threshold, submit_or_apply
 from app.services.audit import write_audit
 from app.services.inventory import adjust_in_transit, adjust_warehouse_balance, apply_movement, get_balance, get_warehouse_balance
 
@@ -150,7 +150,7 @@ async def resolve_discrepancy(db: AsyncSession, *, current: CurrentUser, transfe
     max_variance = max(
         (abs(float(i.dispatched_qty) - float(i.received_qty or 0)) for i in transfer.items), default=0.0
     )
-    if max_variance > DISCREPANCY_APPROVAL_THRESHOLD and current.role_code != "super_admin":
+    if max_variance > await approval_threshold(db, "transfer_discrepancy_resolution", DISCREPANCY_APPROVAL_THRESHOLD) and not current.is_super_admin:
         request = await submit_or_apply(
             db,
             current=current,

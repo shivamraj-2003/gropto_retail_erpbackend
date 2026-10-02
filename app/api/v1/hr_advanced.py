@@ -1,5 +1,5 @@
 import uuid
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import func, select
@@ -8,12 +8,17 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import CurrentUser, require_permission, require_store_access
 from app.core.database import get_db
 from app.models.models_phase3 import Attendance, Employee
-from app.models.models_phase4 import PayrollSummaryExport, StaffTransfer
+from app.models.models_phase4 import HrAdjustment, PayrollSummaryExport, StaffTransfer
 from app.schemas.schemas_phase4 import (
+    HrAdjustmentCreate,
+    HrAdjustmentOut,
     PayrollExportOut,
+    ProductivityRow,
     StaffTransferCreate,
     StaffTransferOut,
 )
+from app.services import hr_adjustments as hr_adjustments_service
+from app.services import hr_productivity as hr_productivity_service
 from app.services.audit import write_audit
 
 router = APIRouter(prefix="/hr-advanced", tags=["hr-advanced"])
@@ -24,7 +29,7 @@ async def list_staff_transfers(
     employee_id: uuid.UUID | None = None,
     store_id: uuid.UUID | None = None,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("hr.manage")),
+    current: CurrentUser = Depends(require_permission("hr.transfer.view")),
 ) -> list[StaffTransfer]:
     # Point 12 audit fix: this previously returned every transfer
     # company-wide with no store filter at all.
@@ -46,7 +51,7 @@ async def list_staff_transfers(
 async def create_staff_transfer(
     payload: StaffTransferCreate,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("hr.manage")),
+    current: CurrentUser = Depends(require_permission("hr.transfer.create")),
 ) -> StaffTransfer:
     """Point 12 audit fix: this used to only insert a log row — the
     employee's actual store assignment was never updated, so the transfer
@@ -97,11 +102,9 @@ async def _compute_payroll_summary(db: AsyncSession, *, store_id: uuid.UUID, mon
     total_employees=12/worked_days=26.0/overtime_hours=48.5/
     penalties_total=450.0/incentives_total=3200.0 for ANY store/month with
     no existing row, then persist the fabrication. This computes the real,
-    available numbers from Employee/Attendance. penalties_total and
-    incentives_total are correctly 0 — there is no wage-rate/deduction/
-    incentive field anywhere in this schema to derive a real currency
-    amount from, and inventing a rate would be exactly the kind of mock
-    data this fix removes."""
+    available numbers from Employee/Attendance. penalties_total/
+    incentives_total now sum real approved HrAdjustment rows for this
+    store+month (0.0 when none exist — not a fabricated placeholder)."""
     year, month = (int(p) for p in month_year.split("-"))
     month_start = date(year, month, 1)
     month_end = date(year + 1, 1, 1) if month == 12 else date(year, month + 1, 1)
@@ -131,12 +134,24 @@ async def _compute_payroll_summary(db: AsyncSession, *, store_id: uuid.UUID, mon
             hours = (r.check_out - r.check_in).total_seconds() / 3600
             overtime_hours += max(hours - 8.0, 0.0)
 
+    adjustment_rows = (
+        await db.execute(
+            select(HrAdjustment.adjustment_type, HrAdjustment.amount).where(
+                HrAdjustment.store_id == store_id,
+                HrAdjustment.month_year == month_year,
+                HrAdjustment.status == "approved",
+            )
+        )
+    ).all()
+    penalties_total = sum(float(a) for t, a in adjustment_rows if t == "penalty")
+    incentives_total = sum(float(a) for t, a in adjustment_rows if t == "incentive")
+
     return {
         "total_employees": int(total_employees),
         "worked_days": round(float(worked_days), 1),
         "overtime_hours": round(overtime_hours, 1),
-        "penalties_total": 0.0,
-        "incentives_total": 0.0,
+        "penalties_total": round(penalties_total, 2),
+        "incentives_total": round(incentives_total, 2),
     }
 
 
@@ -145,7 +160,7 @@ async def get_payroll_summary(
     store_id: uuid.UUID,
     month_year: str = "2026-09",
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("hr.manage")),
+    current: CurrentUser = Depends(require_permission("payroll.summary.view")),
 ) -> list[PayrollSummaryExport]:
     require_store_access(store_id, current)
     computed = await _compute_payroll_summary(db, store_id=store_id, month_year=month_year)
@@ -181,3 +196,56 @@ async def get_payroll_summary(
     await db.commit()
     await db.refresh(export)
     return [export]
+
+
+@router.post("/adjustments", response_model=HrAdjustmentOut, status_code=201)
+async def create_adjustment(
+    payload: HrAdjustmentCreate,
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(require_permission("payroll.adjustment.create")),
+) -> HrAdjustment:
+    require_store_access(payload.store_id, current)
+    employee = await db.get(Employee, payload.employee_id)
+    if employee is None:
+        raise HTTPException(status_code=404, detail="Employee not found")
+    if employee.store_id != payload.store_id:
+        raise HTTPException(status_code=409, detail="Employee does not belong to this store")
+    adjustment = await hr_adjustments_service.create_adjustment(db, current=current, payload=payload)
+    await db.commit()
+    await db.refresh(adjustment)
+    return adjustment
+
+
+@router.get("/adjustments", response_model=list[HrAdjustmentOut])
+async def list_adjustments(
+    store_id: uuid.UUID,
+    month_year: str | None = None,
+    employee_id: uuid.UUID | None = None,
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(require_permission("payroll.adjustment.view")),
+) -> list[HrAdjustment]:
+    require_store_access(store_id, current)
+    stmt = select(HrAdjustment).where(HrAdjustment.store_id == store_id).order_by(HrAdjustment.created_at.desc())
+    if month_year:
+        stmt = stmt.where(HrAdjustment.month_year == month_year)
+    if employee_id:
+        stmt = stmt.where(HrAdjustment.employee_id == employee_id)
+    result = await db.execute(stmt)
+    return list(result.scalars().all())
+
+
+@router.get("/productivity", response_model=list[ProductivityRow])
+async def get_store_productivity(
+    store_id: uuid.UUID,
+    month_year: str = "2026-09",
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(require_permission("workforce.productivity.view")),
+) -> list[dict]:
+    require_store_access(store_id, current)
+    year, month = (int(p) for p in month_year.split("-"))
+    month_start = date(year, month, 1)
+    month_end = date(year + 1, 1, 1) if month == 12 else date(year, month + 1, 1)
+
+    return await hr_productivity_service.store_productivity(
+        db, store_id=store_id, month_start=month_start, month_end=month_end - timedelta(days=1)
+    )
