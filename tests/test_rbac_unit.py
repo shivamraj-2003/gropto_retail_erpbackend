@@ -31,7 +31,8 @@ PUBLIC_OR_SELF = {
     "/health", "/api/v1/sync/health", "/api/v1/auth/login", "/api/v1/auth/refresh", "/api/v1/auth/logout",
     "/api/v1/auth/forgot-password", "/api/v1/auth/reset-password-with-otp", "/api/v1/auth/mfa/login-verify",
     "/api/v1/auth/me", "/api/v1/auth/change-password", "/api/v1/auth/mfa/setup", "/api/v1/auth/mfa/verify-setup",
-    "/api/v1/auth/mfa/disable", "/api/v1/rbac/me",
+    "/api/v1/auth/mfa/disable", "/api/v1/rbac/me", "/api/v1/enterprise/devices/self/config",
+    "/health/ready", "/api/v1/auth/otp/resend", "/api/v1/auth/otp/channels",
 }
 
 

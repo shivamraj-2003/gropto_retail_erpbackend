@@ -44,8 +44,8 @@ async def rate_limit_middleware(request: Request, call_next):
     # The connectivity probe (§14 "unauthenticated health endpoint") must never
     # itself be rate limited, or a flapping connection's own probing traffic
     # could lock a device out of finding out it's back online.
-    if request.url.path not in ("/health", "/api/v1/sync/health"):
-        if is_request_rate_limited(client_ip):
+    if request.url.path not in ("/health", "/health/ready", "/api/v1/sync/health"):
+        if await is_request_rate_limited(client_ip):
             return JSONResponse(status_code=429, content={"detail": "Too many requests"})
     return await call_next(request)
 
@@ -82,3 +82,30 @@ async def db_pool_exhausted_handler(request: Request, exc: Exception) -> JSONRes
 @app.get("/health")
 async def health() -> dict:
     return {"status": "ok", "environment": settings.environment}
+
+
+@app.get("/health/ready")
+async def readiness() -> JSONResponse:
+    """Readiness probe for a load balancer / orchestrator: 200 only when the
+    database answers and (if configured) Redis does. /health stays a cheap
+    liveness check that never touches either."""
+    from sqlalchemy import text
+
+    from app.core.database import engine
+    from app.core.kv import get_kv
+
+    checks: dict[str, str] = {}
+    try:
+        async with engine.connect() as conn:
+            await conn.execute(text("select 1"))
+        checks["database"] = "ok"
+    except Exception as exc:  # noqa: BLE001
+        checks["database"] = f"error: {type(exc).__name__}"
+    kv = get_kv()
+    try:
+        primary = getattr(kv, "primary", kv)
+        checks[f"kv:{kv.name}"] = "ok" if await primary.ping() else "error"
+    except Exception as exc:  # noqa: BLE001
+        checks[f"kv:{kv.name}"] = f"error: {type(exc).__name__}"
+    ready = all(v == "ok" for v in checks.values())
+    return JSONResponse(status_code=200 if ready else 503, content={"ready": ready, "checks": checks})

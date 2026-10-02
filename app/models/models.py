@@ -102,6 +102,8 @@ class Role(Base):
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, server_default=text("true"))
     is_system: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
     scope_level: Mapped[str] = mapped_column(String, default="assigned", server_default="assigned")
+    # Holders must enrol TOTP before they can use the API (deps.get_current_user).
+    mfa_required: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
     created_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
@@ -142,6 +144,9 @@ class User(Base):
     # Point 14: full-authority override independent of role. Only an existing
     # Super Admin can set it (rbac.py); the `super_admin` role code implies it.
     is_super_admin: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
+    # Set for accounts still on a known seed/default password, or after an
+    # admin reset; every endpoint except change-password refuses until cleared.
+    must_change_password: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 

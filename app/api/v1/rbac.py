@@ -15,6 +15,7 @@ from sqlalchemy import delete, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser, get_current_user, require_permission, require_super_admin
+from app.core.config import settings
 from app.core.database import get_db
 from app.core.permission_catalog import MODULE_LABELS, is_transaction_edit
 from app.models.models import (
@@ -34,6 +35,7 @@ from app.schemas.schemas_rbac import (
     ApprovalRuleIn,
     ApprovalRuleOut,
     EffectiveAccessOut,
+    MfaResetIn,
     MatrixOut,
     MatrixUpdateIn,
     PermissionOut,
@@ -208,6 +210,9 @@ async def _access_out(db: AsyncSession, user: User) -> EffectiveAccessOut:
         store_ids=list(access.store_ids),
         direct_store_ids=direct,
         scopes=[ScopeEntry(scope_type=s.scope_type, scope_id=s.scope_id, scope_value=s.scope_value) for s in scopes],
+        mfa_enabled=bool(user.mfa_enabled),
+        mfa_required=access.mfa_required and settings.mfa_enforcement,
+        must_change_password=bool(user.must_change_password),
     )
 
 
@@ -269,6 +274,7 @@ async def create_role(
         scope_level=payload.scope_level,
         max_discount_percent=payload.max_discount_percent,
         max_discount_value=payload.max_discount_value,
+        mfa_required=payload.mfa_required,
         is_active=True,
         is_system=False,
     )
@@ -299,6 +305,8 @@ async def update_role(
     fields = payload.model_dump(exclude_unset=True, exclude={"reason"})
     if role.code == "super_admin" and fields.get("scope_level", "global") != "global":
         raise HTTPException(status_code=400, detail="Super Admin is always company-wide")
+    if role.code == "super_admin" and fields.get("mfa_required") is False:
+        raise HTTPException(status_code=400, detail="Super Admin always requires MFA")
     if fields.get("scope_level") == "global" and not current.sees_all_stores():
         raise HTTPException(status_code=403, detail="Only an enterprise-wide user can make a role company-wide")
     old = {k: (float(v) if k.startswith("max_") else v) for k, v in ((k, getattr(role, k)) for k in fields)}
@@ -650,6 +658,28 @@ async def set_super_admin(
         db, current, "user.super_admin_granted" if payload.is_super_admin else "user.super_admin_revoked", "user", user.id,
         old={"is_super_admin": old}, new={"is_super_admin": payload.is_super_admin}, reason=payload.reason,
     )
+    await db.commit()
+    rbac.invalidate(user.id)
+    return await _access_out(db, user)
+
+
+@router.post("/users/{user_id}/mfa-reset", response_model=EffectiveAccessOut)
+async def reset_user_mfa(
+    user_id: uuid.UUID,
+    payload: MfaResetIn,
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(require_super_admin),
+) -> EffectiveAccessOut:
+    """Recovery for a lost authenticator: clears the user's TOTP secret so
+    they re-enrol at next sign-in (mandatory again if their role requires it).
+    Super Admin only, always with a reason, always audited."""
+    user = await db.get(User, user_id)
+    if user is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    was_enabled = bool(user.mfa_enabled)
+    user.mfa_enabled = False
+    user.mfa_secret = None
+    await _audit(db, current, "user.mfa_reset", "user", user.id, old={"mfa_enabled": was_enabled}, new={"mfa_enabled": False}, reason=payload.reason)
     await db.commit()
     rbac.invalidate(user.id)
     return await _access_out(db, user)

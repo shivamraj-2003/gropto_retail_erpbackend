@@ -18,4 +18,7 @@ apscheduler==3.11.3
 pytest==8.3.3
 pytest-asyncio==0.24.0
 pyotp==2.10.0
+redis==5.2.1
+celery==5.4.0
+gunicorn==23.0.0; sys_platform != "win32"
 

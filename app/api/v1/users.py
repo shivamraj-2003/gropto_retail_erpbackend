@@ -192,6 +192,8 @@ async def reset_password(
         raise HTTPException(status_code=404, detail="User not found")
     await assert_can_manage_user(db, current, user)
     user.password_hash = hash_password(payload.new_password)
+    # The admin knows this password — the holder must replace it on first use.
+    user.must_change_password = True
     await write_audit(
         db,
         user_id=current.user_id,

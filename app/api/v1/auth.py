@@ -1,6 +1,6 @@
 import secrets
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 import pyotp
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -8,6 +8,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser, get_current_user, require_permission, require_store_access
+from app.core.config import settings
 from app.core.database import get_db
 from app.core.security import (
     create_access_token,
@@ -36,12 +37,11 @@ from app.schemas.schemas import (
     StoreCredentialRow,
     TokenResponse,
 )
-from app.services import email as email_service
+from app.services import otp as otp_service
 from app.services.audit import write_audit
 from app.services.rbac import resolve_access
 from app.services.rate_limit import is_login_locked, record_login_failure, record_login_success
 
-OTP_EXPIRY_MINUTES = 10
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -91,7 +91,7 @@ async def login(payload: LoginRequest, db: AsyncSession = Depends(get_db)) -> Lo
     # cashier at a store. With no fingerprint supplied there is no device
     # dimension to scope by, so the identifier alone is the key.
     lockout_device = payload.device_fingerprint or "no-device"
-    remaining = is_login_locked(identifier, lockout_device)
+    remaining = await is_login_locked(identifier, lockout_device)
     if remaining is not None:
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
@@ -103,9 +103,9 @@ async def login(payload: LoginRequest, db: AsyncSession = Depends(get_db)) -> Lo
     )
     user = (await db.execute(stmt)).scalar_one_or_none()
     if user is None or not user.is_active or not verify_password(payload.password, user.password_hash):
-        record_login_failure(identifier, lockout_device)
+        await record_login_failure(identifier, lockout_device)
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
-    record_login_success(identifier, lockout_device)
+    await record_login_success(identifier, lockout_device)
 
     role = await db.get(Role, user.role_id)
 
@@ -265,6 +265,8 @@ async def mfa_disable(
     current: CurrentUser = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> None:
+    if settings.mfa_enforcement and current.access is not None and current.access.mfa_required:
+        raise HTTPException(status_code=400, detail="MFA is mandatory for your role and cannot be disabled")
     user = await db.get(User, current.user_id)
     user.mfa_enabled = False
     user.mfa_secret = None
@@ -363,7 +365,10 @@ async def change_password(
     user = await db.get(User, current.user_id)
     if user is None or not verify_password(payload.current_password, user.password_hash):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Current password is incorrect")
+    if payload.new_password == payload.current_password:
+        raise HTTPException(status_code=400, detail="New password must differ from the current one")
     user.password_hash = hash_password(payload.new_password)
+    user.must_change_password = False
     # Every other device/session must re-login with the new password.
     await db.execute(
         RefreshToken.__table__.update().where(RefreshToken.user_id == user.id).values(revoked=True)
@@ -381,40 +386,32 @@ async def change_password(
     await db.commit()
 
 
+async def _find_user(db: AsyncSession, email: str | None, phone: str | None) -> User | None:
+    if email:
+        return (await db.execute(select(User).where(func.lower(User.email) == email.strip().lower()))).scalar_one_or_none()
+    if phone:
+        return (await db.execute(select(User).where(User.phone == phone.strip()))).scalar_one_or_none()
+    return None
+
+
 @router.post("/forgot-password", status_code=200)
 async def forgot_password(payload: ForgotPasswordIn, db: AsyncSession = Depends(get_db)) -> dict:
-    """When Resend is configured (RESEND_API_KEY in .env), this emails a
-    6-digit OTP the account holder submits to POST /auth/reset-password-with-otp
-    to set their own new password — fully self-service. Without it, this
-    falls back to flagging the request so an Admin/Super Admin sees it and
-    resets the password directly (POST /users/{id}/reset-password). Always
-    returns the same generic message regardless of whether the email exists,
-    so this can't be used to enumerate accounts."""
-    stmt = select(User).where(User.email == payload.email)
-    user = (await db.execute(stmt)).scalar_one_or_none()
+    """Sends a 6-digit code by email, SMS or WhatsApp (`channel`, default the
+    first one configured for the account) that the holder submits to
+    POST /auth/reset-password-with-otp. Calling it again is the resend: a
+    cooldown and an hourly cap apply per identifier (services/otp.py). When no
+    channel is configured, the request is flagged for an Admin/Super Admin to
+    reset directly. The response never reveals whether the account exists."""
+    identifier = payload.email or payload.phone
+    if not identifier:
+        raise HTTPException(status_code=400, detail="Provide email or phone")
+    await otp_service.throttle(identifier, "password_reset")
 
-    if user is not None and email_service.is_configured():
-        # Invalidate any still-live OTPs from an earlier request so only the
-        # newest code works.
-        await db.execute(
-            PasswordResetOtp.__table__.update()
-            .where(PasswordResetOtp.user_id == user.id, PasswordResetOtp.used.is_(False))
-            .values(used=True)
-        )
-        code = f"{secrets.randbelow(1_000_000):06d}"
-        db.add(
-            PasswordResetOtp(
-                user_id=user.id,
-                code_hash=hash_password(code),
-                expires_at=datetime.now(timezone.utc) + timedelta(minutes=OTP_EXPIRY_MINUTES),
-            )
-        )
-        await email_service.send_email(
-            payload.email,
-            "Your Gropto ERP password reset code",
-            f"<p>Your verification code is <strong>{code}</strong>. It expires in {OTP_EXPIRY_MINUTES} minutes.</p>"
-            "<p>If you didn't request this, you can ignore this email.</p>",
-        )
+    user = await _find_user(db, payload.email, payload.phone)
+    generic = {"message": "If that account exists, a verification code has been sent to it.", "otp_sent": True}
+
+    if user is not None and user.is_active and otp_service.available_channels(user):
+        channel, destination = await otp_service.issue_password_reset_otp(db, user, payload.channel)
         await write_audit(
             db,
             user_id=user.id,
@@ -424,9 +421,10 @@ async def forgot_password(payload: ForgotPasswordIn, db: AsyncSession = Depends(
             action="auth.forgot_password_otp_sent",
             entity_type="user",
             entity_id=user.id,
+            new_value={"channel": channel},
         )
         await db.commit()
-        return {"message": "If that account exists, a verification code has been emailed to it.", "otp_sent": True}
+        return {**generic, "channel": channel, "destination": destination}
 
     if user is not None:
         await write_audit(
@@ -440,25 +438,49 @@ async def forgot_password(payload: ForgotPasswordIn, db: AsyncSession = Depends(
             entity_id=user.id,
         )
         await db.commit()
+        return {
+            "message": "If that account exists, your store's Admin or Super Admin has been notified to reset your password.",
+            "otp_sent": False,
+        }
+    # Unknown account: same shape as a real send, so it can't be probed.
+    return generic
+
+
+@router.post("/otp/resend", status_code=200)
+async def resend_otp(payload: ForgotPasswordIn, db: AsyncSession = Depends(get_db)) -> dict:
+    """Explicit resend (optionally on a different channel); same throttle."""
+    return await forgot_password(payload, db)
+
+
+@router.get("/otp/channels")
+async def otp_channels() -> dict:
+    """Which delivery channels this server has configured (no account data),
+    so the login screen only offers what can actually be sent."""
+    from app.services import email as _email, sms as _sms, whatsapp as _wa
+
     return {
-        "message": "If that account exists, your store's Admin or Super Admin has been notified to reset your password.",
-        "otp_sent": False,
+        "email": _email.is_configured(),
+        "sms": _sms.otp_sms_configured(),
+        "whatsapp": _wa.is_configured() and bool(settings.whatsapp_otp_template),
+        "resend_cooldown_seconds": settings.otp_resend_cooldown_seconds,
     }
 
 
 @router.post("/reset-password-with-otp", status_code=204)
 async def reset_password_with_otp(payload: ResetPasswordWithOtpIn, db: AsyncSession = Depends(get_db)) -> None:
-    remaining = is_login_locked(payload.email, "otp-reset")
+    identifier = (payload.email or payload.phone or "").strip().lower()
+    if not identifier:
+        raise HTTPException(status_code=400, detail="Provide email or phone")
+    remaining = await is_login_locked(identifier, "otp-reset")
     if remaining is not None:
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail=f"Too many attempts. Try again in {int(remaining // 60) + 1} minute(s).",
         )
 
-    stmt = select(User).where(User.email == payload.email)
-    user = (await db.execute(stmt)).scalar_one_or_none()
+    user = await _find_user(db, payload.email, payload.phone)
     if user is None:
-        record_login_failure(payload.email, "otp-reset")
+        await record_login_failure(identifier, "otp-reset")
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid or expired code")
 
     otp_stmt = select(PasswordResetOtp).where(
@@ -469,12 +491,13 @@ async def reset_password_with_otp(payload: ResetPasswordWithOtpIn, db: AsyncSess
     candidates = (await db.execute(otp_stmt)).scalars().all()
     match = next((c for c in candidates if verify_password(payload.otp, c.code_hash)), None)
     if match is None:
-        record_login_failure(payload.email, "otp-reset")
+        await record_login_failure(identifier, "otp-reset")
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid or expired code")
 
-    record_login_success(payload.email, "otp-reset")
+    await record_login_success(identifier, "otp-reset")
     match.used = True
     user.password_hash = hash_password(payload.new_password)
+    user.must_change_password = False
     await db.execute(
         RefreshToken.__table__.update().where(RefreshToken.user_id == user.id).values(revoked=True)
     )

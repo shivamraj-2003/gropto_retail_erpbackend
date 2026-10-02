@@ -19,6 +19,9 @@ class EffectiveAccessOut(BaseModel):
     store_ids: list[uuid.UUID]
     direct_store_ids: list[uuid.UUID] = []
     scopes: list["ScopeEntry"] = []
+    mfa_enabled: bool = False
+    mfa_required: bool = False
+    must_change_password: bool = False
 
 
 class PermissionOut(BaseModel):
@@ -42,6 +45,7 @@ class RoleOut(BaseModel):
     scope_level: str
     max_discount_percent: float
     max_discount_value: float
+    mfa_required: bool = False
     user_count: int = 0
     permission_count: int = 0
 
@@ -53,6 +57,7 @@ class RoleCreateIn(BaseModel):
     scope_level: str = Field(default="assigned", pattern="^(global|assigned)$")
     max_discount_percent: float = Field(default=0, ge=0, le=100)
     max_discount_value: float = Field(default=0, ge=0)
+    mfa_required: bool = False
     permission_codes: list[str] = []
     clone_from_role_id: uuid.UUID | None = None
     reason: str | None = None
@@ -64,6 +69,7 @@ class RoleUpdateIn(BaseModel):
     scope_level: str | None = Field(default=None, pattern="^(global|assigned)$")
     max_discount_percent: float | None = Field(default=None, ge=0, le=100)
     max_discount_value: float | None = Field(default=None, ge=0)
+    mfa_required: bool | None = None
     reason: str | None = None
 
 
@@ -118,6 +124,10 @@ class UserScopesIn(BaseModel):
     store_ids: list[uuid.UUID] = []
     scopes: list[ScopeEntry] = []
     reason: str | None = None
+
+
+class MfaResetIn(BaseModel):
+    reason: str = Field(min_length=3)
 
 
 class SuperAdminIn(BaseModel):

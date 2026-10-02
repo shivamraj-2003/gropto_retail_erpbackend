@@ -1,9 +1,10 @@
 import uuid
 
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.core.database import get_db
 from app.core.permission_catalog import GLOBAL_SCOPE_ROLES
 from app.core.security import decode_token
@@ -62,7 +63,20 @@ class CurrentUser:
         return warehouse_id in self.access.warehouse_ids
 
 
+# Reachable while a password change or MFA enrolment is still outstanding —
+# exactly what's needed to complete it (and to sign out).
+_ONBOARDING_PATHS = frozenset({
+    "/api/v1/auth/me",
+    "/api/v1/auth/change-password",
+    "/api/v1/auth/logout",
+    "/api/v1/auth/mfa/setup",
+    "/api/v1/auth/mfa/verify-setup",
+    "/api/v1/rbac/me",
+})
+
+
 async def get_current_user(
+    request: Request,
     token: str = Depends(oauth2_scheme),
     db: AsyncSession = Depends(get_db),
 ) -> CurrentUser:
@@ -105,6 +119,15 @@ async def get_current_user(
     # — so a role change, permission removal or scope change applies on the
     # next request instead of lingering until the token expires.
     access = await resolve_access(db, user)
+
+    # Point 19 hardening: an account on a default/reset password, or a
+    # privileged account without MFA, can do nothing but fix that.
+    if request.url.path not in _ONBOARDING_PATHS:
+        if user.must_change_password:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="PASSWORD_CHANGE_REQUIRED")
+        if settings.mfa_enforcement and access.mfa_required and not user.mfa_enabled:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="MFA_SETUP_REQUIRED")
+
     return CurrentUser(
         user_id=user_id,
         role_code=access.role_code,

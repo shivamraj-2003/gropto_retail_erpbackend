@@ -9,7 +9,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser, require_permission
-from app.core.database import get_db
+from app.core.database import get_reporting_db
 from app.models.models import AuditLog, InventoryBalance, LoyaltyLedger, Product, Sale
 from app.schemas.schemas import Page
 from app.services import crm as crm_service
@@ -34,7 +34,7 @@ def _workbook_response(wb: Workbook, filename: str) -> StreamingResponse:
 @router.get("/sales-register")
 async def sales_register(
     store_id: uuid.UUID | None = None,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_reporting_db),
     current: CurrentUser = Depends(require_permission("reports.sales.export")),
 ) -> StreamingResponse:
     """Always scoped to the caller's stores — an Admin exporting 'all sales' gets
@@ -101,7 +101,7 @@ async def sales_register(
 @router.get("/inventory-snapshot")
 async def inventory_snapshot(
     store_id: uuid.UUID | None = None,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_reporting_db),
     current: CurrentUser = Depends(require_permission("reports.inventory.export")),
 ) -> StreamingResponse:
     stmt = select(InventoryBalance, Product).join(Product, Product.id == InventoryBalance.product_id)
@@ -140,7 +140,7 @@ async def inventory_snapshot(
 
 @router.get("/loyalty")
 async def loyalty_report(
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_reporting_db),
     current: CurrentUser = Depends(require_permission("reports.customer.export")),
 ) -> StreamingResponse:
     rows = list((await db.execute(select(LoyaltyLedger))).scalars().all())
@@ -171,7 +171,7 @@ async def loyalty_report(
 
 @router.get("/approvals-audit")
 async def approvals_audit_report(
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_reporting_db),
     current: CurrentUser = Depends(require_permission("reports.operations.export")),
 ) -> StreamingResponse:
     rows = list((await db.execute(select(AuditLog).order_by(AuditLog.created_at.desc()).limit(5000))).scalars().all())
@@ -186,7 +186,7 @@ async def approvals_audit_report(
 
 @router.get("/purchase-trend")
 async def purchase_trend_report(
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_reporting_db),
     current: CurrentUser = Depends(require_permission("reports.purchase.export")),
 ) -> StreamingResponse:
     rows = (
@@ -232,7 +232,7 @@ async def purchase_trend_report(
 
 @router.get("/warehouse-discrepancies")
 async def warehouse_report(
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_reporting_db),
     current: CurrentUser = Depends(require_permission("reports.inventory.export")),
 ) -> StreamingResponse:
     rows = (
@@ -268,7 +268,7 @@ async def warehouse_report(
 
 @router.get("/finance-pnl")
 async def finance_pnl_report(
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_reporting_db),
     current: CurrentUser = Depends(require_permission("reports.finance.export")),
 ) -> StreamingResponse:
     store_rows = (await db.execute(text("select id, name from stores where is_active = true"))).all()
@@ -289,7 +289,7 @@ async def finance_pnl_report(
 
 @router.get("/customer-rfm")
 async def customer_rfm_report(
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_reporting_db),
     current: CurrentUser = Depends(require_permission("reports.customer.export")),
 ) -> StreamingResponse:
     rows = await crm_service.rfm_segments(db)
@@ -304,7 +304,7 @@ async def customer_rfm_report(
 
 @router.get("/operations-scorecard")
 async def operations_scorecard_report(
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_reporting_db),
     current: CurrentUser = Depends(require_permission("reports.operations.export")),
 ) -> StreamingResponse:
     rows = (
@@ -346,7 +346,7 @@ async def operations_scorecard_report(
 async def sales_hourly_report(
     business_date: date | None = None,
     store_id: uuid.UUID | None = None,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_reporting_db),
     current: CurrentUser = Depends(require_permission("reports.sales.export")),
 ) -> StreamingResponse:
     """Point 18 audit fix: only daily/MTD/YTD sales buckets existed anywhere
@@ -398,7 +398,7 @@ async def stock_ledger_report(
     store_id: uuid.UUID | None = None,
     date_from: date | None = None,
     date_to: date | None = None,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_reporting_db),
     current: CurrentUser = Depends(require_permission("reports.inventory.export")),
 ) -> StreamingResponse:
     """Point 18 audit fix: inventory_movements (written to by every single
@@ -453,7 +453,7 @@ async def stock_ledger_report(
 
 @router.get("/transfer-ageing")
 async def transfer_ageing_report(
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_reporting_db),
     current: CurrentUser = Depends(require_permission("reports.inventory.export")),
 ) -> StreamingResponse:
     """Point 18 audit fix: transfers.dispatched_at has existed since Point 5
@@ -494,7 +494,7 @@ async def transfer_ageing_report(
 @router.get("/margin-bridge")
 async def margin_bridge_report(
     store_id: uuid.UUID | None = None,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_reporting_db),
     current: CurrentUser = Depends(require_permission("reports.sales.export")),
 ) -> StreamingResponse:
     """Point 18 audit fix: no margin bridge/waterfall (price/volume/cost
@@ -568,7 +568,7 @@ async def margin_bridge_report(
 async def audit_checklist_report(
     date_from: date | None = None,
     date_to: date | None = None,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_reporting_db),
     current: CurrentUser = Depends(require_permission("reports.operations.export")),
 ) -> StreamingResponse:
     """Point 18 audit fix: a literal operational/compliance checklist report
@@ -626,7 +626,7 @@ SLA_DISPATCH_MINUTES = 120  # same threshold dashboard.py/orders.py each indepen
 @router.get("/sla-summary")
 async def sla_summary_report(
     store_id: uuid.UUID | None = None,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_reporting_db),
     current: CurrentUser = Depends(require_permission("reports.insight.view")),
 ) -> dict:
     """Point 18 audit fix: no single, unified, filterable SLA report existed
@@ -703,7 +703,7 @@ async def exception_log_report(
     exception_type: str | None = None,
     limit: int = 20,
     offset: int = 0,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_reporting_db),
     current: CurrentUser = Depends(require_permission("reports.insight.view")),
 ) -> Page[dict]:
     """Point 18 audit fix: no single, unified, filterable, exportable
@@ -772,7 +772,7 @@ async def channel_split_report(
     store_id: uuid.UUID | None = None,
     date_from: date | None = None,
     date_to: date | None = None,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_reporting_db),
     current: CurrentUser = Depends(require_permission("reports.insight.view")),
 ) -> dict:
     """Point 18 audit fix: channel split previously existed only as a
@@ -831,7 +831,7 @@ async def channel_split_report(
 @router.get("/customer-activity")
 async def customer_activity_report(
     store_id: uuid.UUID | None = None,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_reporting_db),
     current: CurrentUser = Depends(require_permission("reports.insight.view")),
 ) -> dict:
     """Point 18 audit fix: "New/repeat" and "Frequency" previously existed
@@ -875,7 +875,7 @@ async def customer_activity_report(
 
 @router.get("/operations-scorecard-live")
 async def operations_scorecard_live(
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_reporting_db),
     current: CurrentUser = Depends(require_permission("reports.insight.view")),
 ) -> list[dict]:
     """JSON twin of /operations-scorecard (which only ever existed as an

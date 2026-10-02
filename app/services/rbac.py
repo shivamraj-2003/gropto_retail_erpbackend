@@ -4,12 +4,14 @@ permission change takes effect without waiting for the user's access token to
 expire. The JWT's `role`/`stores` claims are no longer trusted for
 authorization; only its `sub` is.
 
-The cache is in-process, like the rest of this deployment's single-process
-state (rate_limit.py, scheduler.py): RBAC writes in this process clear it
-immediately, and CACHE_TTL_SECONDS bounds staleness if a second API process
-is ever added.
+The cache is per process. A write clears this process's copy immediately
+and bumps a shared version number in Redis (app/core/kv.py); every other
+process checks that version at most every VERSION_CHECK_SECONDS and drops its
+copy when it moved. Without Redis, CACHE_TTL_SECONDS bounds staleness.
 """
 
+import asyncio
+import logging
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -20,6 +22,7 @@ from fastapi import HTTPException, status
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.kv import get_kv, is_shared, key
 from app.models.models import Permission, Role, RolePermission, Store, User, UserRole, UserScope, UserStore
 from app.models.models_phase4 import Cluster
 
@@ -27,6 +30,9 @@ if TYPE_CHECKING:
     from app.api.deps import CurrentUser
 
 CACHE_TTL_SECONDS = 15.0
+VERSION_CHECK_SECONDS = 2.0
+_VERSION_KEY = "rbac_version"
+logger = logging.getLogger("gropto.rbac")
 
 SCOPE_TYPES = ("company", "region", "cluster", "city", "warehouse", "department")
 
@@ -43,22 +49,55 @@ class Access:
     department_ids: tuple[uuid.UUID, ...] = field(default_factory=tuple)
     company_ids: tuple[uuid.UUID, ...] = field(default_factory=tuple)
     role_active: bool = True
+    mfa_required: bool = False
 
 
 _cache: dict[uuid.UUID, tuple[float, Access]] = {}
+_seen_version: str | None = None
+_version_checked_at = 0.0
+_pending_bumps: set[asyncio.Task] = set()
+
+
+async def _bump_shared_version() -> None:
+    global _seen_version
+    try:
+        _seen_version = str(await get_kv().incr(key(_VERSION_KEY), 30 * 24 * 3600))
+    except Exception as exc:  # noqa: BLE001 — never fail the write that triggered it
+        logger.error("Could not publish RBAC cache invalidation: %s", exc)
 
 
 def invalidate(user_id: uuid.UUID | None = None) -> None:
     """Drop cached access — for one user, or everyone (role/permission edits
-    affect every holder of the role)."""
+    affect every holder of the role) — here and, via Redis, in every other
+    API process. A per-user drop is published as a full drop elsewhere."""
     if user_id is None:
         _cache.clear()
     else:
         _cache.pop(user_id, None)
+    if is_shared():
+        try:
+            task = asyncio.get_running_loop().create_task(_bump_shared_version())
+            _pending_bumps.add(task)
+            task.add_done_callback(_pending_bumps.discard)
+        except RuntimeError:
+            pass  # no running loop (scripts/tests): nothing else to notify
+
+
+async def _sync_shared_version(now: float) -> None:
+    global _seen_version, _version_checked_at
+    if not is_shared() or now - _version_checked_at < VERSION_CHECK_SECONDS:
+        return
+    _version_checked_at = now
+    current = await get_kv().get(key(_VERSION_KEY))
+    if current != _seen_version:
+        if _seen_version is not None:
+            _cache.clear()
+        _seen_version = current
 
 
 async def resolve_access(db: AsyncSession, user: User) -> Access:
     now = time.monotonic()
+    await _sync_shared_version(now)
     hit = _cache.get(user.id)
     if hit is not None and hit[0] > now:
         return hit[1]
@@ -132,6 +171,7 @@ async def _load(db: AsyncSession, user: User) -> Access:
         department_ids=tuple(s.scope_id for s in by_type["department"] if s.scope_id),
         company_ids=company_ids,
         role_active=primary is not None and primary.is_active,
+        mfa_required=is_super or any(r.mfa_required for r in active_roles),
     )
 
 
