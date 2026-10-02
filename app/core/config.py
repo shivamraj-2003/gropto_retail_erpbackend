@@ -14,6 +14,13 @@ class Settings(BaseSettings):
     ai_provider_api_key: str = ""
     ai_provider_base_url: str = ""
     ai_daily_call_cap: int = 200
+    # ERP assistant (/ai/chat). AI_PROVIDER_BASE_URL is the full endpoint, e.g.
+    # https://api.openai.com/v1/chat/completions or https://api.anthropic.com/v1/messages.
+    # AI_PROVIDER_KIND: "openai" (any OpenAI-compatible API) or "anthropic".
+    ai_provider_kind: str = "openai"
+    ai_model: str = ""
+    ai_max_tokens: int = 600
+    ai_timeout_seconds: int = 30
 
     # Razorpay — left blank in dev; when unset the payments API reports the
     # gateway as unconfigured and the POS falls back to quick-tender buttons.
