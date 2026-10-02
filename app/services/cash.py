@@ -37,11 +37,19 @@ def _assert_owns_shift(current: CurrentUser, shift: CashierShift) -> None:
 
 
 async def open_shift(db: AsyncSession, *, current: CurrentUser, payload: ShiftOpen) -> CashierShift:
+    if payload.opening_denominations is not None:
+        denom_total = sum(int(note) * count for note, count in payload.opening_denominations.items())
+        if abs(denom_total - payload.opening_float) > 0.01:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Opening count sums to {denom_total}, which does not match opening_float {payload.opening_float}",
+            )
     shift = CashierShift(
         store_id=payload.store_id,
         device_id=payload.device_id,
         cashier_id=current.user_id,
         opening_float=payload.opening_float,
+        opening_denominations=payload.opening_denominations,
         status="open",
     )
     db.add(shift)
@@ -55,7 +63,7 @@ async def open_shift(db: AsyncSession, *, current: CurrentUser, payload: ShiftOp
         action="shift.opened",
         entity_type="cashier_shift",
         entity_id=shift.id,
-        new_value={"opening_float": payload.opening_float},
+        new_value={"opening_float": payload.opening_float, "opening_denominations": payload.opening_denominations},
     )
     return shift
 
@@ -95,7 +103,8 @@ async def record_cash_movement(
     return movement
 
 
-async def _expected_cash(db: AsyncSession, shift: CashierShift) -> float:
+async def cash_summary(db: AsyncSession, shift: CashierShift) -> dict:
+    """What should be in the drawer, and why: opening + cash sales + cash in - cash out."""
     cash_sales = (
         await db.execute(
             select(Payment.amount)
@@ -104,8 +113,20 @@ async def _expected_cash(db: AsyncSession, shift: CashierShift) -> float:
         )
     ).scalars().all()
     movements = (await db.execute(select(CashMovement).where(CashMovement.shift_id == shift.id))).scalars().all()
-    movement_total = sum(m.amount if m.direction == "in" else -m.amount for m in movements)
-    return float(shift.opening_float) + float(sum(cash_sales)) + movement_total
+    cash_in = float(sum(m.amount for m in movements if m.direction == "in"))
+    cash_out = float(sum(m.amount for m in movements if m.direction != "in"))
+    sales = float(sum(cash_sales))
+    return {
+        "opening_cash": float(shift.opening_float),
+        "cash_sales": sales,
+        "cash_in": cash_in,
+        "cash_out": cash_out,
+        "expected_cash": float(shift.opening_float) + sales + cash_in - cash_out,
+    }
+
+
+async def _expected_cash(db: AsyncSession, shift: CashierShift) -> float:
+    return (await cash_summary(db, shift))["expected_cash"]
 
 
 async def _tender_breakdown(db: AsyncSession, *, device_id, since: datetime) -> dict:

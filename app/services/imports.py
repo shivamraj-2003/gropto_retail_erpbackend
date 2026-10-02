@@ -8,6 +8,7 @@ delta; opening stock only imports into an empty balance.
 """
 
 import uuid
+from datetime import date, datetime
 
 import openpyxl
 from sqlalchemy import select
@@ -16,12 +17,32 @@ from sqlalchemy.orm import selectinload
 
 from app.api.deps import CurrentUser
 from app.models.models import ImportBatch, ImportStagingRow, InventoryBalance, Product
+from app.models.models_phase4 import InventoryBatch
 from app.services.approvals import submit_or_apply
 from app.services.audit import write_audit
 from app.services.inventory import apply_movement
 
 PRODUCT_COLUMNS = ["sku", "name", "barcode", "uom", "purchase_price", "selling_price", "mrp", "tax_rate", "hsn_code"]
-OPENING_STOCK_COLUMNS = ["sku", "store_code", "quantity"]
+# batch_number, mfg_date and expiry_date are optional; when any is given the
+# opening quantity is also recorded as an inventory batch so expiry tracking works.
+OPENING_STOCK_COLUMNS = ["sku", "store_code", "quantity", "batch_number", "mfg_date", "expiry_date"]
+
+
+def _parse_date(raw) -> date | None:
+    """Excel gives real dates; typed cells arrive as text — accept ISO and DD-MM-YYYY / DD/MM/YYYY."""
+    if raw is None or str(raw).strip() == "":
+        return None
+    if isinstance(raw, datetime):
+        return raw.date()
+    if isinstance(raw, date):
+        return raw
+    text_value = str(raw).strip()
+    for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y"):
+        try:
+            return datetime.strptime(text_value, fmt).date()
+        except ValueError:
+            continue
+    raise ValueError(text_value)
 
 
 async def get_batch_with_rows(db: AsyncSession, batch_id: uuid.UUID) -> ImportBatch | None:
@@ -181,11 +202,37 @@ async def stage_opening_stock_file(db: AsyncSession, *, file_bytes: bytes, filen
             messages.append("quantity is not numeric")
             quantity = 0
 
+        batch_number = str(values.get("batch_number") or "").strip() or None
+        mfg_date = expiry_date = None
+        for field in ("mfg_date", "expiry_date"):
+            try:
+                parsed = _parse_date(values.get(field))
+            except ValueError as exc:
+                messages.append(f"{field} '{exc}' is not a valid date (use YYYY-MM-DD or DD-MM-YYYY)")
+                continue
+            if field == "mfg_date":
+                mfg_date = parsed
+            else:
+                expiry_date = parsed
+        if mfg_date and expiry_date and expiry_date <= mfg_date:
+            messages.append("expiry_date must be after mfg_date")
+        if mfg_date and mfg_date > date.today():
+            messages.append("mfg_date is in the future")
+        if expiry_date and expiry_date < date.today():
+            messages.append("Product is already expired (expiry_date is in the past)")
+
         db.add(
             ImportStagingRow(
                 batch_id=batch.id,
                 line_number=i,
-                parsed_values={"sku": sku, "product_id": str(product.id) if product else None, "quantity": quantity},
+                parsed_values={
+                    "sku": sku,
+                    "product_id": str(product.id) if product else None,
+                    "quantity": quantity,
+                    "batch_number": batch_number,
+                    "mfg_date": mfg_date.isoformat() if mfg_date else None,
+                    "expiry_date": expiry_date.isoformat() if expiry_date else None,
+                },
                 computed_action="create" if not messages else "error",
                 validation_messages=messages,
             )
@@ -200,6 +247,7 @@ async def commit_opening_stock_batch(db: AsyncSession, batch_id: uuid.UUID, curr
         raise ValueError("Batch not found or already applied")
 
     applied = 0
+    batches_created = 0
     for row in batch.rows:
         if row.computed_action != "create" or row.validation_messages:
             continue
@@ -215,6 +263,20 @@ async def commit_opening_stock_batch(db: AsyncSession, batch_id: uuid.UUID, curr
             created_by=current.user_id,
             device_id=None,
         )
+        if v.get("expiry_date") or v.get("mfg_date") or v.get("batch_number"):
+            product = await db.get(Product, uuid.UUID(v["product_id"]))
+            db.add(
+                InventoryBatch(
+                    product_id=product.id,
+                    store_id=batch.store_id,
+                    batch_number=v.get("batch_number") or "OPENING",
+                    mfg_date=date.fromisoformat(v["mfg_date"]) if v.get("mfg_date") else None,
+                    expiry_date=date.fromisoformat(v["expiry_date"]) if v.get("expiry_date") else None,
+                    quantity=v["quantity"],
+                    purchase_cost=product.purchase_price or 0,
+                )
+            )
+            batches_created += 1
         applied += 1
 
     batch.status = "applied"
@@ -227,10 +289,10 @@ async def commit_opening_stock_batch(db: AsyncSession, batch_id: uuid.UUID, curr
         action="import.committed",
         entity_type="import_batch",
         entity_id=batch.id,
-        new_value={"rows_applied": applied},
+        new_value={"rows_applied": applied, "expiry_batches_created": batches_created},
     )
     await db.commit()
-    return {"rows_applied": applied}
+    return {"rows_applied": applied, "expiry_batches_created": batches_created}
 
 
 def io_bytes(data: bytes):

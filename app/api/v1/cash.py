@@ -27,7 +27,15 @@ async def current_shift(
     shift = result.scalar_one_or_none()
     if shift is None:
         return None
-    return {"shift_id": str(shift.id), "opening_float": float(shift.opening_float), "opened_at": shift.opened_at.isoformat()}
+    return {
+        "shift_id": str(shift.id),
+        "opening_float": float(shift.opening_float),
+        "opened_at": shift.opened_at.isoformat(),
+        "opening_denominations": shift.opening_denominations,
+        # opening_cash, cash_sales, cash_in, cash_out, expected_cash — worked
+        # out live so the screen never asks the cashier to add anything up.
+        **await cash_service.cash_summary(db, shift),
+    }
 
 
 @router.post("/shifts/open")

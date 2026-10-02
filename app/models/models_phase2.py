@@ -225,6 +225,8 @@ class CashierShift(Base):
     device_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("devices.id"), nullable=False)
     cashier_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
     opening_float: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False)
+    # {"500": 4, "100": 8, ...} — the note/coin count the shift was opened with.
+    opening_denominations: Mapped[dict | None] = mapped_column(JSONB)
     expected_cash: Mapped[float | None] = mapped_column(Numeric(12, 2))
     counted_cash: Mapped[float | None] = mapped_column(Numeric(12, 2))
     variance: Mapped[float | None] = mapped_column(Numeric(12, 2))

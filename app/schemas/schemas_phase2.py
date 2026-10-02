@@ -171,6 +171,9 @@ class ShiftOpen(BaseModel):
     store_id: uuid.UUID
     device_id: uuid.UUID
     opening_float: float
+    # Optional {"500": 4, "100": 8, ...} note/coin count behind the opening
+    # float; when supplied its sum must equal opening_float.
+    opening_denominations: dict[str, int] | None = None
 
 
 class CashMovementIn(BaseModel):
