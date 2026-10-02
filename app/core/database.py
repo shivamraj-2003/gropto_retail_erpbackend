@@ -15,6 +15,18 @@ from app.core.config import settings
 engine = create_async_engine(settings.database_url, pool_pre_ping=True, pool_size=5, max_overflow=5)
 SessionLocal = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
 
+# Point 19: reports, dashboards and snapshot-refresh jobs get their own small
+# pool, so a burst of heavy analytical queries queues behind itself instead of
+# taking the connections POS billing and sync need. Sized so both pools
+# together (5+5 + 2+1 = 13) stay under the pooler's 15-connection cap.
+reporting_engine = create_async_engine(
+    settings.database_url,
+    pool_pre_ping=True,
+    pool_size=settings.reporting_pool_size,
+    max_overflow=settings.reporting_max_overflow,
+)
+ReportingSessionLocal = async_sessionmaker(reporting_engine, expire_on_commit=False, class_=AsyncSession)
+
 
 class Base(DeclarativeBase):
     pass
@@ -22,4 +34,9 @@ class Base(DeclarativeBase):
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
     async with SessionLocal() as session:
+        yield session
+
+
+async def get_reporting_db() -> AsyncGenerator[AsyncSession, None]:
+    async with ReportingSessionLocal() as session:
         yield session

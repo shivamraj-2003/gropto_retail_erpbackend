@@ -18,7 +18,7 @@ router = APIRouter(prefix="/imports", tags=["imports"])
 async def stage_products(
     file: UploadFile,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("import.commit")),
+    current: CurrentUser = Depends(require_permission("import.product.import")),
 ) -> dict:
     content = await file.read()
     batch = await import_service.stage_products_file(db, file_bytes=content, filename=file.filename, uploaded_by=current.user_id)
@@ -29,7 +29,7 @@ async def stage_products(
 async def preview(
     batch_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    _current: CurrentUser = Depends(require_permission("import.commit")),
+    _current: CurrentUser = Depends(require_permission("import.batch.view")),
 ) -> dict:
     return await import_service.preview_batch(db, batch_id)
 
@@ -38,7 +38,7 @@ async def preview(
 async def commit_products(
     batch_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("import.commit")),
+    current: CurrentUser = Depends(require_permission("import.product.import")),
 ) -> dict:
     try:
         return await import_service.commit_products_batch(db, batch_id, current)
@@ -51,7 +51,7 @@ async def stage_opening_stock(
     store_id: uuid.UUID,
     file: UploadFile,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("import.commit")),
+    current: CurrentUser = Depends(require_permission("import.opening_stock.import")),
 ) -> dict:
     require_store_access(store_id, current)
     content = await file.read()
@@ -65,7 +65,7 @@ async def stage_opening_stock(
 async def commit_opening_stock(
     batch_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("import.commit")),
+    current: CurrentUser = Depends(require_permission("import.opening_stock.import")),
 ) -> dict:
     try:
         return await import_service.commit_opening_stock_batch(db, batch_id, current)
@@ -77,7 +77,7 @@ async def commit_opening_stock(
 async def download_original_file(
     batch_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    _current: CurrentUser = Depends(require_permission("import.commit")),
+    _current: CurrentUser = Depends(require_permission("import.batch.view")),
 ) -> StreamingResponse:
     """Every batch keeps its uploaded file (§10) — this is how you get it back."""
     batch = await db.get(ImportBatch, batch_id)
@@ -94,7 +94,7 @@ async def download_original_file(
 async def download_result_report(
     batch_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    _current: CurrentUser = Depends(require_permission("import.commit")),
+    _current: CurrentUser = Depends(require_permission("import.batch.view")),
 ) -> StreamingResponse:
     """A downloadable result report showing exactly what was applied, skipped and
     rejected, with row numbers (§10)."""

@@ -1,10 +1,10 @@
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import CurrentUser, require_permission, require_store_access
+from app.api.deps import CurrentUser, get_current_user, require_permission, require_store_access
 from app.core.database import get_db
 from app.models.models import Device
 from app.models.models_phase3 import DeviceConfig
@@ -16,7 +16,7 @@ router = APIRouter(prefix="/enterprise", tags=["enterprise"])
 async def store_sku_drilldown(
     store_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("report.export")),
+    current: CurrentUser = Depends(require_permission("dashboard.drilldown.view")),
 ) -> list[dict]:
     """Company -> store -> SKU drill-down: revenue and margin by product for one
     store, the level below the per-store dashboard in app/api/v1/dashboard.py."""
@@ -48,7 +48,7 @@ async def store_sku_drilldown(
 @router.get("/fleet-health")
 async def fleet_health(
     db: AsyncSession = Depends(get_db),
-    _current: CurrentUser = Depends(require_permission("device.manage")),
+    _current: CurrentUser = Depends(require_permission("device.health.view")),
 ) -> list[dict]:
     """Device health and fleet monitoring: status, last sync, and how many bills
     are still sitting in the failed queue for each device."""
@@ -82,7 +82,7 @@ async def fleet_health(
 @router.get("/exceptions")
 async def exception_feed(
     db: AsyncSession = Depends(get_db),
-    _current: CurrentUser = Depends(require_permission("report.export")),
+    _current: CurrentUser = Depends(require_permission("dashboard.exception.view")),
 ) -> dict:
     """The CEO command-center exception feed: what's wrong right now, not a wall
     of reports — pending approvals, open fraud alerts, unresolved sync failures."""
@@ -107,16 +107,36 @@ async def exception_feed(
     }
 
 
+@router.get("/devices/self/config")
+async def get_own_device_config(
+    current: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """The till's own config, keyed by the device bound to the caller's token —
+    any signed-in user on a registered device may read it (the cashier on the
+    till is who the sync worker runs as), but only for that device. Point 19
+    fix: config pushes previously landed in device_config and nothing on the
+    device ever read them."""
+    if current.device_id is None:
+        raise HTTPException(status_code=404, detail="This session is not bound to a device")
+    row = await db.get(DeviceConfig, current.device_id)
+    return {
+        "device_id": str(current.device_id),
+        "config": row.config if row else {},
+        "updated_at": row.updated_at.isoformat() if row and row.updated_at else None,
+    }
+
+
 @router.put("/devices/{device_id}/config")
 async def push_device_config(
     device_id: uuid.UUID,
     config: dict,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("config.manage")),
+    current: CurrentUser = Depends(require_permission("device.config.configure")),
 ) -> dict:
-    """Blueprint §19 "centralized configuration pushed to every device" — the
-    DeviceConfig table existed with no API surface at all before this. A
-    device's sync worker reads its row via GET below on each poll."""
+    """Blueprint §19 "centralized configuration pushed to every device". The
+    till's sync worker fetches its own row from GET /devices/self/config on
+    every pull and applies it (frontend/electron/sync/worker.ts)."""
     device = await db.get(Device, device_id)
     if device is None:
         raise HTTPException(status_code=404, detail="Device not found")
@@ -127,6 +147,7 @@ async def push_device_config(
         db.add(existing)
     else:
         existing.config = config
+        existing.updated_at = func.now()
     await db.commit()
     return {"device_id": str(device_id), "config": config}
 
@@ -135,7 +156,7 @@ async def push_device_config(
 async def get_device_config(
     device_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("device.manage")),
+    current: CurrentUser = Depends(require_permission("device.config.view")),
 ) -> dict:
     device = await db.get(Device, device_id)
     if device is None:
@@ -149,7 +170,7 @@ async def get_device_config(
 async def broadcast_config(
     config: dict,
     db: AsyncSession = Depends(get_db),
-    _current: CurrentUser = Depends(require_permission("config.manage")),
+    _current: CurrentUser = Depends(require_permission("device.config.configure")),
 ) -> dict:
     """Pushes the same config to every active device in one call — the
     fleet-wide half of centralized configuration, not just per-device."""
@@ -160,5 +181,6 @@ async def broadcast_config(
             db.add(DeviceConfig(device_id=device_id, config=config))
         else:
             existing.config = config
+            existing.updated_at = func.now()
     await db.commit()
     return {"devices_updated": len(device_ids), "config": config}

@@ -41,7 +41,7 @@ async def get_or_create_loyalty_config(db: AsyncSession) -> LoyaltyConfig:
 @router.get("/loyalty/config", response_model=LoyaltyConfigOut)
 async def get_loyalty_config(
     db: AsyncSession = Depends(get_db),
-    _current: CurrentUser = Depends(require_permission("inventory.view")),
+    _current: CurrentUser = Depends(require_permission("loyalty.config.view")),
 ) -> LoyaltyConfig:
     return await get_or_create_loyalty_config(db)
 
@@ -50,7 +50,7 @@ async def get_loyalty_config(
 async def request_loyalty_config_change(
     payload: LoyaltyConfigChange,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("loyalty.configure")),
+    current: CurrentUser = Depends(require_permission("loyalty.config.configure")),
 ) -> dict:
     """Directly financial — always routed through the approval engine (Super
     Admin applies in the same motion; anyone else queues a request)."""
@@ -84,7 +84,7 @@ async def request_loyalty_config_change(
 @router.get("/loyalty/tiers", response_model=list[LoyaltyTierOut])
 async def list_loyalty_tiers(
     db: AsyncSession = Depends(get_db),
-    _current: CurrentUser = Depends(require_permission("inventory.view")),
+    _current: CurrentUser = Depends(require_permission("loyalty.tier.view")),
 ) -> list[LoyaltyTier]:
     result = await db.execute(select(LoyaltyTier).order_by(LoyaltyTier.min_lifetime_points))
     return list(result.scalars().all())
@@ -94,7 +94,7 @@ async def list_loyalty_tiers(
 async def create_loyalty_tier(
     payload: LoyaltyTierIn,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("loyalty.configure")),
+    current: CurrentUser = Depends(require_permission("loyalty.tier.create")),
 ) -> LoyaltyTier:
     """Directly financial (changes future earn rates) — same approval posture
     as loyalty config itself, so this always writes an audit row; only Super
@@ -122,7 +122,7 @@ async def create_loyalty_tier(
 async def get_customer_tier(
     customer_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    _current: CurrentUser = Depends(require_permission("inventory.view")),
+    _current: CurrentUser = Depends(require_permission("loyalty.tier.view")),
 ) -> dict:
     """Tier is always recomputed from real ledger history (lifetime points
     earned = sum of positive deltas) rather than read from a cached field."""
@@ -148,7 +148,7 @@ async def get_customer_tier(
 @router.get("/discounts/rules", response_model=list[DiscountRuleOut])
 async def list_discount_rules(
     db: AsyncSession = Depends(get_db),
-    _current: CurrentUser = Depends(require_permission("inventory.view")),
+    _current: CurrentUser = Depends(require_permission("pricing.discount.view")),
 ) -> list[DiscountRule]:
     result = await db.execute(select(DiscountRule).order_by(DiscountRule.name))
     return list(result.scalars().all())
@@ -158,7 +158,7 @@ async def list_discount_rules(
 async def create_discount_rule(
     payload: DiscountRuleCreate,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("loyalty.configure")),
+    current: CurrentUser = Depends(require_permission("pricing.discount.create")),
 ) -> DiscountRule:
     rule = DiscountRule(**payload.model_dump())
     db.add(rule)
@@ -184,7 +184,7 @@ async def request_discount_rule_change(
     rule_id: uuid.UUID,
     payload: DiscountRuleChange,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("loyalty.configure")),
+    current: CurrentUser = Depends(require_permission("pricing.discount.update")),
 ) -> dict:
     rule = await db.get(DiscountRule, rule_id)
     if rule is None:

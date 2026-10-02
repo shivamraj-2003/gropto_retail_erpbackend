@@ -6,7 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-from app.api.deps import CurrentUser, require_admin_or_super, require_permission, require_store_access
+from app.api.deps import CurrentUser, require_permission, require_store_access
 from app.core.database import get_db
 from app.models.models import Role, Store
 from app.models.models_phase2 import Warehouse
@@ -20,9 +20,12 @@ from app.schemas.schemas_phase2 import (
     StoreOut,
     StoreUpdateIn,
     StoreUpdateResult,
+    WarehouseCreateIn,
     WarehouseOut,
+    WarehouseUpdateIn,
 )
 from app.services.approvals import submit_or_apply
+from app.services.audit import write_audit
 
 router = APIRouter(tags=["stores"])
 
@@ -30,7 +33,7 @@ router = APIRouter(tags=["stores"])
 @router.get("/roles", response_model=list[RoleOut])
 async def list_roles(
     db: AsyncSession = Depends(get_db),
-    _current: CurrentUser = Depends(require_permission("inventory.view")),
+    _current: CurrentUser = Depends(require_permission("rbac.role.view")),
 ) -> list[Role]:
     """Lets the frontend read discount limits (and any other role metadata) from
     the single source of truth instead of a hand-maintained duplicate constant —
@@ -41,20 +44,27 @@ async def list_roles(
 
 @router.get("/stores", response_model=list[StoreOut])
 async def list_stores(
+    include_inactive: bool = False,
     db: AsyncSession = Depends(get_db),
-    _current: CurrentUser = Depends(require_permission("inventory.view")),
+    _current: CurrentUser = Depends(require_permission("masterdata.store.view")),
 ) -> list[Store]:
-    """Every store, active or not filtered here — needed for cross-store pickers
-    like the transfer destination selector. No store-scoping check: seeing the
-    store list (name/code) isn't sensitive the way its transactions are."""
-    result = await db.execute(select(Store).where(Store.is_active.is_(True)).order_by(Store.name))
+    """Active stores only by default — needed for cross-store pickers like the
+    transfer destination selector. No store-scoping check: seeing the store
+    list (name/code) isn't sensitive the way its transactions are.
+    Point 15 audit fix: include_inactive lets master-data admin screens see
+    (and reactivate) a deactivated store — previously it just vanished from
+    every list with no way back."""
+    stmt = select(Store).order_by(Store.name)
+    if not include_inactive:
+        stmt = stmt.where(Store.is_active.is_(True))
+    result = await db.execute(stmt)
     return list(result.scalars().all())
 
 
 @router.post("/stores", response_model=StoreCreateResult, status_code=201)
 async def create_store(
     payload: StoreCreateIn,
-    current: CurrentUser = Depends(require_admin_or_super),
+    current: CurrentUser = Depends(require_permission("masterdata.store.create")),
     db: AsyncSession = Depends(get_db),
 ) -> StoreCreateResult:
     """Onboards a new franchise location. Super Admin's call applies
@@ -100,7 +110,7 @@ async def create_store(
 async def update_store(
     store_id: uuid.UUID,
     payload: StoreUpdateIn,
-    current: CurrentUser = Depends(require_admin_or_super),
+    current: CurrentUser = Depends(require_permission("masterdata.store.update")),
     db: AsyncSession = Depends(get_db),
 ) -> StoreUpdateResult:
     if (
@@ -112,6 +122,7 @@ async def update_store(
         and payload.company_id is None
         and payload.gstin is None
         and payload.state is None
+        and payload.is_active is None
     ):
         raise HTTPException(status_code=400, detail="Provide at least one field to change")
 
@@ -128,6 +139,7 @@ async def update_store(
         "company_id": str(store.company_id) if store.company_id else None,
         "gstin": store.gstin,
         "state": store.state,
+        "is_active": store.is_active,
     }
     new_value: dict = {}
     if payload.name is not None:
@@ -146,6 +158,8 @@ async def update_store(
         new_value["gstin"] = payload.gstin
     if payload.state is not None:
         new_value["state"] = payload.state
+    if payload.is_active is not None:
+        new_value["is_active"] = payload.is_active
 
     request = await submit_or_apply(
         db,
@@ -169,7 +183,7 @@ async def update_store(
 async def log_store_footfall(
     store_id: uuid.UUID,
     payload: StoreFootfallIn,
-    current: CurrentUser = Depends(require_permission("inventory.adjust")),
+    current: CurrentUser = Depends(require_permission("store.footfall.update")),
     db: AsyncSession = Depends(get_db),
 ) -> StoreFootfall:
     """Point 3 audit fix: the Conversion % KPI needs a visitor count, and no
@@ -203,8 +217,87 @@ async def log_store_footfall(
 
 @router.get("/warehouses", response_model=list[WarehouseOut])
 async def list_warehouses(
+    include_inactive: bool = False,
     db: AsyncSession = Depends(get_db),
-    _current: CurrentUser = Depends(require_permission("inventory.view")),
+    _current: CurrentUser = Depends(require_permission("masterdata.warehouse.view")),
 ) -> list[Warehouse]:
-    result = await db.execute(select(Warehouse).where(Warehouse.is_active.is_(True)).order_by(Warehouse.name))
+    stmt = select(Warehouse).order_by(Warehouse.name)
+    if not include_inactive:
+        stmt = stmt.where(Warehouse.is_active.is_(True))
+    result = await db.execute(stmt)
     return list(result.scalars().all())
+
+
+@router.post("/warehouses", response_model=WarehouseOut, status_code=201)
+async def create_warehouse(
+    payload: WarehouseCreateIn,
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(require_permission("masterdata.warehouse.create")),
+) -> Warehouse:
+    """Point 15 audit fix: only GET /warehouses ever existed — no role,
+    including Super Admin, could create a warehouse through the app; rows
+    could only be added by a seed script or raw SQL. This is the first
+    real write path a warehouse has ever had."""
+    existing = (await db.execute(select(Warehouse).where(Warehouse.code == payload.code))).scalar_one_or_none()
+    if existing is not None:
+        raise HTTPException(status_code=409, detail=f"Warehouse code '{payload.code}' already exists")
+    warehouse = Warehouse(code=payload.code, name=payload.name, city=payload.city)
+    db.add(warehouse)
+    await db.flush()
+    await write_audit(
+        db,
+        user_id=current.user_id,
+        role_code=current.role_code,
+        store_id=None,
+        device_id=current.device_id,
+        action="warehouse.created",
+        entity_type="warehouse",
+        entity_id=warehouse.id,
+        new_value=payload.model_dump(mode="json"),
+    )
+    await db.commit()
+    await db.refresh(warehouse)
+    return warehouse
+
+
+@router.put("/warehouses/{warehouse_id}", response_model=WarehouseOut)
+async def update_warehouse(
+    warehouse_id: uuid.UUID,
+    payload: WarehouseUpdateIn,
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(require_permission("masterdata.warehouse.update")),
+) -> Warehouse:
+    if payload.name is None and payload.city is None and payload.is_active is None:
+        raise HTTPException(status_code=400, detail="Provide at least one field to change")
+
+    warehouse = await db.get(Warehouse, warehouse_id)
+    if warehouse is None:
+        raise HTTPException(status_code=404, detail="Warehouse not found")
+
+    old_value = {"name": warehouse.name, "city": warehouse.city, "is_active": warehouse.is_active}
+    new_value: dict = {}
+    if payload.name is not None:
+        warehouse.name = payload.name
+        new_value["name"] = payload.name
+    if payload.city is not None:
+        warehouse.city = payload.city
+        new_value["city"] = payload.city
+    if payload.is_active is not None:
+        warehouse.is_active = payload.is_active
+        new_value["is_active"] = payload.is_active
+
+    await write_audit(
+        db,
+        user_id=current.user_id,
+        role_code=current.role_code,
+        store_id=None,
+        device_id=current.device_id,
+        action="warehouse.updated",
+        entity_type="warehouse",
+        entity_id=warehouse.id,
+        old_value=old_value,
+        new_value=new_value,
+    )
+    await db.commit()
+    await db.refresh(warehouse)
+    return warehouse

@@ -20,7 +20,7 @@ async def list_returns(
     limit: int = 20,
     offset: int = 0,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("sale.void")),
+    current: CurrentUser = Depends(require_permission("pos.return.view")),
 ) -> Page[ReturnOut]:
     stmt = select(Return)
     if not current.sees_all_stores():
@@ -38,7 +38,7 @@ async def list_returns(
 async def submit_return(
     payload: ReturnCreate,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("sale.void")),
+    current: CurrentUser = Depends(require_permission("pos.return.refund")),
 ) -> Return:
     require_store_access(payload.store_id, current)
     ret = await create_return(db, current=current, payload=payload)
@@ -52,7 +52,7 @@ async def link_return_exchange(
     return_id: uuid.UUID,
     payload: ReturnLinkExchangeIn,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("sale.void")),
+    current: CurrentUser = Depends(require_permission("pos.return.update")),
 ) -> Return:
     ret = await db.get(Return, return_id)
     if ret is None:

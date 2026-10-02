@@ -54,6 +54,48 @@ class Settings(BaseSettings):
     gsp_client_secret: str = ""
     gsp_gstin: str = ""
 
+    # Point 19 hardening. MFA is mandatory for roles flagged roles.mfa_required
+    # (and every Super Admin); set false only as an emergency break-glass.
+    mfa_enforcement: bool = True
+    # Separate small pool for reports/dashboards so heavy reads can't take the
+    # connections POS billing needs. Main pool (5+5) + this (2+1) = 13, under
+    # the Supabase pooler's 15-connection cap.
+    reporting_pool_size: int = 2
+    reporting_max_overflow: int = 1
+
+    # Redis (Upstash). REDIS_URL (rediss://… TCP, TLS) is preferred — it backs
+    # rate limiting, login lockout, cross-process permission-cache
+    # invalidation, scheduler locks, OTP throttling and the Celery broker.
+    # The REST pair is a fallback for the key-value features when only REST
+    # is reachable (Celery needs TCP). All blank = single-process in-memory
+    # mode, which is what this app ran on before.
+    redis_url: str = ""
+    upstash_redis_rest_url: str = ""
+    upstash_redis_rest_token: str = ""
+    redis_key_prefix: str = "gropto"
+    # Notifications go through Celery workers when REDIS_URL is set; false
+    # forces inline sending from the API process.
+    celery_enabled: bool = True
+
+    # OTP delivery (password reset, and any future verification flow).
+    # SMS: MSG91 (auth key + approved OTP template) or Twilio (above);
+    # "auto" uses whichever is configured, MSG91 first.
+    sms_provider: str = "auto"
+    msg91_auth_key: str = ""
+    msg91_otp_template_id: str = ""
+    msg91_sender_id: str = ""
+    # Meta-approved WhatsApp authentication template with one body variable
+    # (the code) — Meta requires a template for OTPs.
+    whatsapp_otp_template: str = "otp_code"
+    whatsapp_otp_language: str = "en_US"
+    otp_expiry_minutes: int = 10
+    otp_resend_cooldown_seconds: int = 60
+    otp_max_sends_per_hour: int = 5
+
+    # Gunicorn workers for the Docker image (one APScheduler runs per worker,
+    # but each job takes a Redis lock, so only one worker executes it).
+    web_concurrency: int = 2
+
     cors_origins: str = "http://localhost:5173"
     environment: str = "development"
 

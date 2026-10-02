@@ -5,7 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import CurrentUser, require_permission, require_store_access
+from app.api.deps import CurrentUser, require_permission, require_store_access, require_warehouse_access
 from app.core.database import get_db
 from app.models.models import Product
 from app.models.models_phase2 import Transfer
@@ -44,13 +44,17 @@ async def list_batches(
     warehouse_id: uuid.UUID | None = None,
     product_id: uuid.UUID | None = None,
     db: AsyncSession = Depends(get_db),
-    _current: CurrentUser = Depends(require_permission("inventory.view")),
+    current: CurrentUser = Depends(require_permission("wms.batch.view")),
 ) -> list[InventoryBatch]:
     stmt = select(InventoryBatch).order_by(InventoryBatch.expiry_date.asc())
     if store_id:
+        require_store_access(store_id, current)
         stmt = stmt.where(InventoryBatch.store_id == store_id)
     if warehouse_id:
+        require_warehouse_access(warehouse_id, current)
         stmt = stmt.where(InventoryBatch.warehouse_id == warehouse_id)
+    elif not store_id and current.access is not None and current.access.warehouse_ids and not current.is_super_admin:
+        stmt = stmt.where(InventoryBatch.warehouse_id.in_(current.access.warehouse_ids))
     if product_id:
         stmt = stmt.where(InventoryBatch.product_id == product_id)
     result = await db.execute(stmt)
@@ -61,8 +65,9 @@ async def list_batches(
 async def list_locations(
     warehouse_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    _current: CurrentUser = Depends(require_permission("inventory.view")),
+    current: CurrentUser = Depends(require_permission("wms.location.view")),
 ) -> list[WarehouseZoneLocation]:
+    require_warehouse_access(warehouse_id, current)
     result = await db.execute(select(WarehouseZoneLocation).where(WarehouseZoneLocation.warehouse_id == warehouse_id))
     return list(result.scalars().all())
 
@@ -71,7 +76,7 @@ async def list_locations(
 async def create_putaway_task(
     payload: PutawayTaskCreate,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("inventory.adjust")),
+    current: CurrentUser = Depends(require_permission("wms.putaway.create")),
 ) -> PutawayTask:
     task = PutawayTask(**payload.model_dump())
     db.add(task)
@@ -96,7 +101,7 @@ async def create_putaway_task(
 async def list_putaway_tasks(
     status_filter: str | None = None,
     db: AsyncSession = Depends(get_db),
-    _current: CurrentUser = Depends(require_permission("inventory.view")),
+    _current: CurrentUser = Depends(require_permission("wms.putaway.view")),
 ) -> list[PutawayTask]:
     stmt = select(PutawayTask)
     if status_filter:
@@ -110,7 +115,7 @@ async def confirm_putaway_task(
     task_id: uuid.UUID,
     payload: PutawayTaskConfirm,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("inventory.adjust")),
+    current: CurrentUser = Depends(require_permission("wms.putaway.update")),
 ) -> PutawayTask:
     """Point 5 audit fix: there was previously no way to ever complete a
     putaway task — this confirms the location and actually moves the batch
@@ -125,6 +130,7 @@ async def confirm_putaway_task(
     location = await db.get(WarehouseZoneLocation, payload.confirmed_location_id)
     if location is None or not location.is_active:
         raise HTTPException(status_code=400, detail="Confirmed location is not a valid active location")
+    require_warehouse_access(location.warehouse_id, current)
 
     batches = (
         await db.execute(
@@ -161,11 +167,16 @@ async def list_indents(
     limit: int = 20,
     offset: int = 0,
     db: AsyncSession = Depends(get_db),
-    _current: CurrentUser = Depends(require_permission("inventory.view")),
+    current: CurrentUser = Depends(require_permission("wms.indent.view")),
 ) -> Page[StoreIndentOut]:
     stmt = select(StoreIndent)
     if store_id:
+        require_store_access(store_id, current)
         stmt = stmt.where(StoreIndent.store_id == store_id)
+    elif not current.sees_all_stores() and not current.permissions & {"wms.pick.create", "wms.indent.transfer"}:
+        # Store-side users see their own stores' indents; warehouse-side
+        # fulfilment roles keep seeing the full queue they work from.
+        stmt = stmt.where(StoreIndent.store_id.in_(current.store_ids))
     capped_limit = min(limit, 200)
     total = (await db.execute(select(func.count()).select_from(stmt.subquery()))).scalar_one()
     result = await db.execute(stmt.order_by(StoreIndent.created_at.desc()).limit(capped_limit).offset(offset))
@@ -176,7 +187,7 @@ async def list_indents(
 async def create_indent(
     payload: StoreIndentCreate,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("inventory.adjust")),
+    current: CurrentUser = Depends(require_permission("wms.indent.create")),
 ) -> StoreIndent:
     """Point 5 audit fix: an indent used to be a bare header row with no way
     to say what or how much was being requested — now carries real line
@@ -216,7 +227,7 @@ async def create_indent(
 async def convert_indent_to_transfer(
     indent_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("inventory.adjust")),
+    current: CurrentUser = Depends(require_permission("wms.indent.transfer")),
 ) -> dict:
     """Point 5 audit fix: 'converted_to_transfer' was a documented status
     value nothing ever actually set — this is the real conversion, building a
@@ -271,12 +282,14 @@ async def _fefo_suggestion(db: AsyncSession, warehouse_id: uuid.UUID, product_id
 async def create_pick_list(
     payload: PickListCreate,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("inventory.adjust")),
+    current: CurrentUser = Depends(require_permission("wms.pick.create")),
 ) -> list[dict]:
     """Blueprint §5: "pick list, scan-based picking" + FEFO. Each requested
     line gets a real FEFO batch suggestion (soonest-expiring stock first) and
     a best-effort bin suggestion (the schema has no product→bin mapping yet,
     so this is the warehouse's first active location, not a per-batch one)."""
+    for line in payload.lines:
+        require_warehouse_access(line.warehouse_id, current)
     created: list[dict] = []
     for line in payload.lines:
         location = (
@@ -324,11 +337,14 @@ async def list_pick_lists(
     warehouse_id: uuid.UUID | None = None,
     status_filter: str | None = None,
     db: AsyncSession = Depends(get_db),
-    _current: CurrentUser = Depends(require_permission("inventory.view")),
+    current: CurrentUser = Depends(require_permission("wms.pick.view")),
 ) -> list[WmsPickListTask]:
     stmt = select(WmsPickListTask)
     if warehouse_id:
+        require_warehouse_access(warehouse_id, current)
         stmt = stmt.where(WmsPickListTask.warehouse_id == warehouse_id)
+    elif current.access is not None and current.access.warehouse_ids and not current.is_super_admin:
+        stmt = stmt.where(WmsPickListTask.warehouse_id.in_(current.access.warehouse_ids))
     if status_filter:
         stmt = stmt.where(WmsPickListTask.status == status_filter)
     result = await db.execute(stmt.order_by(WmsPickListTask.created_at.desc()))
@@ -340,7 +356,7 @@ async def confirm_pick(
     task_id: uuid.UUID,
     payload: PickConfirm,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("inventory.adjust")),
+    current: CurrentUser = Depends(require_permission("wms.pick.update")),
 ) -> WmsPickListTask:
     """Scan-based picking confirmation. Depletes the FEFO/FIFO batch by the
     picked quantity — real batch-level stock movement, not just a status
@@ -351,6 +367,7 @@ async def confirm_pick(
     task = await db.get(WmsPickListTask, task_id)
     if task is None:
         raise HTTPException(status_code=404, detail="Pick list task not found")
+    require_warehouse_access(task.warehouse_id, current)
     if payload.picked_qty <= 0 or payload.picked_qty > task.requested_qty:
         raise HTTPException(status_code=400, detail="picked_qty must be between 0 and requested_qty")
 
@@ -403,11 +420,12 @@ async def confirm_pick(
 async def pack_pick_list(
     task_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("inventory.adjust")),
+    current: CurrentUser = Depends(require_permission("wms.pack.update")),
 ) -> WmsPickListTask:
     task = await db.get(WmsPickListTask, task_id)
     if task is None:
         raise HTTPException(status_code=404, detail="Pick list task not found")
+    require_warehouse_access(task.warehouse_id, current)
     if task.status != "picked":
         raise HTTPException(status_code=400, detail="Task must be fully picked before it can be packed")
     task.status = "packed"
@@ -430,7 +448,7 @@ async def pack_pick_list(
 async def dispatch_pick_lists(
     payload: PickListDispatch,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("inventory.adjust")),
+    current: CurrentUser = Depends(require_permission("wms.dispatch.transfer")),
 ) -> dict:
     """Closes the Warehouse-to-Store loop (blueprint §16): every packed pick-
     list task becomes one real Transfer document via the existing
@@ -446,6 +464,7 @@ async def dispatch_pick_lists(
     warehouse_ids = {t.warehouse_id for t in tasks}
     if len(warehouse_ids) > 1:
         raise HTTPException(status_code=400, detail="All pick list tasks in one dispatch must share the same warehouse")
+    require_warehouse_access(next(iter(warehouse_ids)), current)
 
     transfer_payload = TransferCreate(
         source_type="warehouse",

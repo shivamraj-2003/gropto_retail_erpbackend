@@ -20,7 +20,7 @@ async def list_transfers(
     limit: int = 20,
     offset: int = 0,
     db: AsyncSession = Depends(get_db),
-    _current: CurrentUser = Depends(require_permission("inventory.adjust")),
+    _current: CurrentUser = Depends(require_permission("transfer.transfer.view")),
 ) -> Page[TransferOut]:
     stmt = select(Transfer)
     if status_filter:
@@ -35,7 +35,7 @@ async def list_transfers(
 async def get_transfer(
     transfer_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    _current: CurrentUser = Depends(require_permission("inventory.adjust")),
+    _current: CurrentUser = Depends(require_permission("transfer.transfer.view")),
 ) -> Transfer:
     transfer = await db.get(Transfer, transfer_id)
     if transfer is None:
@@ -47,7 +47,7 @@ async def get_transfer(
 async def create_transfer(
     payload: TransferCreate,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("inventory.adjust")),
+    current: CurrentUser = Depends(require_permission("transfer.transfer.create")),
 ) -> Transfer:
     # Point 5 audit fix: previously only the blanket inventory.adjust
     # permission gated this — any holder could dispatch stock out of a store
@@ -69,7 +69,7 @@ async def receive(
     transfer_id: uuid.UUID,
     payload: TransferReceive,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("inventory.adjust")),
+    current: CurrentUser = Depends(require_permission("transfer.transfer.update")),
 ) -> Transfer:
     transfer = await db.get(Transfer, transfer_id)
     if transfer is None:
@@ -87,7 +87,7 @@ async def resolve_transfer_discrepancy(
     transfer_id: uuid.UUID,
     payload: TransferDiscrepancyResolveIn,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("inventory.adjust")),
+    current: CurrentUser = Depends(require_permission("transfer.discrepancy.reconcile")),
 ) -> dict:
     transfer = await db.get(Transfer, transfer_id)
     if transfer is None:

@@ -33,6 +33,7 @@ from app.schemas.schemas_phase3 import (
     OrderReturnCreate,
 )
 from app.services import payments as payments_service
+from app.services import sms as sms_service
 from app.services.audit import write_audit
 from app.services.coupons import validate_and_apply_coupon
 from app.services.inventory import adjust_damaged, adjust_reserved, apply_movement, get_available_to_promise
@@ -344,6 +345,21 @@ async def dispatch_order(db: AsyncSession, *, current: CurrentUser, order: Order
         entity_id=order.id,
         new_value={"rider_id": str(payload.rider_id)},
     )
+
+    # Point 16 audit fix: the delivery OTP previously had to be pulled by the
+    # rider via an authenticated API call (get_delivery_otp) — nothing ever
+    # pushed it to the customer, so a rider at the door had no way to prove
+    # the OTP to a customer who didn't already have it. Same honest
+    # is_configured()-gated pattern as every other provider in this
+    # codebase: a real SMS attempt, not a fabricated "sent" status.
+    if order.customer_id is not None and sms_service.is_configured():
+        customer = await db.get(Customer, order.customer_id)
+        if customer is not None and customer.phone:
+            await sms_service.send_sms(
+                customer.phone,
+                f"Your Gropto order is out for delivery. Share OTP {order.delivery_otp} with the rider to confirm receipt.",
+            )
+
     return order
 
 

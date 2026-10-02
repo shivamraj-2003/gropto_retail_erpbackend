@@ -19,7 +19,8 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser
-from app.models.models import ApprovalRequest, Product
+from app.models.models import ApprovalRequest, ApprovalRule, ApprovalStep, Product
+from app.services import rbac
 from app.services.audit import write_audit
 
 HandlerFn = Callable[[AsyncSession, ApprovalRequest], Awaitable[None]]
@@ -73,8 +74,10 @@ async def submit_or_apply(
     )
     db.add(request)
     await db.flush()
+    rule = await matching_rule(db, request_type, await request_amount(db, request))
+    request.required_levels = rule.levels if rule is not None else 1
 
-    if current.role_code == "super_admin":
+    if current.is_super_admin:
         await _apply(db, request, approver_id=current.user_id)
     else:
         await write_audit(
@@ -93,12 +96,101 @@ async def submit_or_apply(
     return request
 
 
-#: Point 6 audit fix: PO approval previously had no amount-tiered limit at
-#: all — the same blanket "Super Admin applies immediately, anyone else with
-#: approval.decide can approve" rule every other request type uses. A
-#: high-value PO now requires one of these roles specifically.
-PO_HIGH_VALUE_THRESHOLD = 50000.0
-PO_HIGH_VALUE_APPROVER_ROLES = ("super_admin", "purchase_head", "finance_head")
+# ---------------------------------------------------------------------------
+# Point 14 approval matrix (approval_rules)
+# ---------------------------------------------------------------------------
+
+_AMOUNT_KEYS = ("amount", "total_amount", "refund_amount", "total_refund", "max_variance", "discount_value", "delta")
+
+
+async def request_amount(db: AsyncSession, request: ApprovalRequest) -> float | None:
+    """The monetary/quantity figure a rule's amount band is matched against."""
+    if request.request_type == "purchase_order_approval" and request.entity_id is not None:
+        from app.models.models_phase2 import PurchaseOrder
+
+        po = await db.get(PurchaseOrder, request.entity_id)
+        if po is not None:
+            return float(po.total_amount)
+    values = request.new_value or {}
+    for key in _AMOUNT_KEYS:
+        raw = values.get(key)
+        try:
+            if raw is not None and not isinstance(raw, bool):
+                return abs(float(raw))
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+async def matching_rule(db: AsyncSession, request_type: str, amount: float | None) -> ApprovalRule | None:
+    """Most specific active rule whose amount band contains `amount` (bands are
+    min_amount < amount <= max_amount; an open bound matches anything)."""
+    rules = (
+        await db.execute(
+            select(ApprovalRule).where(ApprovalRule.request_type == request_type, ApprovalRule.is_active.is_(True))
+        )
+    ).scalars().all()
+    best: ApprovalRule | None = None
+    for rule in rules:
+        if rule.min_amount is not None and (amount is None or amount <= float(rule.min_amount)):
+            continue
+        if rule.max_amount is not None and (amount is None or amount > float(rule.max_amount)):
+            continue
+        if best is None or float(rule.min_amount or 0) > float(best.min_amount or 0):
+            best = rule
+    return best
+
+
+async def approval_threshold(db: AsyncSession, request_type: str, default: float) -> float:
+    """At-or-below-this applies without approval. Configurable from the
+    approval matrix; `default` is the value that used to be hardcoded."""
+    value = (
+        await db.execute(
+            select(ApprovalRule.threshold_amount)
+            .where(
+                ApprovalRule.request_type == request_type,
+                ApprovalRule.is_active.is_(True),
+                ApprovalRule.threshold_amount.is_not(None),
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    return float(value) if value is not None else default
+
+
+async def assert_can_decide(
+    db: AsyncSession, request: ApprovalRequest, approver: CurrentUser, *, approve: bool
+) -> ApprovalRule | None:
+    """Who may decide this request. Enforced server-side on every decision, so
+    nobody can approve through the API what the matrix doesn't allow them."""
+    needed = "approval.request.approve" if approve else "approval.request.reject"
+    if not approver.has_permission(needed):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=f"Permission denied: {needed}")
+    if request.store_id is not None and not approver.owns_store(request.store_id):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized for this store")
+    rule = await matching_rule(db, request.request_type, await request_amount(db, request))
+    if approver.is_super_admin:
+        return rule
+    if (rule is None or rule.maker_checker) and request.requested_by == approver.user_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Maker-checker: you cannot decide your own request")
+    if rule is not None:
+        if approve and not approver.has_permission(rule.approver_permission):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=f"Permission denied: {rule.approver_permission}")
+        if rule.approver_role_codes:
+            held = set(approver.access.role_codes) if approver.access else {approver.role_code}
+            if not held & set(rule.approver_role_codes):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=f"{rule.name} requires approval by: {', '.join(rule.approver_role_codes)}",
+                )
+    already = (
+        await db.execute(
+            select(ApprovalStep.id).where(ApprovalStep.request_id == request.id, ApprovalStep.approver_id == approver.user_id)
+        )
+    ).scalar_one_or_none()
+    if already is not None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="You have already decided this request")
+    return rule
 
 
 async def decide(
@@ -110,21 +202,45 @@ async def decide(
     if request.status != "pending":
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Request already decided")
 
-    if request.request_type == "purchase_order_approval":
-        from app.models.models_phase2 import PurchaseOrder
+    rule = await assert_can_decide(db, request, approver, approve=approve)
+    required = max(request.required_levels or 1, rule.levels if rule is not None else 1)
+    level = (request.approved_levels or 0) + 1
+    db.add(
+        ApprovalStep(
+            request_id=request.id,
+            level=level,
+            approver_id=approver.user_id,
+            approver_role_code=approver.role_code,
+            decision="approved" if approve else "rejected",
+            note=note,
+        )
+    )
 
-        po = await db.get(PurchaseOrder, request.entity_id)
-        if po is not None and float(po.total_amount) > PO_HIGH_VALUE_THRESHOLD and approver.role_code not in PO_HIGH_VALUE_APPROVER_ROLES:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail=f"POs over ₹{PO_HIGH_VALUE_THRESHOLD:,.0f} require Purchase Head, Finance Head, or Super Admin approval",
-            )
+    if approve and level < required and not approver.is_super_admin:
+        # Multi-level: record this level and wait for the next distinct approver.
+        request.approved_levels = level
+        request.required_levels = required
+        await write_audit(
+            db,
+            user_id=approver.user_id,
+            role_code=approver.role_code,
+            store_id=request.store_id,
+            device_id=None,
+            action=f"{request.request_type}.level_approved",
+            entity_type=request.entity_type,
+            entity_id=request.entity_id,
+            new_value={"level": level, "required_levels": required},
+            approval_id=request.id,
+            reason=note,
+        )
+        return request
 
     request.reviewed_by = approver.user_id
     request.review_note = note
     request.reviewed_at = datetime.now(timezone.utc)
 
     if approve:
+        request.approved_levels = level
         await _apply(db, request, approver_id=approver.user_id)
     else:
         request.status = "rejected"
@@ -153,6 +269,8 @@ async def _apply(db: AsyncSession, request: ApprovalRequest, *, approver_id: uui
     await handler(db, request)
     if request.status == "pending":
         request.status = "approved"
+    if request.request_type in ("user_create", "user_permission_change", "store_create", "store_update"):
+        rbac.invalidate()
     await write_audit(
         db,
         user_id=approver_id,
@@ -408,7 +526,7 @@ async def _handle_store_update(db: AsyncSession, request: ApprovalRequest) -> No
     if store is None:
         request.status = "stale"
         return
-    for field in ("name", "city", "cluster", "area_sqft", "target_revenue_monthly", "gstin", "state"):
+    for field in ("name", "city", "cluster", "area_sqft", "target_revenue_monthly", "gstin", "state", "is_active"):
         if field in request.new_value:
             setattr(store, field, request.new_value[field])
     if "company_id" in request.new_value:
@@ -430,13 +548,29 @@ async def _handle_config_change_noop(db: AsyncSession, request: ApprovalRequest)
 @register_handler("return_approval")
 async def _handle_return_approval(db: AsyncSession, request: ApprovalRequest) -> None:
     from app.models.models_phase2 import Return
-    from app.services.returns import finalize_return
+    from app.services.returns import finalize_return, notify_requester
 
     ret = await db.get(Return, request.entity_id)
     if ret is None or ret.status != "pending":
         request.status = "stale"
         return
     await finalize_return(db, ret)
+    await notify_requester(db, ret=ret, decision="approved")
+
+
+@register_reject_handler("return_approval")
+async def _reject_return_approval(db: AsyncSession, request: ApprovalRequest) -> None:
+    """Point 16 audit fix: a rejected return approval previously only ever
+    flipped the ApprovalRequest's own status — the Return row itself stayed
+    "pending" forever, with no code path that ever moved it to "rejected"."""
+    from app.models.models_phase2 import Return
+    from app.services.returns import notify_requester
+
+    ret = await db.get(Return, request.entity_id)
+    if ret is None or ret.status != "pending":
+        return
+    ret.status = "rejected"
+    await notify_requester(db, ret=ret, decision="rejected")
 
 
 @register_handler("purchase_order_approval")
@@ -507,3 +641,23 @@ async def _handle_expense_approval(db: AsyncSession, request: ApprovalRequest) -
         request.status = "stale"
         return
     expense.status = "approved"
+
+
+@register_handler("hr_adjustment_approval")
+async def _handle_hr_adjustment_approval(db: AsyncSession, request: ApprovalRequest) -> None:
+    from app.models.models_phase4 import HrAdjustment
+
+    adjustment = await db.get(HrAdjustment, request.entity_id)
+    if adjustment is None or adjustment.status != "pending":
+        request.status = "stale"
+        return
+    adjustment.status = "approved"
+
+
+@register_reject_handler("hr_adjustment_approval")
+async def _reject_hr_adjustment_approval(db: AsyncSession, request: ApprovalRequest) -> None:
+    from app.models.models_phase4 import HrAdjustment
+
+    adjustment = await db.get(HrAdjustment, request.entity_id)
+    if adjustment is not None and adjustment.status == "pending":
+        adjustment.status = "rejected"

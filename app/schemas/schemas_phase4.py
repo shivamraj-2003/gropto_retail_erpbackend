@@ -404,17 +404,190 @@ class PayrollExportOut(BaseModel):
     generated_at: datetime
 
 
+# ---------------------------------------------------------------------------
+# HR: leave, document checklist, incentive/penalty workflow
+# ---------------------------------------------------------------------------
+
+class LeaveTypeIn(BaseModel):
+    name: str
+    code: str
+    paid: bool = True
+    default_annual_days: float = 0.0
+
+
+class LeaveTypeOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: uuid.UUID
+    name: str
+    code: str
+    paid: bool
+    default_annual_days: float
+    is_active: bool
+
+
+class LeaveBalanceSet(BaseModel):
+    employee_id: uuid.UUID
+    leave_type_id: uuid.UUID
+    year: int
+    allocated_days: float
+
+
+class LeaveBalanceOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: uuid.UUID
+    employee_id: uuid.UUID
+    leave_type_id: uuid.UUID
+    year: int
+    allocated_days: float
+
+
+class LeaveBalanceSummary(BaseModel):
+    leave_type_id: uuid.UUID
+    leave_type_name: str
+    year: int
+    allocated_days: float
+    used_days: float
+    pending_days: float
+    remaining_days: float
+
+
+class LeaveRequestCreate(BaseModel):
+    employee_id: uuid.UUID
+    leave_type_id: uuid.UUID
+    start_date: date
+    end_date: date
+    reason: str | None = None
+
+
+class LeaveDecision(BaseModel):
+    approve: bool
+    note: str | None = None
+
+
+class LeaveRequestOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: uuid.UUID
+    employee_id: uuid.UUID
+    leave_type_id: uuid.UUID
+    start_date: date
+    end_date: date
+    days: float
+    reason: str | None
+    status: str
+    decided_by: uuid.UUID | None
+    decided_at: datetime | None
+    decision_note: str | None
+    created_at: datetime
+
+
+class DocumentChecklistItemIn(BaseModel):
+    name: str
+    applies_to: str  # joining, exit
+    required: bool = True
+
+
+class DocumentChecklistItemOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: uuid.UUID
+    name: str
+    applies_to: str
+    required: bool
+    is_active: bool
+
+
+class EmployeeDocumentUpdate(BaseModel):
+    status: str
+    reference: str | None = None
+    notes: str | None = None
+
+
+class EmployeeDocumentOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: uuid.UUID
+    employee_id: uuid.UUID
+    checklist_item_id: uuid.UUID
+    status: str
+    reference: str | None
+    notes: str | None
+    updated_at: datetime
+
+
+class HrAdjustmentCreate(BaseModel):
+    employee_id: uuid.UUID
+    store_id: uuid.UUID
+    adjustment_type: str  # incentive, penalty
+    amount: float
+    month_year: str
+    reason: str
+
+
+class HrAdjustmentOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: uuid.UUID
+    employee_id: uuid.UUID
+    store_id: uuid.UUID
+    adjustment_type: str
+    amount: float
+    month_year: str
+    reason: str
+    status: str
+    created_at: datetime
+
+
+class ProductivityRow(BaseModel):
+    employee_id: uuid.UUID
+    name: str | None
+    designation: str
+    role_code: str | None
+    worked_days: int
+    late_count: int
+    absent_count: int
+    sales_count: int
+    sales_revenue: float
+    orders_delivered: int
+
+
 class CeoAlertOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: uuid.UUID
     alert_type: str
     severity: str
     store_id: uuid.UUID | None
+    source_id: uuid.UUID | None
     title: str
     description: str
     action_required: str
     status: str
     created_at: datetime
+    assigned_to: uuid.UUID | None
+    resolved_by: uuid.UUID | None
+    resolved_at: datetime | None
+    resolution_note: str | None
+
+
+class SuspiciousBillingLogOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: uuid.UUID
+    store_id: uuid.UUID
+    cashier_id: uuid.UUID | None
+    risk_score: int
+    pattern_type: str
+    details_json: dict
+    status: str
+    assigned_to: uuid.UUID | None
+    resolved_by: uuid.UUID | None
+    resolved_at: datetime | None
+    resolution_note: str | None
+    created_at: datetime
+
+
+class AlertAssign(BaseModel):
+    assignee_id: uuid.UUID
+
+
+class AlertResolve(BaseModel):
+    status: str | None = None  # "reviewed" or "dismissed" (fraud_alerts/suspicious_billing_logs only)
+    note: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -430,6 +603,7 @@ class CompanyIn(BaseModel):
     city: str
     einvoice_applicable: bool = False
     aato_threshold: float | None = None
+    is_active: bool = True
 
 
 class CompanyOut(BaseModel):
@@ -443,6 +617,7 @@ class CompanyOut(BaseModel):
     city: str
     einvoice_applicable: bool
     aato_threshold: float | None
+    is_active: bool
     created_at: datetime
 
 
@@ -478,6 +653,7 @@ class ClusterIn(BaseModel):
     name: str
     region_code: str
     regional_manager_id: uuid.UUID | None = None
+    is_active: bool = True
 
 
 class ClusterOut(BaseModel):
@@ -486,12 +662,14 @@ class ClusterOut(BaseModel):
     name: str
     region_code: str
     regional_manager_id: uuid.UUID | None
+    is_active: bool
     created_at: datetime
 
 
 class DepartmentIn(BaseModel):
     name: str
     code: str
+    is_active: bool = True
 
 
 class DepartmentOut(BaseModel):
@@ -499,6 +677,7 @@ class DepartmentOut(BaseModel):
     id: uuid.UUID
     name: str
     code: str
+    is_active: bool
 
 
 class PaymentModeIn(BaseModel):
@@ -520,6 +699,7 @@ class ReasonCodeIn(BaseModel):
     code: str
     description: str
     requires_approval: bool = True
+    is_active: bool = True
 
 
 class ReasonCodeOut(BaseModel):
@@ -529,12 +709,14 @@ class ReasonCodeOut(BaseModel):
     code: str
     description: str
     requires_approval: bool
+    is_active: bool
 
 
 class ChartOfAccountIn(BaseModel):
     account_code: str
     account_name: str
     account_type: str
+    is_active: bool = True
 
 
 class ChartOfAccountOut(BaseModel):
@@ -543,6 +725,22 @@ class ChartOfAccountOut(BaseModel):
     account_code: str
     account_name: str
     account_type: str
+    is_active: bool
+
+
+class RegionIn(BaseModel):
+    name: str
+    code: str
+    is_active: bool = True
+
+
+class RegionOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: uuid.UUID
+    name: str
+    code: str
+    is_active: bool
+    created_at: datetime
 
 
 # ---------------------------------------------------------------------------
@@ -681,3 +879,28 @@ class CampaignAnalyticsOut(BaseModel):
     skipped_count: int
     delivery_rate: float
     created_at: datetime
+
+
+class ChecklistItemOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: uuid.UUID
+    name: str
+    category: str
+    frequency: str
+    is_active: bool
+
+
+class ChecklistCompletionOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: uuid.UUID
+    checklist_item_id: uuid.UUID
+    store_id: uuid.UUID
+    business_date: date
+    status: str
+    completed_by: uuid.UUID | None
+    completed_at: datetime | None
+    notes: str | None
+
+
+class ChecklistCompleteIn(BaseModel):
+    notes: str | None = None

@@ -19,7 +19,7 @@ router = APIRouter(prefix="/gift-vouchers", tags=["gift-vouchers"])
 async def issue_gift_voucher(
     payload: GiftVoucherIssueIn,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("sale.create")),
+    current: CurrentUser = Depends(require_permission("pos.gift_voucher.create")),
 ) -> GiftVoucher:
     customer_id = None
     if payload.customer_phone:
@@ -53,7 +53,7 @@ async def issue_gift_voucher(
 async def lookup_gift_voucher(
     code: str,
     db: AsyncSession = Depends(get_db),
-    _current: CurrentUser = Depends(require_permission("sale.create")),
+    _current: CurrentUser = Depends(require_permission("pos.gift_voucher.view")),
 ) -> GiftVoucher:
     """Lets the POS validate a voucher (balance, status) before adding it as
     a tender, without having to attempt the sale first."""

@@ -20,7 +20,7 @@ from app.api.deps import CurrentUser
 from app.models.models import InventoryBalance, Product
 from app.models.models_phase2 import StockCount, StockCountLine
 from app.schemas.schemas_phase2 import StockCountCreate, StockCountSubmitIn
-from app.services.approvals import submit_or_apply
+from app.services.approvals import approval_threshold, submit_or_apply
 from app.services.audit import write_audit
 from app.services.inventory import apply_movement
 
@@ -90,9 +90,10 @@ async def finalize_count(db: AsyncSession, *, current: CurrentUser, count: Stock
         raise HTTPException(status_code=409, detail=f"Count is {count.status}, not ready to finalize — every line must be counted first")
 
     variant_lines = [line for line in count.lines if line.variance is not None and float(line.variance) != 0]
-    high_variance = any(abs(float(line.variance)) > HIGH_VARIANCE_THRESHOLD for line in variant_lines)
+    variance_limit = await approval_threshold(db, "stock_count_adjustment", HIGH_VARIANCE_THRESHOLD)
+    high_variance = any(abs(float(line.variance)) > variance_limit for line in variant_lines)
 
-    if variant_lines and high_variance and current.role_code != "super_admin":
+    if variant_lines and high_variance and not current.is_super_admin:
         # Queues instead of applying — a non-Super-Admin finalizing a
         # high-variance count never reaches this function's "applied
         # immediately" path (submit_or_apply only auto-applies for

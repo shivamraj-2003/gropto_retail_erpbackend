@@ -1,6 +1,6 @@
 import uuid
 from datetime import date, datetime
-from typing import Generic, TypeVar
+from typing import Literal, Generic, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -120,11 +120,14 @@ class ChangePasswordIn(BaseModel):
 
 
 class ForgotPasswordIn(BaseModel):
-    email: str
+    email: str | None = None
+    phone: str | None = None
+    channel: Literal["auto", "email", "sms", "whatsapp"] = "auto"
 
 
 class ResetPasswordWithOtpIn(BaseModel):
-    email: str
+    email: str | None = None
+    phone: str | None = None
     otp: str
     new_password: str = Field(min_length=6)
 
@@ -408,6 +411,19 @@ class ApprovalOut(BaseModel):
     review_note: str | None
     created_at: datetime
     reviewed_at: datetime | None
+    required_levels: int = 1
+    approved_levels: int = 0
+
+
+class ApprovalStepOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: uuid.UUID
+    level: int
+    approver_id: uuid.UUID
+    approver_role_code: str | None
+    decision: str
+    note: str | None
+    created_at: datetime
 
 
 # ---------------------------------------------------------------------------

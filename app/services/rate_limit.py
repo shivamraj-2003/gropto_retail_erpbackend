@@ -1,72 +1,52 @@
-"""In-process rate limiting and login-attempt lockout — matches the plan's "Redis
-is not needed" call: this fits in a single dict because sessions are stateless and
-there is one API process. Revisit only if a second API process is ever added.
+"""Rate limiting and login-attempt lockout on the shared key-value store
+(app/core/kv.py): Redis when configured, so the limits hold across every API
+process/worker; the in-memory store otherwise (single-process deployments).
 """
 
-import time
-from collections import defaultdict, deque
+from app.core.kv import get_kv, key
 
 LOGIN_LOCKOUT_THRESHOLD = 5
 LOGIN_LOCKOUT_WINDOW_SECONDS = 15 * 60
 LOGIN_LOCKOUT_DURATION_SECONDS = 15 * 60
-
-_login_failures: dict[str, deque[float]] = defaultdict(deque)
-_locked_until: dict[str, float] = {}
 
 
 def _login_key(identifier: str, device_fingerprint: str) -> str:
     # Keyed by identifier+device so one compromised/misconfigured till can't lock
     # out every cashier at a store, and one user guessing across many devices
     # still gets caught by the identifier component.
-    return f"{identifier}:{device_fingerprint}"
+    return f"{identifier.lower()}:{device_fingerprint}"
 
 
-def is_login_locked(identifier: str, device_fingerprint: str) -> float | None:
+async def is_login_locked(identifier: str, device_fingerprint: str) -> float | None:
     """Returns remaining lockout seconds, or None if not locked."""
-    key = _login_key(identifier, device_fingerprint)
-    until = _locked_until.get(key)
-    if until is None:
-        return None
-    remaining = until - time.monotonic()
-    if remaining <= 0:
-        _locked_until.pop(key, None)
-        return None
-    return remaining
+    remaining = await get_kv().ttl(key("lock", _login_key(identifier, device_fingerprint)))
+    return float(remaining) if remaining > 0 else None
 
 
-def record_login_failure(identifier: str, device_fingerprint: str) -> None:
-    key = _login_key(identifier, device_fingerprint)
-    now = time.monotonic()
-    window = _login_failures[key]
-    window.append(now)
-    while window and now - window[0] > LOGIN_LOCKOUT_WINDOW_SECONDS:
-        window.popleft()
-    if len(window) >= LOGIN_LOCKOUT_THRESHOLD:
-        _locked_until[key] = now + LOGIN_LOCKOUT_DURATION_SECONDS
-        window.clear()
+async def record_login_failure(identifier: str, device_fingerprint: str) -> None:
+    k = _login_key(identifier, device_fingerprint)
+    kv = get_kv()
+    failures = await kv.incr(key("fail", k), LOGIN_LOCKOUT_WINDOW_SECONDS)
+    if failures >= LOGIN_LOCKOUT_THRESHOLD:
+        await kv.set(key("lock", k), "1", ttl_seconds=LOGIN_LOCKOUT_DURATION_SECONDS)
+        await kv.delete(key("fail", k))
 
 
-def record_login_success(identifier: str, device_fingerprint: str) -> None:
-    key = _login_key(identifier, device_fingerprint)
-    _login_failures.pop(key, None)
-    _locked_until.pop(key, None)
+async def record_login_success(identifier: str, device_fingerprint: str) -> None:
+    k = _login_key(identifier, device_fingerprint)
+    kv = get_kv()
+    await kv.delete(key("fail", k))
+    await kv.delete(key("lock", k))
 
 
 # ---------------------------------------------------------------------------
-# General request rate limiting — a simple fixed-window counter per client IP.
+# General request rate limiting — a fixed-window counter per client IP.
 # ---------------------------------------------------------------------------
 
 REQUEST_LIMIT_PER_WINDOW = 300
 REQUEST_WINDOW_SECONDS = 60
 
-_request_counts: dict[str, tuple[int, float]] = {}
 
-
-def is_request_rate_limited(client_ip: str) -> bool:
-    now = time.monotonic()
-    count, window_start = _request_counts.get(client_ip, (0, now))
-    if now - window_start > REQUEST_WINDOW_SECONDS:
-        count, window_start = 0, now
-    count += 1
-    _request_counts[client_ip] = (count, window_start)
+async def is_request_rate_limited(client_ip: str) -> bool:
+    count = await get_kv().incr(key("rl", client_ip), REQUEST_WINDOW_SECONDS)
     return count > REQUEST_LIMIT_PER_WINDOW

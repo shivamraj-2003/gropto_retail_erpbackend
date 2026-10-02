@@ -20,7 +20,7 @@ async def list_stock_counts(
     limit: int = 20,
     offset: int = 0,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("inventory.view")),
+    current: CurrentUser = Depends(require_permission("inventory.stock_count.view")),
 ) -> Page[StockCountOut]:
     stmt = select(StockCount)
     if not current.sees_all_stores():
@@ -38,7 +38,7 @@ async def list_stock_counts(
 async def get_stock_count(
     count_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("inventory.view")),
+    current: CurrentUser = Depends(require_permission("inventory.stock_count.view")),
 ) -> StockCount:
     count = await db.get(StockCount, count_id)
     if count is None:
@@ -51,7 +51,7 @@ async def get_stock_count(
 async def create_stock_count(
     payload: StockCountCreate,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("inventory.view")),
+    current: CurrentUser = Depends(require_permission("inventory.stock_count.create")),
 ) -> StockCount:
     require_store_access(payload.store_id, current)
     count = await initiate_count(db, current=current, payload=payload)
@@ -65,7 +65,7 @@ async def submit_stock_count_lines(
     count_id: uuid.UUID,
     payload: StockCountSubmitIn,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("inventory.view")),
+    current: CurrentUser = Depends(require_permission("inventory.stock_count.update")),
 ) -> StockCount:
     count = await db.get(StockCount, count_id)
     if count is None:
@@ -84,7 +84,7 @@ async def finalize_stock_count(
     # Maker-checker: the finalizing call requires inventory.adjust (write
     # authority), distinct from inventory.view used to count — a plain
     # counter cannot also be the one who applies the adjustment.
-    current: CurrentUser = Depends(require_permission("inventory.adjust")),
+    current: CurrentUser = Depends(require_permission("inventory.stock_count.close")),
 ) -> dict:
     count = await db.get(StockCount, count_id)
     if count is None:

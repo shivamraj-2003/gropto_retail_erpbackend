@@ -95,7 +95,7 @@ async def list_tickets(
     # permission that most store staff hold — any of them could read every
     # customer service ticket company-wide. crm.view is the actual CRM
     # read permission used everywhere else in this feature area.
-    _current: CurrentUser = Depends(require_permission("crm.view")),
+    _current: CurrentUser = Depends(require_permission("crm.ticket.view")),
 ) -> list[CustomerServiceTicket]:
     stmt = select(CustomerServiceTicket).order_by(CustomerServiceTicket.created_at.desc())
     if customer_id:
@@ -110,7 +110,7 @@ async def list_tickets(
 async def create_ticket(
     payload: TicketCreate,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("crm.view")),
+    current: CurrentUser = Depends(require_permission("crm.ticket.create")),
 ) -> CustomerServiceTicket:
     ticket = CustomerServiceTicket(**payload.model_dump())
     db.add(ticket)
@@ -136,7 +136,7 @@ async def update_ticket(
     ticket_id: uuid.UUID,
     payload: TicketUpdate,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("crm.view")),
+    current: CurrentUser = Depends(require_permission("crm.ticket.update")),
 ) -> CustomerServiceTicket:
     """Point 11 audit fix: the frontend already called this endpoint
     (assign/resolve a ticket) — it didn't exist on the backend at all, so
@@ -174,7 +174,7 @@ async def update_ticket(
 async def list_rfm_cohorts(
     segment: str | None = None,
     db: AsyncSession = Depends(get_db),
-    _current: CurrentUser = Depends(require_permission("crm.view")),
+    _current: CurrentUser = Depends(require_permission("crm.analytics.view")),
 ) -> list[RfmCohortSnapshot]:
     stmt = select(RfmCohortSnapshot)
     if segment:

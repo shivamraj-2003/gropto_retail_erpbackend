@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import CurrentUser
 from app.models.models import Product
 from app.models.models_phase2 import Grn, GrnItem, PurchaseOrder, PurchaseOrderItem, PurchaseRequisition, PurchaseRequisitionItem
-from app.models.models_phase4 import InventoryBatch, VendorDebitCreditNote
+from app.models.models_phase4 import InventoryBatch, PutawayTask, VendorDebitCreditNote
 from app.schemas.schemas_phase2 import GrnCreate, PurchaseOrderCreate, RequisitionCreate
 from app.services.approvals import submit_or_apply
 from app.services.audit import write_audit
@@ -232,6 +232,13 @@ async def receive_grn(db: AsyncSession, *, current: CurrentUser, payload: GrnCre
             await adjust_warehouse_balance(
                 db, product_id=item.product_id, warehouse_id=payload.warehouse_id, delta=item.received_qty
             )
+            # Point 16 audit fix: GRN -> Put-away used to require a separate,
+            # entirely manual "create putaway task" call referencing the GRN
+            # after the fact — a real but disconnected bridge. The task now
+            # exists the moment the batch does; a human still confirms the
+            # actual shelf location (confirm_putaway_task), but no longer has
+            # to remember to create the task in the first place.
+            db.add(PutawayTask(grn_id=grn.id, product_id=item.product_id))
 
     if po is not None:
         # Point 6 audit fix: this used to unconditionally set status =

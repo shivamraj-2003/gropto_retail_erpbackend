@@ -9,7 +9,7 @@ from app.core.database import get_db
 from app.models.models import InventoryBalance, Product
 from app.models.models_phase4 import ReasonCodeMaster
 from app.schemas.schemas import InventoryBalanceOut, StockAdjustmentRequest, StockBlockRequest
-from app.services.approvals import submit_or_apply
+from app.services.approvals import approval_threshold, submit_or_apply
 from app.services.audit import write_audit
 from app.services.inventory import adjust_blocked, adjust_damaged, apply_movement, get_balance
 
@@ -23,7 +23,7 @@ async def read_balance(
     product_id: uuid.UUID,
     store_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("inventory.view")),
+    current: CurrentUser = Depends(require_permission("inventory.stock.view")),
 ) -> dict:
     """Point 7 audit fix: this used to hardcode reserved/in_transit/damaged/
     blocked to 0 regardless of the real column values — now reads the actual
@@ -56,7 +56,7 @@ async def read_balance(
 async def adjust_stock(
     payload: StockAdjustmentRequest,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("inventory.adjust")),
+    current: CurrentUser = Depends(require_permission("inventory.stock.adjust")),
 ) -> dict:
     require_store_access(payload.store_id, current)
 
@@ -71,7 +71,7 @@ async def adjust_stock(
     ).scalar_one_or_none()
     requires_approval_by_reason = bool(reason_master and reason_master.requires_approval)
 
-    if (abs(payload.delta) > HIGH_ADJUSTMENT_THRESHOLD or requires_approval_by_reason) and current.role_code != "super_admin":
+    if (abs(payload.delta) > await approval_threshold(db, "high_stock_adjustment", HIGH_ADJUSTMENT_THRESHOLD) or requires_approval_by_reason) and not current.is_super_admin:
         request = await submit_or_apply(
             db,
             current=current,
@@ -126,7 +126,7 @@ async def block_stock(
     # feature at all — no authorization model to release it either, since
     # nothing could ever block it in the first place. Gated at the same
     # authority as a manual stock adjustment.
-    current: CurrentUser = Depends(require_permission("inventory.adjust")),
+    current: CurrentUser = Depends(require_permission("inventory.block.create")),
 ) -> dict:
     require_store_access(payload.store_id, current)
     await adjust_blocked(db, product_id=payload.product_id, store_id=payload.store_id, delta=payload.quantity)
@@ -149,7 +149,7 @@ async def block_stock(
 async def release_blocked_stock(
     payload: StockBlockRequest,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("inventory.adjust")),
+    current: CurrentUser = Depends(require_permission("inventory.block.delete")),
 ) -> dict:
     require_store_access(payload.store_id, current)
     current_blocked = (
@@ -184,7 +184,7 @@ async def release_blocked_stock(
 async def mark_damaged(
     payload: StockBlockRequest,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("inventory.adjust")),
+    current: CurrentUser = Depends(require_permission("inventory.damage.create")),
 ) -> dict:
     """Point 7 audit fix: damage was previously only ever recordable at GRN
     receiving or at return processing — a store discovering damage on a shelf
@@ -212,7 +212,7 @@ async def mark_damaged(
 async def store_snapshot(
     store_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("inventory.view")),
+    current: CurrentUser = Depends(require_permission("inventory.stock.view")),
 ) -> list[dict]:
     """Bulk stock pull for a device's local stock_snapshot cache — one call instead
     of one round-trip per SKU. Advisory on the device once cached; this endpoint is
@@ -238,7 +238,7 @@ async def store_snapshot(
 async def reconcile_balances(
     apply_fix: bool = False,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("device.manage")),
+    current: CurrentUser = Depends(require_permission("inventory.stock.reconcile")),
 ) -> dict:
     """The ledger-recompute job from §5 of the plan: 'a nightly job recomputes
     balances from the ledger and reports any drift'. No cron infra exists yet, so

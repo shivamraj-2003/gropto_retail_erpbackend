@@ -57,7 +57,7 @@ async def list_entries(
     limit: int = 20,
     offset: int = 0,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("audit.view")),
+    current: CurrentUser = Depends(require_permission("audit.log.view")),
 ) -> AuditEntriesPage:
     base_stmt = _scoped_query(
         current, entity_type=entity_type, action=action, user_id=user_id, store_id=store_id,
@@ -75,7 +75,7 @@ async def entity_history(
     entity_type: str,
     entity_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("audit.view")),
+    current: CurrentUser = Depends(require_permission("audit.log.view")),
 ) -> list[AuditLog]:
     """The full, ordered, immutable version history for one record — entry 1
     is its first-ever audited change, each next entry's old_value is (in
@@ -93,7 +93,7 @@ async def entity_history(
 @router.get("/actions", response_model=list[str])
 async def distinct_actions(
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("audit.view")),
+    current: CurrentUser = Depends(require_permission("audit.log.view")),
 ) -> list[str]:
     """Populates the action filter dropdown with only the actions that
     actually occur, rather than a hand-maintained list that drifts from the
@@ -114,7 +114,7 @@ async def export_entries(
     date_from: datetime | None = None,
     date_to: datetime | None = None,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("audit.view")),
+    current: CurrentUser = Depends(require_permission("audit.log.export")),
 ) -> StreamingResponse:
     stmt = _scoped_query(
         current, entity_type=entity_type, action=action, user_id=user_id, store_id=store_id,

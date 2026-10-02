@@ -6,6 +6,8 @@ from app.api.v1 import (
     audit,
     auth,
     cash,
+    checklist,
+    rbac,
     control_tower,
     crm,
     crm_advanced,
@@ -86,3 +88,5 @@ api_router.include_router(crm_advanced.router)
 api_router.include_router(hr_advanced.router)
 api_router.include_router(control_tower.router)
 api_router.include_router(master_data.router)
+api_router.include_router(checklist.router)
+api_router.include_router(rbac.router)

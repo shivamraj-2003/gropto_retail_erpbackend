@@ -21,7 +21,7 @@ async def health() -> dict:
 async def push(
     batch: SyncPushBatch,
     db: AsyncSession = Depends(get_db),
-    _current: CurrentUser = Depends(require_permission("sale.create")),
+    _current: CurrentUser = Depends(require_permission("pos.sale.create")),
 ) -> SyncPushResponse:
     """Applies each item in creation order, returning a per-item verdict so one bad
     row never blocks the good rows behind it. Always returns 200 — a network error or

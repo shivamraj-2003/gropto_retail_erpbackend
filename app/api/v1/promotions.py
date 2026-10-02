@@ -38,7 +38,7 @@ router = APIRouter(prefix="/promotions", tags=["promotions"])
 async def list_promotion_rules(
     active_only: bool = True,
     db: AsyncSession = Depends(get_db),
-    _current: CurrentUser = Depends(require_permission("inventory.view")),
+    _current: CurrentUser = Depends(require_permission("promotion.rule.view")),
 ) -> list[PromotionRule]:
     """Blueprint §9 "BOGO, combo, category offers, coupons, cart rules" — the
     PromotionRule table existed with zero API endpoints before this."""
@@ -53,7 +53,7 @@ async def list_promotion_rules(
 async def create_promotion_rule(
     payload: PromotionRuleIn,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("loyalty.configure")),
+    current: CurrentUser = Depends(require_permission("promotion.rule.create")),
 ) -> PromotionRule:
     rule = PromotionRule(**payload.model_dump())
     db.add(rule)
@@ -79,7 +79,7 @@ async def update_promotion_rule(
     rule_id: uuid.UUID,
     payload: PromotionRuleIn,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("loyalty.configure")),
+    current: CurrentUser = Depends(require_permission("promotion.rule.update")),
 ) -> PromotionRule:
     rule = await db.get(PromotionRule, rule_id)
     if rule is None:
@@ -108,7 +108,7 @@ async def update_promotion_rule(
 async def promotion_profitability(
     store_id: uuid.UUID | None = None,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("report.export")),
+    current: CurrentUser = Depends(require_permission("promotion.analytics.view")),
 ) -> dict:
     """Blueprint §9 "Promotion profitability and discount-funding tracking."
     Two real, distinct sources: (1) discount_rules vs. sales.discount_total
@@ -198,7 +198,7 @@ async def promotion_profitability(
 async def private_label_margin(
     store_id: uuid.UUID | None = None,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("report.export")),
+    current: CurrentUser = Depends(require_permission("promotion.analytics.view")),
 ) -> list[dict]:
     """Blueprint §9 "Private-label SKU performance and margin tracking" — real
     revenue/margin per private-label product from actual sale_items, not
@@ -250,7 +250,7 @@ async def list_price_overrides(
     store_id: uuid.UUID | None = None,
     city: str | None = None,
     db: AsyncSession = Depends(get_db),
-    _current: CurrentUser = Depends(require_permission("inventory.view")),
+    _current: CurrentUser = Depends(require_permission("pricing.price.view")),
 ) -> list[StorePriceOverride]:
     stmt = select(StorePriceOverride).where(StorePriceOverride.active.is_(True))
     if store_id:
@@ -265,7 +265,7 @@ async def list_price_overrides(
 async def create_price_override(
     payload: StorePriceOverrideCreate,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("loyalty.configure")),
+    current: CurrentUser = Depends(require_permission("pricing.price.override")),
 ) -> StorePriceOverride:
     # Point 9 audit fix: a user holding the blanket loyalty.configure
     # permission could previously create a price override for ANY store —
@@ -294,7 +294,7 @@ async def create_price_override(
 @router.get("/scheduled-price-changes", response_model=list[ScheduledPriceChangeOut])
 async def list_scheduled_price_changes(
     db: AsyncSession = Depends(get_db),
-    _current: CurrentUser = Depends(require_permission("loyalty.configure")),
+    _current: CurrentUser = Depends(require_permission("pricing.scheduled_price.view")),
 ) -> list[ScheduledPriceChange]:
     result = await db.execute(select(ScheduledPriceChange).order_by(ScheduledPriceChange.effective_at.desc()))
     return list(result.scalars().all())
@@ -304,7 +304,7 @@ async def list_scheduled_price_changes(
 async def create_scheduled_price_change(
     payload: ScheduledPriceChangeCreate,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("loyalty.configure")),
+    current: CurrentUser = Depends(require_permission("pricing.scheduled_price.create")),
 ) -> dict:
     """Point 9 audit fix: previously inserted directly with no approval gate
     and nothing ever executed it (effective_at was purely decorative). Now
@@ -335,7 +335,7 @@ async def create_scheduled_price_change(
 async def get_customer_wallet_ledger(
     customer_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    _current: CurrentUser = Depends(require_permission("inventory.view")),
+    _current: CurrentUser = Depends(require_permission("loyalty.wallet.view")),
 ) -> list[CustomerWalletLedger]:
     result = await db.execute(select(CustomerWalletLedger).where(CustomerWalletLedger.customer_id == customer_id).order_by(CustomerWalletLedger.created_at.desc()))
     return list(result.scalars().all())
@@ -346,7 +346,7 @@ async def credit_customer_wallet(
     customer_id: uuid.UUID,
     payload: WalletCreditIn,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("loyalty.configure")),
+    current: CurrentUser = Depends(require_permission("loyalty.wallet.adjust")),
 ) -> CustomerWalletLedger:
     """Point 9 audit fix: credit_wallet() existed in services/wallet.py but
     was never called from any endpoint — there was no manual top-up/goodwill-
@@ -386,7 +386,7 @@ async def credit_customer_wallet(
 async def list_promotion_redemptions(
     promotion_rule_id: uuid.UUID | None = None,
     db: AsyncSession = Depends(get_db),
-    _current: CurrentUser = Depends(require_permission("report.export")),
+    _current: CurrentUser = Depends(require_permission("promotion.analytics.view")),
 ) -> list[PromotionRedemption]:
     stmt = select(PromotionRedemption).order_by(PromotionRedemption.created_at.desc()).limit(500)
     if promotion_rule_id:
@@ -398,7 +398,7 @@ async def list_promotion_redemptions(
 @router.get("/coupons", response_model=list[CouponOut])
 async def list_coupons(
     db: AsyncSession = Depends(get_db),
-    _current: CurrentUser = Depends(require_permission("inventory.view")),
+    _current: CurrentUser = Depends(require_permission("promotion.coupon.view")),
 ) -> list[Coupon]:
     result = await db.execute(select(Coupon).order_by(Coupon.created_at.desc()))
     return list(result.scalars().all())
@@ -408,7 +408,7 @@ async def list_coupons(
 async def create_coupon(
     payload: CouponCreate,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("loyalty.configure")),
+    current: CurrentUser = Depends(require_permission("promotion.coupon.create")),
 ) -> Coupon:
     existing = (await db.execute(select(Coupon).where(Coupon.code == payload.code))).scalar_one_or_none()
     if existing is not None:
@@ -437,7 +437,7 @@ async def update_coupon(
     coupon_id: uuid.UUID,
     payload: CouponCreate,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("loyalty.configure")),
+    current: CurrentUser = Depends(require_permission("promotion.coupon.update")),
 ) -> Coupon:
     coupon = await db.get(Coupon, coupon_id)
     if coupon is None:

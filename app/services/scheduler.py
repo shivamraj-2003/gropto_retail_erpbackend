@@ -1,9 +1,12 @@
+import functools
 import logging
+import os
 from datetime import datetime, timezone
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from sqlalchemy import delete, or_
 
-from app.core.database import SessionLocal
+from app.core.kv import get_kv, key
+from app.core.database import ReportingSessionLocal, SessionLocal
 from app.models.models import PasswordResetOtp, RefreshToken
 
 logger = logging.getLogger("gropto.scheduler")
@@ -16,7 +19,7 @@ async def refresh_rfm_cohorts_job() -> None:
     snapshot from whenever the table happened to first be read."""
     from app.api.v1.crm_advanced import refresh_rfm_cohorts
 
-    async with SessionLocal() as db:
+    async with ReportingSessionLocal() as db:
         try:
             await refresh_rfm_cohorts(db)
         except Exception as e:
@@ -39,12 +42,50 @@ async def evaluate_ceo_alerts_job() -> None:
             await db.rollback()
             logger.error(f"Error during scheduled CEO alert evaluation: {e}")
 
+async def run_fraud_scan_job() -> None:
+    """Point 13 audit fix: run_fraud_scan's own docstring admitted this was
+    "on demand ... call from a scheduler in production" and never was —
+    fraud_alerts only ever populated if a Super Admin remembered to click
+    the manual scan button. Now runs on the same cadence as CEO alerts."""
+    from app.services import fraud as fraud_service
+    from app.services import fraud_notify
+
+    async with SessionLocal() as db:
+        try:
+            alerts = await fraud_service.run_fraud_scan(db)
+            await db.commit()
+            if alerts:
+                await fraud_notify.notify_new_alerts(
+                    db,
+                    subject=f"Gropto Fraud Scan: {len(alerts)} new alert(s)",
+                    lines=[f"[{a.severity.upper()}] {a.rule_code.replace('_', ' ')} — {a.details}" for a in alerts],
+                )
+        except Exception as e:
+            await db.rollback()
+            logger.error(f"Error during scheduled fraud scan: {e}")
+
+
+async def scan_suspicious_billing_job() -> None:
+    """Point 13 audit fix: scan_suspicious_billing was reachable only by a
+    direct API call nobody in the UI ever makes — dead code end-to-end.
+    Scheduled the same way as the fraud scan so suspicious_billing_logs
+    actually gets populated in production."""
+    from app.api.v1.control_tower import _run_suspicious_billing_scan
+
+    async with SessionLocal() as db:
+        try:
+            await _run_suspicious_billing_scan(db)
+        except Exception as e:
+            await db.rollback()
+            logger.error(f"Error during scheduled suspicious billing scan: {e}")
+
+
 async def refresh_abc_xyz_job() -> None:
     """Point 7 audit fix: ABC/XYZ classification was computed once per store,
     lazily, and never refreshed afterward."""
     from app.api.v1.inventory_intelligence import refresh_all_abc_xyz
 
-    async with SessionLocal() as db:
+    async with ReportingSessionLocal() as db:
         try:
             count = await refresh_all_abc_xyz(db)
             logger.info(f"ABC/XYZ refresh complete: {count} product snapshot(s) updated.")
@@ -58,7 +99,7 @@ async def refresh_vendor_performance_job() -> None:
     by any code despite its own docstring claiming a nightly refresh job."""
     from app.services.vendor_performance import compute_vendor_performance
 
-    async with SessionLocal() as db:
+    async with ReportingSessionLocal() as db:
         try:
             count = await compute_vendor_performance(db)
             await db.commit()
@@ -162,7 +203,7 @@ async def refresh_budget_actuals_job() -> None:
 
     today = date.today()
     financial_year = today.year if today.month >= 4 else today.year - 1
-    async with SessionLocal() as db:
+    async with ReportingSessionLocal() as db:
         try:
             count = await refresh_actuals(db, financial_year=financial_year, month=today.month)
             await db.commit()
@@ -210,6 +251,34 @@ async def purge_expired_auth_data() -> None:
             logger.error(f"Error during auth cleanup task: {e}")
 
 
+async def refresh_clv_snapshots_job() -> None:
+    """Point 19 fix: clv_snapshots were only recomputed when someone pressed
+    refresh in CRM, so CLV/churn figures could be arbitrarily stale."""
+    from app.services.clv import compute_clv_snapshots
+
+    async with ReportingSessionLocal() as db:
+        try:
+            await compute_clv_snapshots(db)
+        except Exception as e:
+            await db.rollback()
+            logger.error(f"Error during scheduled CLV refresh: {e}")
+
+
+def _exclusive(job_id: str, fn, lock_seconds: int):
+    """Every API worker runs its own scheduler; a Redis lock (SET NX EX) makes
+    sure only one of them actually executes each tick of each job. Held for
+    most of the interval so a worker whose clock fires slightly later skips
+    too. Without Redis the in-memory lock always succeeds (single process)."""
+
+    @functools.wraps(fn)
+    async def run() -> None:
+        if not await get_kv().set(key("job", job_id), str(os.getpid()), ttl_seconds=lock_seconds, nx=True):
+            return
+        await fn()
+
+    return run
+
+
 def start_scheduler() -> None:
     """Starts the APScheduler background jobs."""
     if not scheduler.running:
@@ -226,6 +295,20 @@ def start_scheduler() -> None:
             "interval",
             minutes=15,
             id="evaluate_ceo_alerts",
+            replace_existing=True,
+        )
+        scheduler.add_job(
+            run_fraud_scan_job,
+            "interval",
+            minutes=30,
+            id="run_fraud_scan",
+            replace_existing=True,
+        )
+        scheduler.add_job(
+            scan_suspicious_billing_job,
+            "interval",
+            minutes=30,
+            id="scan_suspicious_billing",
             replace_existing=True,
         )
         scheduler.add_job(
@@ -277,6 +360,16 @@ def start_scheduler() -> None:
             id="refresh_budget_actuals",
             replace_existing=True,
         )
+        scheduler.add_job(
+            refresh_clv_snapshots_job,
+            "interval",
+            hours=24,
+            id="refresh_clv_snapshots",
+            replace_existing=True,
+        )
+        for job in scheduler.get_jobs():
+            interval = int(job.trigger.interval.total_seconds())
+            job.modify(func=_exclusive(job.id, job.func, max(int(interval * 0.8), 30)))
         scheduler.start()
         logger.info("APScheduler started successfully.")
 

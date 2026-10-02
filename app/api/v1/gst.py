@@ -26,7 +26,7 @@ async def get_applicability(
     company_id: uuid.UUID,
     financial_year: int | None = None,
     db: AsyncSession = Depends(get_db),
-    _current: CurrentUser = Depends(require_permission("report.export")),
+    _current: CurrentUser = Depends(require_permission("gst.applicability.view")),
 ) -> dict:
     company = await db.get(Company, company_id)
     if company is None:
@@ -40,7 +40,7 @@ async def list_einvoices(
     status_filter: str | None = None,
     store_id: uuid.UUID | None = None,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("report.export")),
+    current: CurrentUser = Depends(require_permission("gst.einvoice.view")),
 ) -> list[EInvoice]:
     if store_id is not None:
         require_store_access(store_id, current)
@@ -57,7 +57,7 @@ async def list_einvoices(
 async def submit_einvoice(
     sale_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("finance.gst_configure")),
+    current: CurrentUser = Depends(require_permission("gst.einvoice.create")),
 ) -> EInvoice:
     sale = await db.get(Sale, sale_id)
     if sale is None:
@@ -76,7 +76,7 @@ async def cancel_einvoice(
     einvoice_id: uuid.UUID,
     payload: EInvoiceCancelIn,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("finance.gst_configure")),
+    current: CurrentUser = Depends(require_permission("gst.einvoice.cancel")),
 ) -> EInvoice:
     einvoice = await db.get(EInvoice, einvoice_id)
     if einvoice is None:

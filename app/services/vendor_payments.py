@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import CurrentUser
 from app.models.models_phase2 import Payable, VendorPayment
 from app.schemas.schemas_phase2 import VendorPaymentIn
-from app.services.approvals import submit_or_apply
+from app.services.approvals import approval_threshold, submit_or_apply
 from app.services.audit import write_audit
 
 PAYMENT_APPROVAL_THRESHOLD = 20000.0
@@ -31,7 +31,7 @@ async def record_payment(db: AsyncSession, *, current: CurrentUser, payable: Pay
     if payload.amount > float(payable.amount_due) + 0.01:
         raise HTTPException(status_code=409, detail=f"Payment {payload.amount} exceeds the outstanding balance {float(payable.amount_due)}")
 
-    if payload.amount > PAYMENT_APPROVAL_THRESHOLD and current.role_code != "super_admin":
+    if payload.amount > await approval_threshold(db, "vendor_payment_approval", PAYMENT_APPROVAL_THRESHOLD) and not current.is_super_admin:
         request = await submit_or_apply(
             db,
             current=current,

@@ -1,13 +1,34 @@
 """Fraud & loss prevention (Phase 2): rule-based detection over data already
 captured since Phase 1 — excessive discounting, high void/return rates, cash
-mismatch, repeated negative stock. Runs on demand here (call from a scheduler,
-e.g. APScheduler or an external cron hitting POST /fraud/scan, in production)."""
+mismatch, repeated negative stock. Point 13 audit fix: this used to be
+callable only on demand with no dedup guard, so clicking "scan" twice in the
+same day inserted duplicate alerts for the identical condition — now
+scheduled (app/services/scheduler.py::run_fraud_scan_job) and each rule
+checks for an existing still-open alert with the same rule_code/store_id/
+subject (cashier or user) raised today before inserting another."""
 
+from datetime import date, datetime, timezone
 
-from sqlalchemy import text
+from fastapi import HTTPException
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.deps import CurrentUser
 from app.models.models_phase2 import FraudAlert
+from app.services.audit import write_audit
+
+
+async def _already_open(db: AsyncSession, *, rule_code: str, store_id, subject_key: str, subject_value: str, today_only: bool = True) -> bool:
+    stmt = select(FraudAlert.id).where(
+        FraudAlert.rule_code == rule_code,
+        FraudAlert.store_id == store_id,
+        FraudAlert.status == "open",
+        FraudAlert.details[subject_key].astext == subject_value,
+    )
+    if today_only:
+        stmt = stmt.where(FraudAlert.created_at >= datetime.combine(date.today(), datetime.min.time(), tzinfo=timezone.utc))
+    existing = (await db.execute(stmt)).scalar_one_or_none()
+    return existing is not None
 
 
 async def run_fraud_scan(db: AsyncSession) -> list[FraudAlert]:
@@ -27,6 +48,8 @@ async def run_fraud_scan(db: AsyncSession) -> list[FraudAlert]:
         )
     ).all()
     for row in excessive_discounts:
+        if await _already_open(db, rule_code="excessive_discount_overrides", store_id=row.store_id, subject_key="cashier_id", subject_value=str(row.cashier_id)):
+            continue
         alert = FraudAlert(
             store_id=row.store_id,
             rule_code="excessive_discount_overrides",
@@ -48,6 +71,8 @@ async def run_fraud_scan(db: AsyncSession) -> list[FraudAlert]:
         )
     ).all()
     for row in cash_mismatches:
+        if await _already_open(db, rule_code="cash_mismatch", store_id=row.store_id, subject_key="shift_id", subject_value=str(row.id)):
+            continue
         alert = FraudAlert(
             store_id=row.store_id,
             rule_code="cash_mismatch",
@@ -63,6 +88,10 @@ async def run_fraud_scan(db: AsyncSession) -> list[FraudAlert]:
         )
     ).all()
     for row in negative_stock:
+        # Not a "today" event — a product sitting negative yesterday is
+        # still negative; dedup must not re-fire every day it stays open.
+        if await _already_open(db, rule_code="negative_stock", store_id=row.store_id, subject_key="product_id", subject_value=str(row.product_id), today_only=False):
+            continue
         alert = FraudAlert(
             store_id=row.store_id,
             rule_code="negative_stock",
@@ -86,6 +115,8 @@ async def run_fraud_scan(db: AsyncSession) -> list[FraudAlert]:
         )
     ).all()
     for row in stock_adjustment_abuse:
+        if await _already_open(db, rule_code="stock_adjustment_abuse", store_id=row.store_id, subject_key="created_by", subject_value=str(row.created_by)):
+            continue
         alert = FraudAlert(
             store_id=row.store_id,
             rule_code="stock_adjustment_abuse",
@@ -113,6 +144,8 @@ async def run_fraud_scan(db: AsyncSession) -> list[FraudAlert]:
         )
     ).all()
     for row in master_data_changes:
+        if await _already_open(db, rule_code="excessive_master_data_changes", store_id=None, subject_key="user_id", subject_value=str(row.user_id)):
+            continue
         alert = FraudAlert(
             store_id=None,
             rule_code="excessive_master_data_changes",
@@ -136,6 +169,8 @@ async def run_fraud_scan(db: AsyncSession) -> list[FraudAlert]:
         )
     ).all()
     for row in repeated_returns:
+        if await _already_open(db, rule_code="repeated_returns", store_id=row.store_id, subject_key="requested_by", subject_value=str(row.requested_by)):
+            continue
         alert = FraudAlert(
             store_id=row.store_id,
             rule_code="repeated_returns",
@@ -146,3 +181,55 @@ async def run_fraud_scan(db: AsyncSession) -> list[FraudAlert]:
         alerts.append(alert)
 
     return alerts
+
+
+async def assign_alert(db: AsyncSession, *, current: CurrentUser, alert_id, assignee_id) -> FraudAlert:
+    alert = await db.get(FraudAlert, alert_id)
+    if alert is None:
+        raise HTTPException(status_code=404, detail="Fraud alert not found")
+    old_assignee = alert.assigned_to
+    alert.assigned_to = assignee_id
+    await write_audit(
+        db,
+        user_id=current.user_id,
+        role_code=current.role_code,
+        store_id=alert.store_id,
+        device_id=current.device_id,
+        action="fraud_alert.assigned",
+        entity_type="fraud_alert",
+        entity_id=alert.id,
+        old_value={"assigned_to": str(old_assignee) if old_assignee else None},
+        new_value={"assigned_to": str(assignee_id)},
+    )
+    return alert
+
+
+async def resolve_alert(db: AsyncSession, *, current: CurrentUser, alert_id, status: str, note: str | None) -> FraudAlert:
+    if status not in ("reviewed", "dismissed"):
+        raise HTTPException(status_code=400, detail="status must be 'reviewed' or 'dismissed'")
+    alert = await db.get(FraudAlert, alert_id)
+    if alert is None:
+        raise HTTPException(status_code=404, detail="Fraud alert not found")
+    if alert.status != "open":
+        raise HTTPException(status_code=409, detail=f"Alert already {alert.status}")
+
+    old_status = alert.status
+    alert.status = status
+    alert.resolved_by = current.user_id
+    alert.resolved_at = datetime.now(timezone.utc)
+    alert.resolution_note = note
+
+    await write_audit(
+        db,
+        user_id=current.user_id,
+        role_code=current.role_code,
+        store_id=alert.store_id,
+        device_id=current.device_id,
+        action=f"fraud_alert.{status}",
+        entity_type="fraud_alert",
+        entity_id=alert.id,
+        old_value={"status": old_status},
+        new_value={"status": status},
+        reason=note,
+    )
+    return alert

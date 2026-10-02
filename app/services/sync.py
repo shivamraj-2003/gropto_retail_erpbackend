@@ -163,6 +163,28 @@ async def process_sale(db: AsyncSession, sale_in: SaleIn) -> SyncItemVerdict:
         db.add(sale)
         await db.flush()
 
+        if override_user_id is not None:
+            # Point 13 audit fix: a manager discount override was stamped
+            # onto the Sale row but never passed through write_audit() —
+            # invisible in the Audit Trail screen even though it's exactly
+            # the POS exception event fraud.py's primary rule reads.
+            await write_audit(
+                db,
+                user_id=sale_in.cashier_id,
+                role_code=role.code,
+                store_id=sale_in.store_id,
+                device_id=sale_in.device_id,
+                action="sale.discount_override",
+                entity_type="sale",
+                entity_id=sale.id,
+                new_value={
+                    "discount_total": discount_total,
+                    "override_user_id": str(override_user_id),
+                    "override_reason": override_reason,
+                },
+                reason=override_reason,
+            )
+
         for idx, item in enumerate(sale_in.items):
             line_taxable, cgst, sgst, igst = line_tax_breakdown[idx]
             db.add(

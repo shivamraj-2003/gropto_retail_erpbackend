@@ -17,7 +17,7 @@ router = APIRouter(prefix="/cash", tags=["cash"])
 async def current_shift(
     device_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    _current: CurrentUser = Depends(require_permission("sale.create")),
+    _current: CurrentUser = Depends(require_permission("pos.shift.view")),
 ) -> dict | None:
     """The device needs to know its own open shift (if any) to record cash
     movements/close without the cashier having to remember a shift id."""
@@ -34,7 +34,7 @@ async def current_shift(
 async def open_shift(
     payload: ShiftOpen,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("sale.create")),
+    current: CurrentUser = Depends(require_permission("pos.shift.create")),
 ) -> dict:
     require_store_access(payload.store_id, current)
     shift = await cash_service.open_shift(db, current=current, payload=payload)
@@ -47,7 +47,7 @@ async def cash_movement(
     shift_id: uuid.UUID,
     payload: CashMovementIn,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("sale.create")),
+    current: CurrentUser = Depends(require_permission("pos.cash_movement.create")),
 ) -> dict:
     shift = await db.get(CashierShift, shift_id)
     if shift is None:
@@ -65,7 +65,7 @@ async def close_shift(
     shift_id: uuid.UUID,
     payload: ShiftClose,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("sale.create")),
+    current: CurrentUser = Depends(require_permission("pos.shift.close")),
 ) -> dict:
     shift = await db.get(CashierShift, shift_id)
     if shift is None:
@@ -86,7 +86,7 @@ async def close_shift(
 async def day_close(
     payload: DayCloseRequest,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("report.export")),
+    current: CurrentUser = Depends(require_permission("store.day_close.close")),
 ) -> dict:
     require_store_access(payload.store_id, current)
     result = await cash_service.close_day(db, current=current, payload=payload)

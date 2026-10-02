@@ -54,7 +54,7 @@ async def _compute_expiry_forecast(db: AsyncSession, store_id: uuid.UUID) -> Exp
 async def get_abc_xyz_analysis(
     store_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("inventory.view")),
+    current: CurrentUser = Depends(require_permission("inventory.intelligence.view")),
 ) -> list[AbcXyzMetric]:
     require_store_access(store_id, current)
     result = await db.execute(select(AbcXyzMetric).where(AbcXyzMetric.store_id == store_id))
@@ -139,7 +139,7 @@ async def _compute_abc_xyz(db: AsyncSession, store_id: uuid.UUID) -> list[AbcXyz
 async def recalculate_abc_xyz(
     store_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("inventory.adjust")),
+    current: CurrentUser = Depends(require_permission("inventory.intelligence.update")),
 ) -> list[AbcXyzMetric]:
     """Point 7 audit fix: ABC/XYZ was previously computed once, lazily, the
     first time the table happened to be empty for a store — and then frozen
@@ -170,7 +170,7 @@ SLOW_STOCK_UNITS_THRESHOLD = 5  # Point 7 audit fix: "slow" now a distinct tier 
 async def dead_slow_stock(
     store_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("inventory.view")),
+    current: CurrentUser = Depends(require_permission("inventory.intelligence.view")),
 ) -> list[dict]:
     """Products sitting in stock with zero/near-zero sales ("dead", <=1 unit
     in 60 days) or meaningfully below-normal sales ("slow", <=5 units) — two
@@ -216,7 +216,7 @@ async def dead_slow_stock(
 async def get_expiry_forecast(
     store_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("inventory.view")),
+    current: CurrentUser = Depends(require_permission("inventory.intelligence.view")),
 ) -> ExpiryForecastSnapshot:
     require_store_access(store_id, current)
     stmt = select(ExpiryForecastSnapshot).where(ExpiryForecastSnapshot.store_id == store_id).order_by(ExpiryForecastSnapshot.generated_at.desc())
@@ -233,7 +233,7 @@ async def sell_through(
     store_id: uuid.UUID,
     days: int = 30,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("inventory.view")),
+    current: CurrentUser = Depends(require_permission("inventory.intelligence.view")),
 ) -> list[dict]:
     """Point 7 audit fix: sell-through didn't exist anywhere in the codebase.
     Formula: units sold in the period / (beginning-of-period inventory +
@@ -299,7 +299,7 @@ async def shrinkage_analytics(
     store_id: uuid.UUID,
     days: int = 90,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("inventory.view")),
+    current: CurrentUser = Depends(require_permission("inventory.intelligence.view")),
 ) -> dict:
     """Point 7 audit fix: "shrinkage" previously existed only as one allowed
     value of ReasonCodeMaster.category — nothing aggregated adjustments
@@ -343,10 +343,110 @@ async def shrinkage_analytics(
     }
 
 
+@router.get("/ageing")
+async def inventory_ageing(
+    store_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(require_permission("inventory.intelligence.view")),
+) -> list[dict]:
+    """Point 18 audit fix: ageing (how long stock has sat, by receipt date)
+    previously existed only as a company-wide aggregate inside
+    dashboard.py's ceo-command-center, with no store filter and no SKU-level
+    list — just four bucket totals. This is the real per-SKU equivalent,
+    bucketed by inventory_batches.created_at, distinct from Expiry (which
+    uses expiry_date, not receipt date)."""
+    require_store_access(store_id, current)
+    rows = (
+        await db.execute(
+            text(
+                """
+                select p.id as product_id, p.name, p.sku, ib.batch_number, ib.quantity, ib.purchase_cost, ib.created_at,
+                       extract(day from now() - ib.created_at) as days_on_hand
+                from inventory_batches ib
+                join products p on p.id = ib.product_id
+                where ib.store_id = :store_id and ib.quantity > 0
+                order by ib.created_at asc
+                """
+            ),
+            {"store_id": str(store_id)},
+        )
+    ).all()
+    result = []
+    for r in rows:
+        days = int(r.days_on_hand)
+        bucket = "0-30 days" if days <= 30 else "31-60 days" if days <= 60 else "61-90 days" if days <= 90 else "90+ days"
+        result.append(
+            {
+                "product_id": str(r.product_id),
+                "name": r.name,
+                "sku": r.sku,
+                "batch_number": r.batch_number,
+                "quantity": float(r.quantity),
+                "value": float(r.quantity) * float(r.purchase_cost),
+                "days_on_hand": days,
+                "age_bucket": bucket,
+            }
+        )
+    return result
+
+
+@router.get("/excess")
+async def excess_stock(
+    store_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(require_permission("inventory.intelligence.view")),
+) -> list[dict]:
+    """Point 18 audit fix: excess (overstocked relative to demand velocity)
+    previously existed only as a company-wide aggregate in dashboard.py's
+    ceo-command-center — no store filter, no SKU-level list. Distinct from
+    Dead Stock (zero/near-zero movement): excess means real but
+    disproportionately slow movement — on-hand qty exceeds 90 days of cover
+    at the trailing-60-day velocity."""
+    require_store_access(store_id, current)
+    rows = (
+        await db.execute(
+            text(
+                """
+                with velocity as (
+                    select si.product_id, sum(si.quantity) as units_60d
+                    from sale_items si join sales s on s.id = si.sale_id
+                    where s.store_id = :store_id and s.status = 'completed' and s.billed_at >= current_date - interval '60 days'
+                    group by si.product_id
+                )
+                select p.id as product_id, p.name, p.sku, ib.quantity, p.purchase_price, v.units_60d
+                from inventory_balances ib
+                join products p on p.id = ib.product_id
+                join velocity v on v.product_id = p.id
+                where ib.store_id = :store_id and ib.quantity > 0
+                  and v.units_60d > 0 and ib.quantity > (v.units_60d / 60.0) * 90
+                order by ib.quantity * p.purchase_price desc
+                """
+            ),
+            {"store_id": str(store_id)},
+        )
+    ).all()
+    result = []
+    for r in rows:
+        daily_velocity = float(r.units_60d) / 60.0
+        days_of_cover = float(r.quantity) / daily_velocity if daily_velocity > 0 else None
+        result.append(
+            {
+                "product_id": str(r.product_id),
+                "name": r.name,
+                "sku": r.sku,
+                "quantity": float(r.quantity),
+                "value_tied_up": float(r.quantity) * float(r.purchase_price),
+                "units_sold_60d": float(r.units_60d),
+                "days_of_cover": round(days_of_cover, 1) if days_of_cover is not None else None,
+            }
+        )
+    return result
+
+
 @router.get("/transfer-recommendations")
 async def transfer_recommendations(
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("inventory.view")),
+    current: CurrentUser = Depends(require_permission("inventory.intelligence.view")),
 ) -> list[dict]:
     """Point 7 audit fix: inter-store transfer recommendations previously
     existed only as narrative text inside two CEO alert descriptions ("...or

@@ -25,7 +25,7 @@ async def payment_mode_reconciliation(
     store_id: uuid.UUID | None = None,
     business_date: date | None = None,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("report.export")),
+    current: CurrentUser = Depends(require_permission("finance.reconciliation.reconcile")),
 ) -> list[dict]:
     """Blueprint §10: "Daily sales and payment reconciliation by store and
     payment mode." Cash mode is cross-checked against that day's bank
@@ -100,7 +100,7 @@ async def payment_mode_reconciliation(
 async def accounting_export(
     business_date: date,
     db: AsyncSession = Depends(get_db),
-    _current: CurrentUser = Depends(require_permission("report.export")),
+    _current: CurrentUser = Depends(require_permission("finance.accounting.export")),
 ) -> dict:
     """Blueprint §10 "Accounting integration/API so ERP remains operational
     source while finance books remain controlled." Exports one business day
@@ -172,7 +172,7 @@ async def accounting_export(
 @router.get("/consolidated-pnl")
 async def consolidated_pnl(
     db: AsyncSession = Depends(get_db),
-    _current: CurrentUser = Depends(require_permission("report.export")),
+    _current: CurrentUser = Depends(require_permission("finance.pnl.view")),
 ) -> dict:
     """Blueprint §10: "Store-wise and consolidated P&L." store_pnl() (services/
     finance.py) only ever computed one store at a time — this rolls every
@@ -226,7 +226,7 @@ async def consolidated_pnl(
 async def list_bank_deposits(
     store_id: uuid.UUID | None = None,
     db: AsyncSession = Depends(get_db),
-    _current: CurrentUser = Depends(require_permission("report.export")),
+    _current: CurrentUser = Depends(require_permission("finance.bank_deposit.view")),
 ) -> list[BankDeposit]:
     stmt = select(BankDeposit).order_by(BankDeposit.business_date.desc())
     if store_id:
@@ -239,7 +239,7 @@ async def list_bank_deposits(
 async def create_bank_deposit(
     payload: BankDepositCreate,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("purchase.manage")),
+    current: CurrentUser = Depends(require_permission("finance.bank_deposit.create")),
 ) -> BankDeposit:
     require_store_access(payload.store_id, current)
     variance = payload.cash_deposited - payload.cash_expected
@@ -254,7 +254,7 @@ async def create_bank_deposit(
 async def list_store_budgets(
     store_id: uuid.UUID | None = None,
     db: AsyncSession = Depends(get_db),
-    _current: CurrentUser = Depends(require_permission("report.export")),
+    _current: CurrentUser = Depends(require_permission("finance.budget.view")),
 ) -> list[StoreBudget]:
     stmt = select(StoreBudget)
     if store_id:
@@ -267,7 +267,7 @@ async def list_store_budgets(
 async def create_store_budget(
     payload: StoreBudgetCreate,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("purchase.manage")),
+    current: CurrentUser = Depends(require_permission("finance.budget.create")),
 ) -> StoreBudget:
     """Point 10 audit fix: StoreBudget had a model, a read-only API, and a
     frontend tab, but no endpoint could ever create a row — the feature was
@@ -292,7 +292,7 @@ async def refresh_budget_actuals(
     financial_year: int,
     month: int,
     db: AsyncSession = Depends(get_db),
-    _current: CurrentUser = Depends(require_permission("report.export")),
+    _current: CurrentUser = Depends(require_permission("finance.budget.update")),
 ) -> dict:
     """Point 10 audit fix: actual_opex/actual_capex had no computation path
     at all — recomputes both from real approved Expense records."""
@@ -305,7 +305,7 @@ async def refresh_budget_actuals(
 async def list_customer_receivables(
     customer_id: uuid.UUID | None = None,
     db: AsyncSession = Depends(get_db),
-    _current: CurrentUser = Depends(require_permission("report.export")),
+    _current: CurrentUser = Depends(require_permission("finance.receivable.view")),
 ) -> list[CustomerReceivable]:
     stmt = select(CustomerReceivable)
     if customer_id:

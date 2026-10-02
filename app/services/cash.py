@@ -8,11 +8,11 @@ from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import ENTERPRISE_WIDE_ROLES, CurrentUser
+from app.api.deps import CurrentUser
 from app.models.models import Payment, Sale
 from app.models.models_phase2 import CashierShift, CashMovement, DayClose
 from app.schemas.schemas_phase2 import CashMovementIn, DayCloseRequest, ShiftClose, ShiftOpen
-from app.services.approvals import submit_or_apply
+from app.services.approvals import approval_threshold, submit_or_apply
 from app.services.audit import write_audit
 
 VARIANCE_TOLERANCE = 50.0
@@ -20,7 +20,6 @@ VARIANCE_TOLERANCE = 50.0
 # any amount, no review. Store managers and above can still move cash
 # directly; a plain cashier's movement above this queues for approval.
 CASH_MOVEMENT_APPROVAL_THRESHOLD = 2000.0
-SHIFT_OWNERSHIP_BYPASS_ROLES = ENTERPRISE_WIDE_ROLES + ("store_manager", "regional_manager")
 
 
 def _assert_owns_shift(current: CurrentUser, shift: CashierShift) -> None:
@@ -30,7 +29,9 @@ def _assert_owns_shift(current: CurrentUser, shift: CashierShift) -> None:
     act on it; a peer cashier may not."""
     if shift.cashier_id == current.user_id:
         return
-    if current.role_code in SHIFT_OWNERSHIP_BYPASS_ROLES:
+    # Point 14: was a hardcoded role list (enterprise roles + store/regional
+    # manager); those roles were migrated onto pos.shift.override.
+    if current.has_permission("pos.shift.override"):
         return
     raise HTTPException(status_code=403, detail="You do not own this shift")
 
@@ -64,7 +65,7 @@ async def record_cash_movement(
 ) -> CashMovement | dict:
     _assert_owns_shift(current, shift)
 
-    if payload.amount > CASH_MOVEMENT_APPROVAL_THRESHOLD and current.role_code != "super_admin":
+    if payload.amount > await approval_threshold(db, "cash_movement_approval", CASH_MOVEMENT_APPROVAL_THRESHOLD) and not current.is_super_admin:
         request = await submit_or_apply(
             db,
             current=current,
@@ -200,6 +201,30 @@ async def close_shift(db: AsyncSession, *, current: CurrentUser, shift: CashierS
 
 
 async def close_day(db: AsyncSession, *, current: CurrentUser, payload: DayCloseRequest) -> DayClose:
+    # Point 16 audit fix: this previously silently excluded any still-open
+    # cashier shift from the day's reconciliation instead of blocking the
+    # close — a store could "close" for the day while a till remained open,
+    # with that till's cash left out of total_expected_cash/
+    # total_counted_cash/variance with no warning. Store Close must depend
+    # on Cashier Close actually completing first.
+    open_shifts = (
+        await db.execute(
+            select(CashierShift).where(
+                CashierShift.store_id == payload.store_id,
+                CashierShift.status == "open",
+            )
+        )
+    ).scalars().all()
+    still_open_for_date = [s for s in open_shifts if s.opened_at.date() <= payload.business_date]
+    if still_open_for_date:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{len(still_open_for_date)} cashier shift(s) opened on or before {payload.business_date} "
+                "are still open for this store — close every till before closing the day."
+            ),
+        )
+
     shifts = (
         await db.execute(
             select(CashierShift).where(

@@ -16,7 +16,7 @@ async def insights(
     store_id: uuid.UUID,
     question: str | None = None,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("report.export")),
+    current: CurrentUser = Depends(require_permission("ai.insight.view")),
 ) -> dict:
     require_store_access(store_id, current)
     return await get_insight(db, store_id=store_id, question=question)

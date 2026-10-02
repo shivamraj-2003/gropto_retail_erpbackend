@@ -5,7 +5,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser, require_permission, require_store_access
-from app.core.database import get_db
+from app.core.database import get_reporting_db
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
 
@@ -28,8 +28,8 @@ async def _evaluate_alerts_safely(db: AsyncSession) -> None:
 @router.get("/store/{store_id}")
 async def store_dashboard(
     store_id: uuid.UUID,
-    db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("report.export")),
+    db: AsyncSession = Depends(get_reporting_db),
+    current: CurrentUser = Depends(require_permission("dashboard.store.view")),
 ) -> dict:
     require_store_access(store_id, current)
     row = (
@@ -81,8 +81,8 @@ async def store_dashboard(
 @router.get("/store/{store_id}/trend")
 async def store_sales_trend(
     store_id: uuid.UUID,
-    db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("report.export")),
+    db: AsyncSession = Depends(get_reporting_db),
+    current: CurrentUser = Depends(require_permission("dashboard.store.view")),
 ) -> dict:
     """Last 14 days of revenue + a top-10 products-by-revenue breakdown —
     backs the dashboard charts and answers "where sales are highest/lowest"
@@ -132,8 +132,8 @@ async def store_sales_trend(
 
 @router.get("/company")
 async def company_dashboard(
-    db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("report.export")),
+    db: AsyncSession = Depends(get_reporting_db),
+    current: CurrentUser = Depends(require_permission("dashboard.ceo.view")),
 ) -> dict:
     """Company-wide dashboard, real aggregates. Point 2 audit fix: this used
     to run with no store-scope filter at all regardless of caller — fine by
@@ -203,8 +203,8 @@ async def company_dashboard(
 
 @router.get("/ceo-command-center")
 async def ceo_command_center(
-    db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("report.export")),
+    db: AsyncSession = Depends(get_reporting_db),
+    current: CurrentUser = Depends(require_permission("dashboard.ceo.view")),
 ) -> dict:
     """The 9-block CEO home screen (blueprint §3/§22) in one call: Sales,
     Margin, Stores, Inventory, Warehouse, Customers, Finance, Online, Control

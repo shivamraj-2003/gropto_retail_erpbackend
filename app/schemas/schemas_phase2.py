@@ -393,6 +393,19 @@ class WarehouseOut(BaseModel):
     code: str
     name: str
     city: str | None
+    is_active: bool
+
+
+class WarehouseCreateIn(BaseModel):
+    code: str
+    name: str
+    city: str | None = None
+
+
+class WarehouseUpdateIn(BaseModel):
+    name: str | None = None
+    city: str | None = None
+    is_active: bool | None = None
 
 
 class StoreOut(BaseModel):
@@ -411,6 +424,7 @@ class StoreOut(BaseModel):
     company_id: uuid.UUID | None = None
     gstin: str | None = None
     state: str | None = None
+    is_active: bool = True
 
 
 class StoreCreateIn(BaseModel):
@@ -444,6 +458,10 @@ class StoreUpdateIn(BaseModel):
     company_id: uuid.UUID | None = None
     gstin: str | None = None
     state: str | None = None
+    # Point 15 audit fix: the is_active column existed on Store from day
+    # one, but no endpoint anywhere could ever set it to False — a closed
+    # store could never be deactivated through the app.
+    is_active: bool | None = None
 
 
 class StoreUpdateResult(BaseModel):
@@ -564,3 +582,7 @@ class FraudAlertOut(BaseModel):
     details: dict
     status: str
     created_at: datetime
+    assigned_to: uuid.UUID | None
+    resolved_by: uuid.UUID | None
+    resolved_at: datetime | None
+    resolution_note: str | None

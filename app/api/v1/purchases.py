@@ -20,7 +20,7 @@ async def list_vendors(
     db: AsyncSession = Depends(get_db),
     # Read access is broader than write: anyone entering a purchase needs to see
     # the vendor list, but only vendor.manage holders can create/edit a vendor.
-    _current: CurrentUser = Depends(require_permission("purchase.manage")),
+    _current: CurrentUser = Depends(require_permission("vendor.vendor.view")),
 ) -> list[Vendor]:
     result = await db.execute(select(Vendor).where(Vendor.is_active.is_(True)))
     return list(result.scalars().all())
@@ -30,7 +30,7 @@ async def list_vendors(
 async def create_vendor(
     payload: VendorCreate,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("vendor.manage")),
+    current: CurrentUser = Depends(require_permission("vendor.vendor.create")),
 ) -> Vendor:
     # Point 6 audit fix: no duplicate-vendor prevention existed at all.
     if payload.gst_number:
@@ -62,7 +62,7 @@ async def update_vendor(
     vendor_id: uuid.UUID,
     payload: VendorUpdateIn,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("vendor.manage")),
+    current: CurrentUser = Depends(require_permission("vendor.vendor.update")),
 ) -> Vendor:
     """Point 6 audit fix: vendors could previously be created but never
     edited or deactivated — this is the entire missing update/deactivate
@@ -124,7 +124,7 @@ async def update_vendor(
 async def create_purchase(
     payload: PurchaseCreate,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("purchase.manage")),
+    current: CurrentUser = Depends(require_permission("procurement.purchase.create")),
 ) -> Purchase:
     """P1 scope: direct purchase entry with immediate stock-in (online only — the
     back office has connectivity). PO/GRN/three-way-match workflow is Phase 2."""
@@ -177,7 +177,7 @@ async def list_purchases(
     limit: int = 50,
     offset: int = 0,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("purchase.manage")),
+    current: CurrentUser = Depends(require_permission("procurement.purchase.view")),
 ) -> list[Purchase]:
     stmt = select(Purchase).order_by(Purchase.created_at.desc()).offset(offset).limit(limit)
     if store_id:
