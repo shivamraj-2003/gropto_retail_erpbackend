@@ -498,7 +498,7 @@ async def list_user_access(
         like = f"%{search.strip()}%"
         stmt = stmt.where(or_(User.full_name.ilike(like), User.email.ilike(like), User.phone.ilike(like)))
     if not current.sees_all_stores():
-        stmt = stmt.join(UserStore, UserStore.user_id == User.id).where(UserStore.store_id.in_(current.store_ids)).distinct()
+        stmt = stmt.outerjoin(UserStore, UserStore.user_id == User.id).where(or_(UserStore.store_id.in_(current.store_ids), User.id == current.user_id)).distinct()
     users = (await db.execute(stmt.order_by(User.full_name).limit(min(limit, 200)))).scalars().all()
     return [await _access_out(db, u) for u in users]
 

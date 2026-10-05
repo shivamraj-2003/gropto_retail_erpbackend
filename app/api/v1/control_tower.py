@@ -67,7 +67,7 @@ async def _evaluate_ceo_alerts(db: AsyncSession) -> list[CeoAlert]:
         if source_id is not None:
             stmt = stmt.where(CeoAlert.source_id == source_id)
         existing = await db.execute(stmt)
-        return existing.scalar_one_or_none() is not None
+        return existing.scalars().first() is not None
 
     sales_decline_rows = (
         await db.execute(
@@ -613,7 +613,7 @@ async def _already_logged_today(db: AsyncSession, *, store_id, cashier_id) -> bo
             ),
             {"store_id": store_id, "cashier_id": cashier_id},
         )
-    ).scalar_one_or_none()
+    ).first()
     return existing is not None
 
 

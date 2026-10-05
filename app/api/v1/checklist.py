@@ -10,6 +10,7 @@ from datetime import date, datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser, require_permission, require_store_access
@@ -41,6 +42,27 @@ async def list_completions(
     items = (
         await db.execute(select(OperationalChecklistItem).where(OperationalChecklistItem.is_active.is_(True)))
     ).scalars().all()
+
+    if items:
+        values = [
+            {
+                "checklist_item_id": item.id,
+                "store_id": store_id,
+                "business_date": business_date,
+                "status": "pending",
+            }
+            for item in items
+        ]
+        stmt = (
+            pg_insert(StoreChecklistCompletion)
+            .values(values)
+            .on_conflict_do_nothing(
+                index_elements=["checklist_item_id", "store_id", "business_date"]
+            )
+        )
+        await db.execute(stmt)
+        await db.commit()
+
     existing = (
         await db.execute(
             select(StoreChecklistCompletion).where(
@@ -49,14 +71,7 @@ async def list_completions(
             )
         )
     ).scalars().all()
-    existing_item_ids = {c.checklist_item_id for c in existing}
-    for item in items:
-        if item.id not in existing_item_ids:
-            completion = StoreChecklistCompletion(checklist_item_id=item.id, store_id=store_id, business_date=business_date)
-            db.add(completion)
-            existing.append(completion)
-    await db.commit()
-    return existing
+    return list(existing)
 
 
 @router.post("/completions/{completion_id}/complete", response_model=ChecklistCompletionOut)

@@ -48,6 +48,8 @@ class CurrentUser:
         return self.is_super_admin or code in self.permissions
 
     def sees_all_stores(self) -> bool:
+        if self.is_super_admin:
+            return True
         if self.access is not None:
             return self.access.global_scope
         return self.role_code in ENTERPRISE_WIDE_ROLES
