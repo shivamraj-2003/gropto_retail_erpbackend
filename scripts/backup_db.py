@@ -53,7 +53,7 @@ def main() -> int:
     partial = target.with_suffix(".dump.partial")
 
     result = subprocess.run(
-        ["pg_dump", "--format=custom", "--no-owner", "--file", str(partial), _libpq_url(settings.database_url)],
+        ["pg_dump", "--format=custom", "--no-owner", "--file", str(partial), _libpq_url(settings.migration_database_url or settings.database_url)],
         capture_output=True,
         text=True,
     )

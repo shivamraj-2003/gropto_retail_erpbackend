@@ -23,7 +23,7 @@ target_metadata = Base.metadata
 def _sync_url() -> str:
     """Alembic runs migrations synchronously; the app uses asyncpg at runtime, so
     swap the driver for psycopg2 here only, for the migration connection."""
-    return settings.database_url.replace("postgresql+asyncpg://", "postgresql+psycopg2://")
+    return (settings.migration_database_url or settings.database_url).replace("postgresql+asyncpg://", "postgresql+psycopg2://")
 
 
 def run_migrations_offline() -> None:

@@ -69,6 +69,19 @@ class Settings(BaseSettings):
     # the Supabase pooler's 15-connection cap.
     reporting_pool_size: int = 2
     reporting_max_overflow: int = 1
+    # Main pool. Defaults fit the Supabase SESSION pooler (port 5432, 15 cap).
+    # On the TRANSACTION pooler (port 6543) many app connections share few
+    # server connections, so these can be raised (e.g. 20 + 20) per worker.
+    db_pool_size: int = 5
+    db_max_overflow: int = 5
+    # Seconds a request waits for a free connection before failing fast with
+    # an error, rather than hanging until the gateway times out.
+    db_pool_timeout: int = 10
+    # Recycle connections so a pooler/firewall idle-kill never hands out a dead one.
+    db_pool_recycle: int = 1800
+    # Optional direct/session-mode URL for Alembic migrations and pg_dump
+    # backups (they need a real session; the transaction pooler can break them).
+    migration_database_url: str = ""
 
     # Redis (Upstash). REDIS_URL (rediss://… TCP, TLS) is preferred — it backs
     # rate limiting, login lockout, cross-process permission-cache
