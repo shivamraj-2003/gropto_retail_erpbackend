@@ -18,6 +18,7 @@ from app.api.deps import CurrentUser, get_current_user
 from app.core.database import get_db
 from app.models.models import Customer, Product, Sale, Store, User, Vendor
 from app.models.models_phase2 import Grn, Warehouse
+from app.models.models_phase3 import Employee
 from app.models.models_phase4 import PromotionRule
 
 router = APIRouter(prefix="/lookups", tags=["lookups"])
@@ -38,6 +39,7 @@ KIND_PERMISSIONS: dict[str, tuple[str, ...] | None] = {
     "customer": ("crm.customer.view", "pos.customer.view", "oms.order.view"),
     "sale": ("pos.return.view", "gst.einvoice.view", "finance.expense.view", "reports.sales.export", "pos.sale.create"),
     "grn": ("receiving.grn.view",),
+    "employee": ("hr.employee.view", "hr.transfer.view", "workforce.shift.view"),
     "promotion_rule": ("promotion.rule.view", "promotion.analytics.view"),
 }
 
@@ -88,6 +90,9 @@ async def resolve_names(
             for sid, bill, store_id in rows:
                 if current.owns_store(store_id):
                     labels[str(sid)] = bill
+        elif kind == "employee":
+            for eid, name, designation in (await db.execute(select(Employee.id, Employee.name, Employee.designation).where(Employee.id.in_(ids)))).all():
+                labels[str(eid)] = f"{name} ({designation})" if name else designation
         elif kind == "grn":
             for gid, number in (await db.execute(select(Grn.id, Grn.grn_number).where(Grn.id.in_(ids)))).all():
                 if number:
