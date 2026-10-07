@@ -7,6 +7,7 @@ from app.api.v1 import (
     auth,
     cash,
     checklist,
+    lookups,
     rbac,
     control_tower,
     crm,
@@ -90,3 +91,4 @@ api_router.include_router(control_tower.router)
 api_router.include_router(master_data.router)
 api_router.include_router(checklist.router)
 api_router.include_router(rbac.router)
+api_router.include_router(lookups.router)

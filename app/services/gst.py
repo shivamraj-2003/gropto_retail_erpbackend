@@ -3,16 +3,16 @@ aggregation, and e-invoice applicability (Point 10 audit fix — none of this
 existed; GST handling was intra-state-only with no way to ever compute it
 correctly otherwise).
 
-Applicability and turnover are deliberately modelled at the Company (GSTIN/
-PAN-bearing legal entity) level, never at the individual Store level — e-
+Applicability and turnover are deliberately never judged per Store: e-
 invoicing's AATO (Aggregate Annual Turnover) threshold is a PAN-wide
-regulatory fact, and a single store's revenue is not a valid proxy for it.
+regulatory fact, so turnover is summed over every store of every company
+sharing a PAN, and a single store's revenue is not a valid proxy for it.
 """
 
 import uuid
-from datetime import date
+from datetime import date, datetime, timezone
 
-from sqlalchemy import select
+from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.models import Sale, Store
@@ -64,50 +64,127 @@ def split_tax(line_net: float, rate: float, *, inter_state: bool) -> tuple[float
     return taxable, tax / 2, tax / 2, 0.0
 
 
-async def compute_turnover(db: AsyncSession, *, company_id: uuid.UUID, financial_year: int) -> float:
-    """Aggregate Annual Turnover for one GSTIN/company, across every store
-    linked to it — the correct grouping level per §15 of this audit, not
-    per-store. Indian FY runs Apr 1 -> Mar 31."""
-    fy_start = date(financial_year, 4, 1)
-    fy_end = date(financial_year + 1, 3, 31)
-    store_ids = (
-        await db.execute(select(Store.id).where(Store.company_id == company_id))
+#: E-invoicing threshold: Aggregate Annual Turnover above ₹5 crore (CBIC
+#: notification, in force since 1 Aug 2023). Used when a company has no
+#: threshold of its own; a company's aato_threshold overrides it.
+DEFAULT_AATO_THRESHOLD = 5_00_00_000.0
+
+
+def current_financial_year(today: date | None = None) -> int:
+    today = today or date.today()
+    return today.year if today.month >= 4 else today.year - 1
+
+
+async def _group_company_ids(db: AsyncSession, company: Company) -> list[uuid.UUID]:
+    """Every company the threshold is measured across. AATO is a PAN-wide
+    figure — all GSTINs (one per state) under the same PAN add up — so when
+    the company has a PAN, its siblings count too. Without a PAN the company
+    stands alone."""
+    if not company.pan:
+        return [company.id]
+    ids = (
+        await db.execute(select(Company.id).where(func.upper(Company.pan) == company.pan.strip().upper()))
     ).scalars().all()
-    if not store_ids:
-        return 0.0
-    total = (
+    return list(ids) or [company.id]
+
+
+async def turnover_by_store(db: AsyncSession, *, company: Company, financial_year: int) -> list[dict]:
+    """Completed-sale turnover for the financial year, one row per store, for
+    every store under the company's PAN group (Indian FY: 1 Apr -> 31 Mar)."""
+    fy_start = datetime(financial_year, 4, 1, tzinfo=timezone.utc)
+    fy_end = datetime(financial_year + 1, 4, 1, tzinfo=timezone.utc)  # exclusive: includes all of 31 Mar
+    company_ids = await _group_company_ids(db, company)
+    rows = (
         await db.execute(
-            select(Sale.grand_total).where(
-                Sale.store_id.in_(store_ids),
-                Sale.status == "completed",
-                Sale.billed_at >= fy_start,
-                Sale.billed_at <= fy_end,
+            select(Store.id, Store.code, Store.name, Store.company_id, func.coalesce(func.sum(Sale.grand_total), 0))
+            .select_from(Store)
+            .outerjoin(
+                Sale,
+                and_(
+                    Sale.store_id == Store.id,
+                    Sale.status == "completed",
+                    Sale.billed_at >= fy_start,
+                    Sale.billed_at < fy_end,
+                ),
             )
+            .where(Store.company_id.in_(company_ids))
+            .group_by(Store.id, Store.code, Store.name, Store.company_id)
+            .order_by(Store.code)
         )
-    ).scalars().all()
-    return round(float(sum(total)), 2)
+    ).all()
+    return [
+        {"store_id": str(sid), "code": code, "name": name, "company_id": str(cid), "turnover": round(float(total), 2)}
+        for sid, code, name, cid, total in rows
+    ]
+
+
+async def compute_turnover(db: AsyncSession, *, company: Company, financial_year: int) -> float:
+    """Aggregate Annual Turnover across every store of every company under
+    the same PAN — never one store, never one GSTIN in isolation."""
+    stores = await turnover_by_store(db, company=company, financial_year=financial_year)
+    return round(sum(s["turnover"] for s in stores), 2)
+
+
+def effective_threshold(company: Company) -> float:
+    return float(company.aato_threshold) if company.aato_threshold is not None else DEFAULT_AATO_THRESHOLD
+
+
+async def is_einvoice_required(db: AsyncSession, *, company: Company, as_of: date | None = None) -> bool:
+    """E-invoicing is mandatory once AATO exceeded the threshold in any
+    *preceding* financial year, so it is judged on last year's PAN-wide
+    turnover — or because Finance flagged the company explicitly (e.g. an
+    entity that opted in, or crossed in an earlier year)."""
+    if company.einvoice_applicable:
+        return True
+    fy = current_financial_year(as_of)
+    return await compute_turnover(db, company=company, financial_year=fy - 1) > effective_threshold(company)
 
 
 async def check_einvoice_applicability(db: AsyncSession, *, company: Company, financial_year: int) -> dict:
-    """Reports applicability — never auto-derives it from a hardcoded
-    threshold. Company.einvoice_applicable is the actual regulatory fact,
-    set explicitly by Finance; aato_threshold (if configured) only drives an
-    informational warning once turnover crosses it, so Finance knows to
-    re-check the determination — it never flips einvoice_applicable itself."""
-    turnover = await compute_turnover(db, company_id=company.id, financial_year=financial_year)
+    """Applicability for one company, measured across its whole PAN group.
+
+    * einvoice_applicable — the flag Finance set on this company.
+    * einvoice_required — what actually applies: the flag, or last FY's
+      PAN-wide turnover above the threshold (default ₹5 crore).
+    * stores — the per-store turnover that adds up to the total, so it's
+      clear the threshold is judged on the sum, not on any one store."""
+    stores = await turnover_by_store(db, company=company, financial_year=financial_year)
+    turnover = round(sum(s["turnover"] for s in stores), 2)
+    previous = await compute_turnover(db, company=company, financial_year=financial_year - 1)
+    threshold = effective_threshold(company)
+    group_ids = await _group_company_ids(db, company)
+    group_names = (
+        await db.execute(select(Company.name, Company.gstin).where(Company.id.in_(group_ids)).order_by(Company.name))
+    ).all()
+
+    required = bool(company.einvoice_applicable) or previous > threshold
     warning = None
-    if company.aato_threshold is not None and turnover >= float(company.aato_threshold) and not company.einvoice_applicable:
+    if not required and turnover > threshold:
         warning = (
-            f"Turnover ₹{turnover:,.2f} has crossed the configured AATO threshold "
-            f"₹{float(company.aato_threshold):,.2f} — confirm e-invoice applicability with Finance."
+            f"Turnover across all stores under this PAN is ₹{turnover:,.2f} this year, above the "
+            f"₹{threshold:,.0f} threshold — e-invoicing becomes mandatory from next financial year. "
+            "Set the company as e-invoice applicable earlier if you want to start now."
         )
+    elif required and not company.einvoice_applicable:
+        warning = (
+            f"Last year's turnover across all stores under this PAN (₹{previous:,.2f}) exceeded "
+            f"₹{threshold:,.0f}, so e-invoicing applies to every GSTIN under it."
+        )
+    if not stores:
+        warning = "No stores are linked to this company yet — link stores to it (Stores → Parent Company) so their sales count."
     return {
         "company_id": str(company.id),
         "gstin": company.gstin,
         "pan": company.pan,
         "financial_year": financial_year,
         "turnover": turnover,
+        "previous_year_turnover": previous,
         "aato_threshold": float(company.aato_threshold) if company.aato_threshold is not None else None,
+        "effective_threshold": threshold,
         "einvoice_applicable": company.einvoice_applicable,
+        "einvoice_required": required,
+        "scope": "PAN" if company.pan else "Company",
+        "companies_in_scope": [{"name": n, "gstin": g} for n, g in group_names],
+        "stores": stores,
         "warning": warning,
     }

@@ -27,7 +27,7 @@ from app.core.config import settings
 from app.models.models import Sale, Store
 from app.models.models_phase4 import Company, EInvoice
 from app.services.audit import write_audit
-from app.services.gst import GST_STATE_CODES
+from app.services.gst import GST_STATE_CODES, is_einvoice_required
 
 MAX_RETRY_COUNT = 5
 
@@ -105,10 +105,11 @@ async def get_or_create_einvoice(db: AsyncSession, *, sale: Sale, company: Compa
     existing = result.scalar_one_or_none()
     if existing is not None:
         return existing
+    required = bool(company) and await is_einvoice_required(db, company=company, as_of=sale.billed_at.date() if sale.billed_at else None)
     einvoice = EInvoice(
         sale_id=sale.id,
         company_id=company.id if company else None,
-        status="pending" if (company and company.einvoice_applicable) else "not_applicable",
+        status="pending" if required else "not_applicable",
     )
     db.add(einvoice)
     await db.flush()
@@ -127,8 +128,18 @@ async def submit_einvoice(
 
     if einvoice.status == "irn_generated":
         return einvoice  # idempotent: already succeeded, never resubmit
+    if company is None:
+        raise HTTPException(
+            status_code=409,
+            detail="This sale's store isn't linked to a company, so e-invoice applicability can't be determined. "
+            "Link the store to its company (Stores → Parent Company) first.",
+        )
     if einvoice.status == "not_applicable":
-        raise HTTPException(status_code=409, detail="This sale's company is not configured as e-invoice applicable")
+        raise HTTPException(
+            status_code=409,
+            detail="E-invoicing doesn't apply yet: turnover across all stores under this company's PAN hasn't "
+            "exceeded the threshold (₹5 crore by default), and it isn't flagged applicable.",
+        )
     if einvoice.status == "cancelled":
         raise HTTPException(status_code=409, detail="This e-invoice was cancelled; cannot resubmit the same sale")
 
