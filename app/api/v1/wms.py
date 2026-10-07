@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import CurrentUser, require_permission, require_store_access, require_warehouse_access
 from app.core.database import get_db
 from app.models.models import Product
+from app.models.models_phase2 import Warehouse
 from app.models.models_phase2 import Transfer
 from app.models.models_phase4 import (
     InventoryBatch,
@@ -33,6 +34,7 @@ from app.schemas.schemas_phase4 import (
     WmsPickListTaskOut,
 )
 from app.services.audit import write_audit
+from app.services.inventory import adjust_warehouse_balance, get_warehouse_balance
 from app.services.transfers import dispatch_transfer
 
 router = APIRouter(prefix="/wms", tags=["wms"])
@@ -278,6 +280,67 @@ async def _fefo_suggestion(db: AsyncSession, warehouse_id: uuid.UUID, product_id
     return (await db.execute(stmt)).scalars().first()
 
 
+# A pick depletes batches immediately but the warehouse balance only at
+# dispatch, so "picked but not yet dispatched" sits in the balance and not in
+# the batches. Open pick tasks reserve what they still have to pick.
+_PICKED_NOT_DISPATCHED = ("picking", "picked", "packed")
+_STILL_TO_PICK = ("pending", "picking")
+
+
+async def _stock_position(db: AsyncSession, warehouse_id: uuid.UUID, product_id: uuid.UUID) -> dict:
+    """Unpicked stock physically in the warehouse, and how much of it open
+    pick lists already claim. The two stock records (warehouse_balances and
+    inventory_batches) are both kept by GRN, but transfers only touch the
+    balance and some older data only has batches — so on-hand is the larger
+    of the two views rather than trusting either one alone."""
+    batch_qty = float(
+        (
+            await db.execute(
+                select(func.coalesce(func.sum(InventoryBatch.quantity), 0)).where(
+                    InventoryBatch.warehouse_id == warehouse_id,
+                    InventoryBatch.product_id == product_id,
+                    InventoryBatch.quantity > 0,
+                )
+            )
+        ).scalar_one()
+    )
+    balance = await get_warehouse_balance(db, product_id=product_id, warehouse_id=warehouse_id)
+    picked_open = float(
+        (
+            await db.execute(
+                select(func.coalesce(func.sum(WmsPickListTask.picked_qty), 0)).where(
+                    WmsPickListTask.warehouse_id == warehouse_id,
+                    WmsPickListTask.product_id == product_id,
+                    WmsPickListTask.status.in_(_PICKED_NOT_DISPATCHED),
+                )
+            )
+        ).scalar_one()
+    )
+    reserved = float(
+        (
+            await db.execute(
+                select(func.coalesce(func.sum(WmsPickListTask.requested_qty - WmsPickListTask.picked_qty), 0)).where(
+                    WmsPickListTask.warehouse_id == warehouse_id,
+                    WmsPickListTask.product_id == product_id,
+                    WmsPickListTask.status.in_(_STILL_TO_PICK),
+                )
+            )
+        ).scalar_one()
+    )
+    on_hand = max(float(balance) - picked_open, batch_qty, 0.0)
+    return {"on_hand": on_hand, "reserved": reserved, "free": max(on_hand - reserved, 0.0)}
+
+
+async def _names(db: AsyncSession, warehouse_id: uuid.UUID, product_id: uuid.UUID) -> tuple[str, str]:
+    product = await db.get(Product, product_id)
+    warehouse = await db.get(Warehouse, warehouse_id)
+    return (product.name if product else str(product_id)), (warehouse.code if warehouse else str(warehouse_id))
+
+
+def _fmt(qty: float) -> str:
+    return f"{qty:g}"
+
+
 @router.post("/pick-lists", response_model=list[WmsPickListTaskOut], status_code=201)
 async def create_pick_list(
     payload: PickListCreate,
@@ -290,6 +353,25 @@ async def create_pick_list(
     so this is the warehouse's first active location, not a per-batch one)."""
     for line in payload.lines:
         require_warehouse_access(line.warehouse_id, current)
+    # Stock check up front: a pick list for stock that isn't there only fails
+    # later, at the picker's scanner. Lines for the same product in one
+    # request add up.
+    requested: dict[tuple[uuid.UUID, uuid.UUID], float] = {}
+    for line in payload.lines:
+        k = (line.warehouse_id, line.product_id)
+        requested[k] = requested.get(k, 0.0) + float(line.requested_qty)
+    for (warehouse_id, product_id), qty in requested.items():
+        pos = await _stock_position(db, warehouse_id, product_id)
+        if qty > pos["free"]:
+            name, wh = await _names(db, warehouse_id, product_id)
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Not enough {name} in {wh}: requested {_fmt(qty)}, free to pick {_fmt(pos['free'])} "
+                    f"({_fmt(pos['on_hand'])} on hand, {_fmt(pos['reserved'])} already on open pick lists). "
+                    "Receive stock (GRN or transfer) into this warehouse first."
+                ),
+            )
     created: list[dict] = []
     for line in payload.lines:
         location = (
@@ -338,7 +420,7 @@ async def list_pick_lists(
     status_filter: str | None = None,
     db: AsyncSession = Depends(get_db),
     current: CurrentUser = Depends(require_permission("wms.pick.view")),
-) -> list[WmsPickListTask]:
+) -> list[dict]:
     stmt = select(WmsPickListTask)
     if warehouse_id:
         require_warehouse_access(warehouse_id, current)
@@ -347,8 +429,17 @@ async def list_pick_lists(
         stmt = stmt.where(WmsPickListTask.warehouse_id.in_(current.access.warehouse_ids))
     if status_filter:
         stmt = stmt.where(WmsPickListTask.status == status_filter)
-    result = await db.execute(stmt.order_by(WmsPickListTask.created_at.desc()))
-    return list(result.scalars().all())
+    tasks = list((await db.execute(stmt.order_by(WmsPickListTask.created_at.desc()))).scalars().all())
+    positions: dict[tuple[uuid.UUID, uuid.UUID], dict] = {}
+    out: list[dict] = []
+    for t in tasks:
+        k = (t.warehouse_id, t.product_id)
+        if t.status in _STILL_TO_PICK and k not in positions:
+            positions[k] = await _stock_position(db, *k)
+        row = {c.name: getattr(t, c.name) for c in t.__table__.columns}
+        row["available_qty"] = positions[k]["on_hand"] if k in positions else None
+        out.append(row)
+    return out
 
 
 @router.post("/pick-lists/{task_id}/pick", response_model=WmsPickListTaskOut)
@@ -380,22 +471,40 @@ async def confirm_pick(
         if task.zone_location_id is None or payload.scanned_location_id != task.zone_location_id:
             raise HTTPException(status_code=409, detail="Scanned location does not match this pick task's assigned location")
 
-    remaining = payload.picked_qty
-    batches = (
-        await db.execute(
-            select(InventoryBatch)
-            .where(InventoryBatch.warehouse_id == task.warehouse_id, InventoryBatch.product_id == task.product_id, InventoryBatch.quantity > 0)
-            .order_by(InventoryBatch.expiry_date.asc().nulls_last(), InventoryBatch.created_at.asc())
-        )
-    ).scalars().all()
-    for batch in batches:
-        if remaining <= 0:
-            break
-        take = min(float(batch.quantity), remaining)
-        batch.quantity = float(batch.quantity) - take
-        remaining -= take
-    if remaining > 0:
-        raise HTTPException(status_code=409, detail=f"Only {payload.picked_qty - remaining} units available across batches for this product")
+    # Only the increase over what was already picked moves stock — re-confirming
+    # a partial pick used to deplete the batches a second time.
+    already = float(task.picked_qty or 0)
+    delta = float(payload.picked_qty) - already
+    if delta < 0:
+        raise HTTPException(status_code=400, detail=f"Already picked {_fmt(already)}; picked quantity can't go down")
+    if delta > 0:
+        pos = await _stock_position(db, task.warehouse_id, task.product_id)
+        if delta > pos["on_hand"]:
+            name, wh = await _names(db, task.warehouse_id, task.product_id)
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Only {_fmt(pos['on_hand'])} units of {name} in stock at {wh} — can't pick {_fmt(delta)}. "
+                    "Receive stock into this warehouse, or pick what's there and cancel the rest."
+                ),
+            )
+        # FEFO: soonest-expiring batches first. Stock that arrived without
+        # batch records (transfers) has nothing to deplete here — it's covered
+        # by the balance, which dispatch decrements.
+        remaining = delta
+        batches = (
+            await db.execute(
+                select(InventoryBatch)
+                .where(InventoryBatch.warehouse_id == task.warehouse_id, InventoryBatch.product_id == task.product_id, InventoryBatch.quantity > 0)
+                .order_by(InventoryBatch.expiry_date.asc().nulls_last(), InventoryBatch.created_at.asc())
+            )
+        ).scalars().all()
+        for batch in batches:
+            if remaining <= 0:
+                break
+            take = min(float(batch.quantity), remaining)
+            batch.quantity = float(batch.quantity) - take
+            remaining -= take
 
     task.picked_qty = payload.picked_qty
     task.picker_id = current.user_id
@@ -466,9 +575,34 @@ async def dispatch_pick_lists(
         raise HTTPException(status_code=400, detail="All pick list tasks in one dispatch must share the same warehouse")
     require_warehouse_access(next(iter(warehouse_ids)), current)
 
+    # Picks were validated against batches too, so stock that existed only as
+    # batches (balance never updated) is real. Bring the balance up to what
+    # was picked — audited — so dispatch doesn't refuse stock already in the box.
+    warehouse_id = next(iter(warehouse_ids))
+    needed: dict[uuid.UUID, float] = {}
+    for t in tasks:
+        needed[t.product_id] = needed.get(t.product_id, 0.0) + float(t.picked_qty)
+    for product_id, qty in needed.items():
+        balance = await get_warehouse_balance(db, product_id=product_id, warehouse_id=warehouse_id)
+        if balance < qty:
+            await adjust_warehouse_balance(db, product_id=product_id, warehouse_id=warehouse_id, delta=qty - float(balance))
+            await write_audit(
+                db,
+                user_id=current.user_id,
+                role_code=current.role_code,
+                store_id=None,
+                device_id=current.device_id,
+                action="warehouse_balance.reconciled_from_batches",
+                entity_type="warehouse_balance",
+                entity_id=product_id,
+                old_value={"warehouse_id": str(warehouse_id), "quantity": float(balance)},
+                new_value={"warehouse_id": str(warehouse_id), "quantity": qty},
+                reason="Picked stock existed as batches but the warehouse balance lagged behind",
+            )
+
     transfer_payload = TransferCreate(
         source_type="warehouse",
-        source_id=next(iter(warehouse_ids)),
+        source_id=warehouse_id,
         dest_type=payload.dest_type,
         dest_id=payload.dest_id,
         items=[TransferItemIn(product_id=t.product_id, dispatched_qty=float(t.picked_qty)) for t in tasks],

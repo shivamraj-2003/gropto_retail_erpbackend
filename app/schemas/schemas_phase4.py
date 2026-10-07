@@ -772,6 +772,8 @@ class WmsPickListTaskOut(BaseModel):
     created_at: datetime
     fefo_batch_number: str | None = None
     fefo_expiry_date: date | None = None
+    # Unpicked stock in the task's warehouse (pending/picking tasks only).
+    available_qty: float | None = None
 
 
 class PickConfirm(BaseModel):
