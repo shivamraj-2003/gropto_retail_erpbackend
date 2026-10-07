@@ -188,3 +188,108 @@ async def check_einvoice_applicability(db: AsyncSession, *, company: Company, fi
         "stores": stores,
         "warning": warning,
     }
+
+
+# ---------------------------------------------------------------------------
+# Per-store e-invoicing. Every Gropto store files under its own GSTIN, so the
+# ₹5 crore test is applied to each store's own sales — never pooled with other
+# stores. (GST law measures turnover per PAN; if one owner ever runs several
+# stores under a single PAN, those stores' figures would have to be combined —
+# the company-level functions above do that — but the per-store view is what
+# decides e-invoicing here.)
+# ---------------------------------------------------------------------------
+
+
+def decide_required(*, flagged: bool, previous_year_turnover: float, threshold: float) -> bool:
+    """E-invoicing is mandatory once turnover exceeded the threshold in a
+    *preceding* financial year, or when the store has been flagged by hand."""
+    return flagged or previous_year_turnover > threshold
+
+
+def store_threshold(store: Store) -> float:
+    return float(store.aato_threshold) if store.aato_threshold is not None else DEFAULT_AATO_THRESHOLD
+
+
+async def store_turnover(db: AsyncSession, *, store_id: uuid.UUID, financial_year: int) -> float:
+    fy_start = datetime(financial_year, 4, 1, tzinfo=timezone.utc)
+    fy_end = datetime(financial_year + 1, 4, 1, tzinfo=timezone.utc)
+    total = (
+        await db.execute(
+            select(func.coalesce(func.sum(Sale.grand_total), 0)).where(
+                Sale.store_id == store_id,
+                Sale.status == "completed",
+                Sale.billed_at >= fy_start,
+                Sale.billed_at < fy_end,
+            )
+        )
+    ).scalar_one()
+    return round(float(total), 2)
+
+
+async def is_einvoice_required_for_store(db: AsyncSession, *, store: Store, as_of: date | None = None) -> bool:
+    if store.einvoice_applicable:
+        return True
+    fy = current_financial_year(as_of)
+    previous = await store_turnover(db, store_id=store.id, financial_year=fy - 1)
+    return decide_required(flagged=False, previous_year_turnover=previous, threshold=store_threshold(store))
+
+
+async def store_applicability(db: AsyncSession, *, store_ids: list[uuid.UUID] | None, financial_year: int) -> list[dict]:
+    """One row per store: this year's and last year's turnover against that
+    store's own threshold, and whether e-invoicing applies to it."""
+    stmt = select(Store).where(Store.is_active.is_(True)).order_by(Store.code)
+    if store_ids is not None:
+        stmt = stmt.where(Store.id.in_(store_ids))
+    stores = (await db.execute(stmt)).scalars().all()
+
+    fy_start = datetime(financial_year - 1, 4, 1, tzinfo=timezone.utc)
+    fy_mid = datetime(financial_year, 4, 1, tzinfo=timezone.utc)
+    fy_end = datetime(financial_year + 1, 4, 1, tzinfo=timezone.utc)
+    by_store: dict[uuid.UUID, dict[str, float]] = {}
+    if stores:
+        rows = (
+            await db.execute(
+                select(
+                    Sale.store_id,
+                    func.coalesce(func.sum(Sale.grand_total).filter(and_(Sale.billed_at >= fy_start, Sale.billed_at < fy_mid)), 0),
+                    func.coalesce(func.sum(Sale.grand_total).filter(and_(Sale.billed_at >= fy_mid, Sale.billed_at < fy_end)), 0),
+                )
+                .where(Sale.store_id.in_([s.id for s in stores]), Sale.status == "completed")
+                .group_by(Sale.store_id)
+            )
+        ).all()
+        by_store = {sid: {"previous": float(prev), "current": float(cur)} for sid, prev, cur in rows}
+
+    out = []
+    for s in stores:
+        previous = round(by_store.get(s.id, {}).get("previous", 0.0), 2)
+        current = round(by_store.get(s.id, {}).get("current", 0.0), 2)
+        threshold = store_threshold(s)
+        required = decide_required(flagged=bool(s.einvoice_applicable), previous_year_turnover=previous, threshold=threshold)
+        if required and not s.einvoice_applicable:
+            note = f"Last year's sales (₹{previous:,.0f}) passed ₹{threshold:,.0f} — e-invoicing applies to this store."
+        elif required:
+            note = "Switched on for this store."
+        elif current > threshold:
+            note = "Passed the limit this year — e-invoicing starts from next financial year."
+        else:
+            note = None
+        out.append(
+            {
+                "store_id": str(s.id),
+                "code": s.code,
+                "name": s.name,
+                "gstin": s.gstin,
+                "state": s.state,
+                "turnover": current,
+                "previous_year_turnover": previous,
+                "threshold": threshold,
+                "threshold_is_custom": s.aato_threshold is not None,
+                "percent_of_threshold": round(current / threshold * 100, 1) if threshold else 0.0,
+                "einvoice_flag": bool(s.einvoice_applicable),
+                "einvoice_required": required,
+                "note": note,
+                "missing_gstin": not s.gstin,
+            }
+        )
+    return out

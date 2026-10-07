@@ -11,12 +11,12 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser, require_permission, require_store_access
-from app.core.database import get_db
+from app.core.database import get_db, get_reporting_db
 from app.models.models import Sale, Store
 from app.models.models_phase4 import Company, EInvoice
 from app.schemas.schemas_phase4 import EInvoiceCancelIn, EInvoiceOut
 from app.services import einvoice as einvoice_service
-from app.services.gst import check_einvoice_applicability
+from app.services.gst import check_einvoice_applicability, current_financial_year, store_applicability
 
 router = APIRouter(prefix="/gst", tags=["gst"])
 
@@ -33,6 +33,20 @@ async def get_applicability(
         raise HTTPException(status_code=404, detail="Company not found")
     fy = financial_year or (date.today().year if date.today().month >= 4 else date.today().year - 1)
     return await check_einvoice_applicability(db, company=company, financial_year=fy)
+
+
+@router.get("/store-applicability")
+async def get_store_applicability(
+    financial_year: int | None = None,
+    db: AsyncSession = Depends(get_reporting_db),
+    current: CurrentUser = Depends(require_permission("gst.applicability.view")),
+) -> list[dict]:
+    """The ₹5 crore e-invoice check, one row per store, on that store's own
+    sales. Limited to the stores the caller can see."""
+    fy = financial_year or current_financial_year()
+    return await store_applicability(
+        db, store_ids=None if current.sees_all_stores() else list(current.store_ids), financial_year=fy
+    )
 
 
 @router.get("/einvoices", response_model=list[EInvoiceOut])

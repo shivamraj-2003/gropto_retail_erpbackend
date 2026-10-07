@@ -1,7 +1,7 @@
 import uuid
 from datetime import date, datetime
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, Field
 
 
 # ---------------------------------------------------------------------------
@@ -427,6 +427,8 @@ class StoreOut(BaseModel):
     company_id: uuid.UUID | None = None
     gstin: str | None = None
     state: str | None = None
+    einvoice_applicable: bool = False
+    aato_threshold: float | None = None
     is_active: bool = True
 
 
@@ -440,6 +442,8 @@ class StoreCreateIn(BaseModel):
     company_id: uuid.UUID | None = None
     gstin: str | None = None
     state: str | None = None
+    einvoice_applicable: bool = False
+    aato_threshold: float | None = Field(default=None, ge=0)
 
 
 class StoreCreateResult(BaseModel):
@@ -461,6 +465,9 @@ class StoreUpdateIn(BaseModel):
     company_id: uuid.UUID | None = None
     gstin: str | None = None
     state: str | None = None
+    einvoice_applicable: bool | None = None
+    # 0 clears the store's own threshold (back to the ₹5 crore default).
+    aato_threshold: float | None = Field(default=None, ge=0)
     # Point 15 audit fix: the is_active column existed on Store from day
     # one, but no endpoint anywhere could ever set it to False — a closed
     # store could never be deactivated through the app.

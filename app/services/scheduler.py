@@ -181,10 +181,13 @@ async def retry_pending_einvoices_job() -> None:
     """Point 10 audit fix: no e-invoice retry mechanism existed (nothing
     did, because e-invoicing itself didn't exist). Always a safe no-op when
     GSP credentials aren't configured — see services/einvoice.py."""
-    from app.services.einvoice import retry_failed_einvoices
+    from app.services.einvoice import queue_required_einvoices, retry_failed_einvoices
 
     async with SessionLocal() as db:
         try:
+            queued = await queue_required_einvoices(db)
+            if queued:
+                logger.info(f"E-invoice queue: {queued} B2B invoice(s) queued for stores where e-invoicing applies.")
             count = await retry_failed_einvoices(db)
             await db.commit()
             if count:

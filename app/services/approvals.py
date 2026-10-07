@@ -514,6 +514,8 @@ async def _handle_store_create(db: AsyncSession, request: ApprovalRequest) -> No
         company_id=uuid.UUID(payload["company_id"]) if payload.get("company_id") else None,
         gstin=payload.get("gstin"),
         state=payload.get("state"),
+        einvoice_applicable=bool(payload.get("einvoice_applicable", False)),
+        aato_threshold=payload.get("aato_threshold") or None,
     )
     db.add(store)
 
@@ -526,9 +528,11 @@ async def _handle_store_update(db: AsyncSession, request: ApprovalRequest) -> No
     if store is None:
         request.status = "stale"
         return
-    for field in ("name", "city", "cluster", "area_sqft", "target_revenue_monthly", "gstin", "state", "is_active"):
+    for field in ("name", "city", "cluster", "area_sqft", "target_revenue_monthly", "gstin", "state", "is_active", "einvoice_applicable"):
         if field in request.new_value:
             setattr(store, field, request.new_value[field])
+    if "aato_threshold" in request.new_value:
+        store.aato_threshold = request.new_value["aato_threshold"] or None  # 0/None = back to the default
     if "company_id" in request.new_value:
         store.company_id = uuid.UUID(request.new_value["company_id"]) if request.new_value["company_id"] else None
 

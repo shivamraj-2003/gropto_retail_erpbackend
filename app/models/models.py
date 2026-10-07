@@ -82,6 +82,11 @@ class Store(Base):
     company_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("companies.id"))
     gstin: Mapped[str | None] = mapped_column(String)
     state: Mapped[str | None] = mapped_column(String)
+    # Each store is its own GST filer, so e-invoicing is judged per store:
+    # einvoice_applicable is the explicit opt-in; aato_threshold overrides the
+    # ₹5 crore default (services/gst.py) for this store only.
+    einvoice_applicable: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
+    aato_threshold: Mapped[float | None] = mapped_column(Numeric(14, 2))
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

@@ -27,7 +27,7 @@ from app.core.config import settings
 from app.models.models import Sale, Store
 from app.models.models_phase4 import Company, EInvoice
 from app.services.audit import write_audit
-from app.services.gst import GST_STATE_CODES, is_einvoice_required
+from app.services.gst import GST_STATE_CODES, is_einvoice_required_for_store
 
 MAX_RETRY_COUNT = 5
 
@@ -100,12 +100,13 @@ async def _call_irp(payload: dict) -> dict:
     raise NotConfigured("GSP/IRP credentials are not configured (settings.gsp_api_base_url/client_id/client_secret)")
 
 
-async def get_or_create_einvoice(db: AsyncSession, *, sale: Sale, company: Company | None) -> EInvoice:
+async def get_or_create_einvoice(db: AsyncSession, *, sale: Sale, store: Store, company: Company | None) -> EInvoice:
     result = await db.execute(select(EInvoice).where(EInvoice.sale_id == sale.id))
     existing = result.scalar_one_or_none()
     if existing is not None:
         return existing
-    required = bool(company) and await is_einvoice_required(db, company=company, as_of=sale.billed_at.date() if sale.billed_at else None)
+    # Judged on this store's own sales — each store files under its own GSTIN.
+    required = await is_einvoice_required_for_store(db, store=store, as_of=sale.billed_at.date() if sale.billed_at else None)
     einvoice = EInvoice(
         sale_id=sale.id,
         company_id=company.id if company else None,
@@ -124,21 +125,20 @@ async def submit_einvoice(
     user_id = current.user_id if current else None
     role_code = current.role_code if current else None
 
-    einvoice = await get_or_create_einvoice(db, sale=sale, company=company)
+    einvoice = await get_or_create_einvoice(db, sale=sale, store=store, company=company)
 
     if einvoice.status == "irn_generated":
         return einvoice  # idempotent: already succeeded, never resubmit
-    if company is None:
+    if not (store.gstin or (company.gstin if company else None)):
         raise HTTPException(
             status_code=409,
-            detail="This sale's store isn't linked to a company, so e-invoice applicability can't be determined. "
-            "Link the store to its company (Stores → Parent Company) first.",
+            detail="This store has no GSTIN, so an e-invoice can't be raised. Add the store's GSTIN in Stores first.",
         )
     if einvoice.status == "not_applicable":
         raise HTTPException(
             status_code=409,
-            detail="E-invoicing doesn't apply yet: turnover across all stores under this company's PAN hasn't "
-            "exceeded the threshold (₹5 crore by default), and it isn't flagged applicable.",
+            detail="E-invoicing doesn't apply to this store yet: its own sales haven't passed the limit "
+            "(₹5 crore by default) and it isn't switched on in Stores.",
         )
     if einvoice.status == "cancelled":
         raise HTTPException(status_code=409, detail="This e-invoice was cancelled; cannot resubmit the same sale")
@@ -238,7 +238,9 @@ async def retry_failed_einvoices(db: AsyncSession) -> int:
     if not is_configured():
         return 0
     rows = (
-        await db.execute(select(EInvoice).where(EInvoice.status == "failed", EInvoice.retry_count < MAX_RETRY_COUNT))
+        await db.execute(
+            select(EInvoice).where(EInvoice.status.in_(("failed", "pending")), EInvoice.retry_count < MAX_RETRY_COUNT)
+        )
     ).scalars().all()
     retried = 0
     for einvoice in rows:
@@ -250,3 +252,40 @@ async def retry_failed_einvoices(db: AsyncSession) -> int:
         await submit_einvoice(db, current=None, sale=sale, store=store, company=company)
         retried += 1
     return retried
+
+
+QUEUE_WINDOW_DAYS = 30
+
+
+async def queue_required_einvoices(db: AsyncSession) -> int:
+    """Per store, once e-invoicing applies to it: every B2B invoice (one with a
+    customer GSTIN) from the last 30 days gets an e-invoice record in
+    `pending`, ready to go to the government portal. Walk-in B2C sales are not
+    reported invoice by invoice, so they are left out. Safe to run repeatedly:
+    a sale is only ever queued once."""
+    from datetime import timedelta
+
+    stores = (await db.execute(select(Store).where(Store.is_active.is_(True)))).scalars().all()
+    since = datetime.now(timezone.utc) - timedelta(days=QUEUE_WINDOW_DAYS)
+    queued = 0
+    for store in stores:
+        if not await is_einvoice_required_for_store(db, store=store):
+            continue
+        sales = (
+            await db.execute(
+                select(Sale)
+                .outerjoin(EInvoice, EInvoice.sale_id == Sale.id)
+                .where(
+                    Sale.store_id == store.id,
+                    Sale.status == "completed",
+                    Sale.customer_gstin.is_not(None),
+                    Sale.billed_at >= since,
+                    EInvoice.id.is_(None),
+                )
+            )
+        ).scalars().all()
+        for sale in sales:
+            db.add(EInvoice(sale_id=sale.id, company_id=store.company_id, status="pending"))
+            queued += 1
+    await db.flush()
+    return queued
