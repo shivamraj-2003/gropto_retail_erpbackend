@@ -143,6 +143,20 @@ _EVALUATORS = {
 }
 
 
+async def evaluate_preview(db: AsyncSession, *, lines: list[CartLine]) -> list[tuple[PromotionRule, float]]:
+    """Same evaluation as evaluate_and_log but writes nothing: returns each
+    rule that fires with its discount, for the till's live cart preview."""
+    fired: list[tuple[PromotionRule, float]] = []
+    for rule in await _active_rules(db):
+        evaluator = _EVALUATORS.get(rule.promo_type)
+        if evaluator is None:
+            continue
+        amount = evaluator(rule, lines)
+        if amount > 0:
+            fired.append((rule, round(amount, 2)))
+    return fired
+
+
 async def evaluate_and_log(
     db: AsyncSession,
     *,

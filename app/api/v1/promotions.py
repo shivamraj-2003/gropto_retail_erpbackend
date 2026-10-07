@@ -15,6 +15,9 @@ from app.models.models_phase4 import (
     StorePriceOverride,
 )
 from app.schemas.schemas_phase4 import (
+    CartEvaluateIn,
+    CartEvaluateOut,
+    CartOfferOut,
     CouponCreate,
     CouponOut,
     PromotionRedemptionOut,
@@ -28,10 +31,56 @@ from app.schemas.schemas_phase4 import (
     WalletLedgerOut,
 )
 from app.services.approvals import submit_or_apply
+from app.models.models import Customer
 from app.services.audit import write_audit
+from app.services.coupons import check_coupon
+from app.services.promotion_engine import build_lines, evaluate_preview
 from app.services.wallet import DuplicateWalletEntry, credit_wallet
 
 router = APIRouter(prefix="/promotions", tags=["promotions"])
+
+
+@router.post("/evaluate", response_model=CartEvaluateOut)
+async def evaluate_cart(
+    payload: CartEvaluateIn,
+    db: AsyncSession = Depends(get_db),
+    _current: CurrentUser = Depends(require_permission("pos.sale.create")),
+) -> CartEvaluateOut:
+    """Live preview for the till: which offers fire on this cart and what the
+    coupon (if any) would take off. Read-only — nothing is redeemed until the
+    bill syncs (services/sync.py)."""
+    items = [l.model_dump() for l in payload.lines if l.quantity > 0]
+    lines = await build_lines(db, items=items)
+    fired = await evaluate_preview(db, lines=lines)
+    offers = [
+        CartOfferOut(rule_id=r.id, name=r.name, promo_type=r.promo_type, amount=amount) for r, amount in fired
+    ]
+    offer_discount = round(sum(o.amount for o in offers), 2)
+
+    coupon_code = (payload.coupon_code or "").strip() or None
+    coupon_discount = 0.0
+    coupon_error = None
+    if coupon_code:
+        customer_id = None
+        if payload.customer_phone:
+            customer = (
+                await db.execute(select(Customer).where(Customer.phone == payload.customer_phone))
+            ).scalar_one_or_none()
+            customer_id = customer.id if customer else None
+        gross = sum(float(l.quantity) * float(l.unit_price) for l in payload.lines)
+        try:
+            _coupon, coupon_discount = await check_coupon(
+                db, code=coupon_code, customer_id=customer_id, cart_subtotal=gross - offer_discount
+            )
+        except HTTPException as exc:
+            coupon_error = str(exc.detail)
+    return CartEvaluateOut(
+        offers=offers,
+        offer_discount=offer_discount,
+        coupon_code=coupon_code,
+        coupon_discount=coupon_discount,
+        coupon_error=coupon_error,
+    )
 
 
 @router.get("/rules", response_model=list[PromotionRuleOut])

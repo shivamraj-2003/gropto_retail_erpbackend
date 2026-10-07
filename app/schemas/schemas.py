@@ -356,6 +356,12 @@ class SaleIn(BaseModel):
     override_user_id: uuid.UUID | None = None
     override_reason: str | None = None
     loyalty_points_redeemed: float = 0
+    # Offers and coupon the till applied. Both are part of discount_total; the
+    # server re-checks them (services/sync.py) and only the verified share is
+    # exempt from the cashier's discount limit.
+    offer_discount: float = 0
+    coupon_code: str | None = None
+    coupon_discount: float = 0
     client_idempotency_key: str
     billed_at: datetime
     # Point 10 audit fix: GST-ready sales data (B2B customer GSTIN) didn't

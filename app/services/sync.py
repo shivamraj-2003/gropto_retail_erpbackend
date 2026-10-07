@@ -5,6 +5,7 @@ device-generated primary keys, and unique bill numbers per store+device.
 """
 
 
+from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -12,9 +13,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.models import Customer, Device, Payment, Role, Sale, SaleItem, Store, SyncFailure, User
 from app.models.models_phase2 import GiftVoucher
 from app.schemas.schemas import SaleIn, SyncItemVerdict
+from app.models.models_phase4 import CouponRedemption
 from app.services.audit import write_audit
+from app.services.coupons import check_coupon
 from app.services.gst import determine_place_of_supply, split_tax
 from app.services.inventory import DuplicateMovement, apply_movement, get_balance as get_stock_balance
+from app.services.promotion_engine import build_lines, evaluate_and_log, evaluate_preview
 from app.services.loyalty import DuplicateLedgerEntry, apply_ledger_entry, get_balance, get_config, get_earn_multiplier
 from app.services.wallet import DuplicateWalletEntry, InsufficientWalletBalance, debit_wallet
 
@@ -29,6 +33,12 @@ async def _get_or_create_customer(db: AsyncSession, phone: str | None) -> Custom
         db.add(customer)
         await db.flush()
     return customer
+
+
+async def _find_customer(db: AsyncSession, phone: str | None) -> Customer | None:
+    if not phone:
+        return None
+    return (await db.execute(select(Customer).where(Customer.phone == phone))).scalar_one_or_none()
 
 
 async def process_sale(db: AsyncSession, sale_in: SaleIn) -> SyncItemVerdict:
@@ -82,11 +92,50 @@ async def process_sale(db: AsyncSession, sale_in: SaleIn) -> SyncItemVerdict:
         # discounts are already netted into subtotal/tax_total above.
         grand_total = subtotal + tax_total - sale_in.discount_total
 
+        # Offers and coupons are business-configured, not a cashier's call, so
+        # they don't count against the role discount limit — but only the share
+        # the server can reproduce from its own rules does. Anything the till
+        # claims beyond that is treated as a manual discount.
+        item_dicts = [
+            {"product_id": i.product_id, "quantity": i.quantity, "unit_price": i.unit_price} for i in sale_in.items
+        ]
+        gross = sum(i["quantity"] * i["unit_price"] for i in item_dicts)
+        verified_offer = 0.0
+        if sale_in.offer_discount > 0:
+            fired = await evaluate_preview(db, lines=await build_lines(db, items=item_dicts))
+            verified_offer = min(sale_in.offer_discount, round(sum(a for _r, a in fired), 2))
+        verified_coupon = 0.0
+        coupon_row = None
+        coupon_customer = await _find_customer(db, sale_in.customer_phone)
+        if sale_in.coupon_code and sale_in.coupon_discount > 0:
+            try:
+                coupon_row, server_coupon = await check_coupon(
+                    db,
+                    code=sale_in.coupon_code,
+                    customer_id=coupon_customer.id if coupon_customer else None,
+                    cart_subtotal=gross - verified_offer,
+                )
+                verified_coupon = min(sale_in.coupon_discount, server_coupon)
+            except HTTPException as exc:
+                # Offline-built bill whose coupon no longer holds (expired or
+                # used up meanwhile): the goods are sold, so keep the sale,
+                # drop the coupon's exemption and flag it for review.
+                coupon_row = None
+                db.add(
+                    SyncFailure(
+                        device_id=sale_in.device_id,
+                        payload={"sale_id": str(sale_in.id), "coupon_code": sale_in.coupon_code},
+                        error=f"coupon_not_honoured: {exc.detail}",
+                        resolved=False,
+                    )
+                )
+        manual_discount = max(discount_total - verified_offer - verified_coupon, 0.0)
+
         # Role-based discount limit; above it requires a manager override PIN, stamped
         # on the sale immediately rather than a pending-approval round trip, because
         # the customer is standing at the till.
         max_allowed = max(float(role.max_discount_value), subtotal * float(role.max_discount_percent) / 100)
-        if discount_total > max_allowed and sale_in.override_user_id is None:
+        if manual_discount > max_allowed and sale_in.override_user_id is None:
             await savepoint.rollback()
             return SyncItemVerdict(
                 client_id=sale_in.id,
@@ -95,15 +144,15 @@ async def process_sale(db: AsyncSession, sale_in: SaleIn) -> SyncItemVerdict:
             )
         override_user_id = None
         override_reason = None
-        if discount_total > max_allowed:
+        if manual_discount > max_allowed:
             overrider = await db.get(User, sale_in.override_user_id)
             if overrider is None:
                 await savepoint.rollback()
                 return SyncItemVerdict(client_id=sale_in.id, verdict="rejected", error="Unknown override user")
             overrider_role = await db.get(Role, overrider.role_id)
-            if float(overrider_role.max_discount_value) < discount_total and float(
+            if float(overrider_role.max_discount_value) < manual_discount and float(
                 overrider_role.max_discount_percent
-            ) / 100 * subtotal < discount_total:
+            ) / 100 * subtotal < manual_discount:
                 await savepoint.rollback()
                 return SyncItemVerdict(
                     client_id=sale_in.id, verdict="rejected", error="Override user lacks sufficient discount authority"
@@ -162,6 +211,28 @@ async def process_sale(db: AsyncSession, sale_in: SaleIn) -> SyncItemVerdict:
         )
         db.add(sale)
         await db.flush()
+
+        # Log what actually fired, so Offer Profit and Coupon Use see till bills
+        # the same way they see online orders. Idempotent under replay.
+        if verified_offer > 0:
+            await evaluate_and_log(
+                db,
+                store_id=sale_in.store_id,
+                lines=await build_lines(db, items=item_dicts),
+                source_type="sale",
+                source_id=sale.id,
+            )
+        if coupon_row is not None and verified_coupon > 0:
+            db.add(
+                CouponRedemption(
+                    coupon_id=coupon_row.id,
+                    customer_id=customer.id if customer else None,
+                    source_type="sale",
+                    source_id=sale.id,
+                    discount_amount=verified_coupon,
+                )
+            )
+            await db.flush()
 
         if override_user_id is not None:
             # Point 13 audit fix: a manager discount override was stamped

@@ -906,3 +906,32 @@ class ChecklistCompletionOut(BaseModel):
 
 class ChecklistCompleteIn(BaseModel):
     notes: str | None = None
+
+
+class CartEvaluateLine(BaseModel):
+    product_id: uuid.UUID
+    quantity: float
+    unit_price: float
+
+
+class CartEvaluateIn(BaseModel):
+    """What the till sends while a bill is being built."""
+
+    lines: list[CartEvaluateLine]
+    coupon_code: str | None = None
+    customer_phone: str | None = None
+
+
+class CartOfferOut(BaseModel):
+    rule_id: uuid.UUID
+    name: str
+    promo_type: str
+    amount: float
+
+
+class CartEvaluateOut(BaseModel):
+    offers: list[CartOfferOut]
+    offer_discount: float
+    coupon_code: str | None = None
+    coupon_discount: float = 0
+    coupon_error: str | None = None

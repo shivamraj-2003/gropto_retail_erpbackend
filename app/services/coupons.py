@@ -1,7 +1,8 @@
 """Coupon codes (Point 9 audit fix). Previously "coupon" existed only as a
 selectable string in a promo-type dropdown — no code, no validation, no
-redemption tracking anywhere. Wired into OMS order creation only (POS
-checkout is a live-till flow this pass doesn't touch)."""
+redemption tracking anywhere. Used by OMS order creation and by the till
+(`check_coupon` for the live preview, `validate_and_apply_coupon` when the
+bill is recorded)."""
 
 import uuid
 from datetime import date
@@ -14,19 +15,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.models_phase4 import Coupon, CouponRedemption
 
 
-async def validate_and_apply_coupon(
+async def check_coupon(
     db: AsyncSession,
     *,
     code: str,
     customer_id: uuid.UUID | None,
     cart_subtotal: float,
-    source_type: str,
-    source_id: uuid.UUID,
-) -> float:
-    """Validates the coupon against date range/usage limits/min cart value,
-    computes the capped discount, and writes the redemption row (idempotent
-    under replay via the source_type/source_id/coupon_id unique constraint).
-    Raises HTTPException(400) on any invalid/expired/exhausted coupon."""
+) -> tuple[Coupon, float]:
+    """Validates the coupon against date range/usage limits/min cart value and
+    returns it with the capped discount. Writes nothing. Raises
+    HTTPException(400) on any invalid/expired/exhausted coupon."""
     coupon = (await db.execute(select(Coupon).where(Coupon.code == code))).scalar_one_or_none()
     if coupon is None or not coupon.active:
         raise HTTPException(status_code=400, detail=f"Coupon {code} is invalid or inactive")
@@ -66,7 +64,21 @@ async def validate_and_apply_coupon(
         discount = float(coupon.discount_value)
     if coupon.max_discount_amount is not None:
         discount = min(discount, float(coupon.max_discount_amount))
-    discount = round(min(discount, cart_subtotal), 2)
+    return coupon, round(max(min(discount, cart_subtotal), 0.0), 2)
+
+
+async def validate_and_apply_coupon(
+    db: AsyncSession,
+    *,
+    code: str,
+    customer_id: uuid.UUID | None,
+    cart_subtotal: float,
+    source_type: str,
+    source_id: uuid.UUID,
+) -> float:
+    """check_coupon plus the redemption row (idempotent under replay via the
+    source_type/source_id/coupon_id unique constraint)."""
+    coupon, discount = await check_coupon(db, code=code, customer_id=customer_id, cart_subtotal=cart_subtotal)
     if discount <= 0:
         return 0.0
 
