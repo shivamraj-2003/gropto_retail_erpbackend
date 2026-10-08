@@ -6,7 +6,7 @@ from fastapi.responses import StreamingResponse
 from openpyxl import Workbook
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import CurrentUser, require_permission, require_store_access
+from app.api.deps import CurrentUser, require_permission, require_store_access, require_warehouse_access
 from app.core.database import get_db
 from app.models.models import ImportBatch
 from app.services import imports as import_service
@@ -21,7 +21,10 @@ async def stage_products(
     current: CurrentUser = Depends(require_permission("import.product.import")),
 ) -> dict:
     content = await file.read()
-    batch = await import_service.stage_products_file(db, file_bytes=content, filename=file.filename, uploaded_by=current.user_id)
+    try:
+        batch = await import_service.stage_products_file(db, file_bytes=content, filename=file.filename, uploaded_by=current.user_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     return await import_service.preview_batch(db, batch.id)
 
 
@@ -48,16 +51,26 @@ async def commit_products(
 
 @router.post("/opening-stock/stage")
 async def stage_opening_stock(
-    store_id: uuid.UUID,
     file: UploadFile,
+    store_id: uuid.UUID | None = None,
+    warehouse_id: uuid.UUID | None = None,
     db: AsyncSession = Depends(get_db),
     current: CurrentUser = Depends(require_permission("import.opening_stock.import")),
 ) -> dict:
-    require_store_access(store_id, current)
+    """Opening stock for one store OR one warehouse (exactly one of the two)."""
+    if (store_id is None) == (warehouse_id is None):
+        raise HTTPException(status_code=400, detail="Pick either a store or a warehouse to load stock into")
+    if store_id is not None:
+        require_store_access(store_id, current)
+    else:
+        require_warehouse_access(warehouse_id, current)
     content = await file.read()
-    batch = await import_service.stage_opening_stock_file(
-        db, file_bytes=content, filename=file.filename, store_id=store_id, uploaded_by=current.user_id
-    )
+    try:
+        batch = await import_service.stage_opening_stock_file(
+            db, file_bytes=content, filename=file.filename, store_id=store_id, warehouse_id=warehouse_id, uploaded_by=current.user_id
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     return await import_service.preview_batch(db, batch.id)
 
 

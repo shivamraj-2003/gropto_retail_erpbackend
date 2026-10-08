@@ -117,6 +117,7 @@ async def execute_scheduled_price_changes_job() -> None:
     from app.models.models import Product
     from app.models.models_phase4 import ScheduledPriceChange
     from app.services.audit import write_audit
+    from app.services.catalog import bump_revision
 
     async with SessionLocal() as db:
         try:
@@ -138,7 +139,7 @@ async def execute_scheduled_price_changes_job() -> None:
                 old_sp, old_mrp = float(product.selling_price), float(product.mrp)
                 product.selling_price = sp_change.new_sp
                 product.mrp = sp_change.new_mrp
-                product.revision = (product.revision or 0) + 1
+                await bump_revision(db, product)
                 sp_change.status = "executed"
                 await write_audit(
                     db,

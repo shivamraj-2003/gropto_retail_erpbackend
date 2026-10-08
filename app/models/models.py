@@ -271,6 +271,17 @@ class Category(Base):
     revision: Mapped[int] = revision_column()
 
 
+class ProductBarcode(Base):
+    """Extra barcodes for a product (pack sizes, old and new labels, distributors).
+    The main barcode stays on products.barcode; every code is unique across both."""
+
+    __tablename__ = "product_barcodes"
+    id: Mapped[uuid.UUID] = uuid_pk()
+    product_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("products.id", ondelete="CASCADE"), nullable=False)
+    barcode: Mapped[str] = mapped_column(String, unique=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 class Product(Base):
     __tablename__ = "products"
     id: Mapped[uuid.UUID] = uuid_pk()
@@ -295,6 +306,10 @@ class Product(Base):
     revision: Mapped[int] = revision_column()
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    alt_barcodes: Mapped[list["ProductBarcode"]] = relationship(
+        lazy="selectin", cascade="all, delete-orphan", order_by="ProductBarcode.created_at"
+    )
 
 
 class InventoryBalance(Base):

@@ -2,7 +2,7 @@ import uuid
 from datetime import date, datetime
 from typing import Literal, Generic, TypeVar
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 T = TypeVar("T")
 
@@ -235,8 +235,16 @@ class ProductOut(BaseModel):
     mrp: float
     tax_rate: float
     hsn_code: str | None
+    brand: str | None = None
+    # The other barcodes of this product (the main one is `barcode`).
+    alt_barcodes: list[str] = []
     is_active: bool
     revision: int
+
+    @field_validator("alt_barcodes", mode="before")
+    @classmethod
+    def _barcode_strings(cls, value):
+        return [getattr(v, "barcode", v) for v in (value or [])]
 
 
 class ProductCreate(BaseModel):
@@ -251,6 +259,23 @@ class ProductCreate(BaseModel):
     mrp: float = 0
     tax_rate: float = 0
     hsn_code: str | None = None
+    brand: str | None = None
+    extra_barcodes: list[str] = []
+
+
+class ProductUpdate(BaseModel):
+    """Everything about a product except its selling price and MRP (those go through a price change)."""
+
+    name: str | None = None
+    barcode: str | None = None
+    uom: str | None = None
+    pack_size: float | None = None
+    purchase_price: float | None = None
+    tax_rate: float | None = None
+    hsn_code: str | None = None
+    brand: str | None = None
+    # Replaces the product's other barcodes when sent (omit to leave them as they are).
+    extra_barcodes: list[str] | None = None
 
 
 class ProductPriceChangeRequest(BaseModel):

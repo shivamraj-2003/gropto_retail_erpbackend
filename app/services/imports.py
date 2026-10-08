@@ -5,6 +5,10 @@ apply the valid rows, rolling back entirely on failure.
 Three hard rules: no deletes via import ever (a missing row means nothing); price
 changes via import route through the approval engine as one request holding every
 delta; opening stock only imports into an empty balance.
+
+Product sheets create new products and update existing ones by SKU. A blank cell
+leaves that field alone. Name, barcode, unit, purchase price, GST and HSN apply
+at once; selling price and MRP wait for approval (a Super Admin's apply at once).
 """
 
 import uuid
@@ -16,16 +20,27 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.api.deps import CurrentUser
-from app.models.models import ImportBatch, ImportStagingRow, InventoryBalance, Product
+from app.models.models import ImportBatch, ImportStagingRow, InventoryBalance, Product, ProductBarcode
+from app.models.models_phase2 import WarehouseBalance
 from app.models.models_phase4 import InventoryBatch
 from app.services.approvals import submit_or_apply
 from app.services.audit import write_audit
-from app.services.inventory import apply_movement
+from app.services.catalog import bump_revision
+from app.services.inventory import adjust_warehouse_balance, apply_movement
+from app.services.product_import_rules import (
+    PRICE_FIELDS,
+    clean_text,
+    describe_changes,
+    diff_product,
+    header_key,
+    parse_product_row,
+)
 
 PRODUCT_COLUMNS = ["sku", "name", "barcode", "uom", "purchase_price", "selling_price", "mrp", "tax_rate", "hsn_code"]
 # batch_number, mfg_date and expiry_date are optional; when any is given the
 # opening quantity is also recorded as an inventory batch so expiry tracking works.
-OPENING_STOCK_COLUMNS = ["sku", "store_code", "quantity", "batch_number", "mfg_date", "expiry_date"]
+# The location (store or warehouse) is picked on screen, not read from the sheet.
+OPENING_STOCK_COLUMNS = ["sku", "quantity", "batch_number", "mfg_date", "expiry_date"]
 
 
 def _parse_date(raw) -> date | None:
@@ -54,46 +69,80 @@ async def get_batch_with_rows(db: AsyncSession, batch_id: uuid.UUID) -> ImportBa
     return (await db.execute(stmt)).scalar_one_or_none()
 
 
-async def stage_products_file(db: AsyncSession, *, file_bytes: bytes, filename: str, uploaded_by: uuid.UUID) -> ImportBatch:
+def _rows_of(file_bytes: bytes) -> tuple[list[str], list[tuple]]:
     wb = openpyxl.load_workbook(io_bytes(file_bytes), read_only=True)
-    ws = wb.active
-    rows = list(ws.iter_rows(values_only=True))
-    header, *data_rows = rows
+    rows = list(wb.active.iter_rows(values_only=True))
+    if not rows:
+        raise ValueError("The file is empty")
+    header = [header_key(h) for h in rows[0]]
+    return header, [r for r in rows[1:] if any(c is not None and str(c).strip() != "" for c in r)]
+
+
+def _product_snapshot(p: Product) -> dict:
+    return {
+        "other_barcodes": [b.barcode for b in p.alt_barcodes],
+        "name": p.name, "barcode": p.barcode, "uom": p.uom, "hsn_code": p.hsn_code,
+        "purchase_price": float(p.purchase_price or 0), "selling_price": float(p.selling_price or 0),
+        "mrp": float(p.mrp or 0), "tax_rate": float(p.tax_rate or 0),
+    }
+
+
+async def stage_products_file(db: AsyncSession, *, file_bytes: bytes, filename: str, uploaded_by: uuid.UUID) -> ImportBatch:
+    try:
+        header, data_rows = _rows_of(file_bytes)
+    except ValueError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — a corrupt/non-Excel upload should read as a plain message
+        raise ValueError("Could not read this file — upload an .xlsx Excel file") from exc
+    if "sku" not in header:
+        raise ValueError("The first row must have a column called sku")
 
     batch = ImportBatch(import_type="products", uploaded_by=uploaded_by, file_name=filename, file_bytes=file_bytes, status="staged")
     db.add(batch)
     await db.flush()
 
-    existing_skus = {p.sku: p for p in (await db.execute(select(Product))).scalars().all()}
+    all_products = list((await db.execute(select(Product))).scalars().all())
+    by_sku = {p.sku: p for p in all_products}
+    barcode_owner = {p.barcode: p.sku for p in all_products if p.barcode}
+    for p in all_products:
+        for b in p.alt_barcodes:
+            barcode_owner[b.barcode] = p.sku
+    seen_skus: set[str] = set()
+    seen_barcodes: dict[str, str] = {}
 
     for i, row in enumerate(data_rows, start=2):
         values = dict(zip(header, row, strict=False))
-        messages: list[str] = []
-        sku = str(values.get("sku") or "").strip()
+        sku = clean_text(values.get("sku")) or ""
+        existing = by_sku.get(sku)
+        provided, messages = parse_product_row(values, is_new=existing is None)
         if not sku:
-            messages.append("Missing SKU")
-        try:
-            selling_price = float(values.get("selling_price") or 0)
-            if selling_price < 0:
-                messages.append("selling_price must be >= 0")
-        except (TypeError, ValueError):
-            messages.append("selling_price is not numeric")
-            selling_price = 0
-        try:
-            tax_rate = float(values.get("tax_rate") or 0)
-        except (TypeError, ValueError):
-            messages.append("tax_rate is not numeric")
-            tax_rate = 0
+            messages.append("SKU is missing")
+        elif sku in seen_skus:
+            messages.append("This SKU appears twice in the file")
+        seen_skus.add(sku)
 
-        action = "error"
-        if not messages:
-            action = "update" if sku in existing_skus else "create"
+        for barcode in ([provided["barcode"]] if provided.get("barcode") else []) + provided.get("other_barcodes", []):
+            owner = barcode_owner.get(barcode)
+            if owner and owner != sku:
+                messages.append(f"Barcode {barcode} already belongs to {owner}")
+            elif barcode in seen_barcodes and seen_barcodes[barcode] != sku:
+                messages.append(f"Barcode {barcode} is used by {seen_barcodes[barcode]} in this file")
+            seen_barcodes.setdefault(barcode, sku)
+
+        changes: dict = {}
+        if messages:
+            action = "error"
+        elif existing is None:
+            action = "create"
+        else:
+            changes = diff_product(_product_snapshot(existing), provided)
+            action = "update" if changes else "skip"
 
         db.add(
             ImportStagingRow(
                 batch_id=batch.id,
                 line_number=i,
-                parsed_values={**{k: values.get(k) for k in PRODUCT_COLUMNS}, "selling_price": selling_price, "tax_rate": tax_rate},
+                parsed_values={"sku": sku, **provided, "_changes": changes},
                 computed_action=action,
                 validation_messages=messages,
             )
@@ -107,7 +156,18 @@ async def preview_batch(db: AsyncSession, batch_id: uuid.UUID) -> dict:
     counts = {"create": 0, "update": 0, "error": 0, "skip": 0}
     for row in batch.rows:
         counts[row.computed_action or "error"] = counts.get(row.computed_action or "error", 0) + 1
-    return {"batch_id": str(batch_id), "counts": counts, "total_rows": len(batch.rows)}
+    order = {"error": 0, "create": 1, "update": 2, "skip": 3}
+    rows = []
+    for row in sorted(batch.rows, key=lambda r: (order.get(r.computed_action or "error", 0), r.line_number)):
+        v = row.parsed_values or {}
+        detail = list(row.validation_messages or [])
+        if row.computed_action == "update":
+            detail = describe_changes(v.get("_changes") or {})
+        elif row.computed_action == "skip":
+            detail = ["Already up to date"]
+        label = v.get("name") or v.get("sku")
+        rows.append({"line": row.line_number, "sku": v.get("sku"), "label": label, "action": row.computed_action, "detail": detail})
+    return {"batch_id": str(batch_id), "counts": counts, "total_rows": len(batch.rows), "rows": rows[:300]}
 
 
 async def commit_products_batch(db: AsyncSession, batch_id: uuid.UUID, current: CurrentUser) -> dict:
@@ -115,43 +175,68 @@ async def commit_products_batch(db: AsyncSession, batch_id: uuid.UUID, current: 
     if batch is None or batch.status != "staged":
         raise ValueError("Batch not found or already applied")
 
-    valid_rows = [r for r in batch.rows if r.computed_action in ("create", "update") and not r.validation_messages]
-    price_deltas = []
     created, updated = 0, 0
+    price_changes: list[dict] = []
 
-    for row in valid_rows:
+    for row in batch.rows:
+        if row.computed_action not in ("create", "update") or row.validation_messages:
+            continue
         v = row.parsed_values
-        result = await db.execute(select(Product).where(Product.sku == v["sku"]))
-        product = result.scalar_one_or_none()
-        if product is None:
+        product = (await db.execute(select(Product).where(Product.sku == v["sku"]))).scalar_one_or_none()
+        if row.computed_action == "create" and product is None:
             product = Product(
-                sku=v["sku"], name=v.get("name") or v["sku"], barcode=v.get("barcode"),
-                uom=v.get("uom") or "EA", selling_price=v["selling_price"], mrp=v.get("mrp") or v["selling_price"],
-                tax_rate=v["tax_rate"], hsn_code=v.get("hsn_code"), purchase_price=v.get("purchase_price") or 0,
+                sku=v["sku"], name=v["name"], barcode=v.get("barcode"), uom=v.get("uom") or "EA",
+                selling_price=v["selling_price"], mrp=v.get("mrp") or v["selling_price"],
+                tax_rate=v.get("tax_rate", 0), hsn_code=v.get("hsn_code"), purchase_price=v.get("purchase_price", 0),
             )
+            product.alt_barcodes = [ProductBarcode(barcode=c) for c in v.get("other_barcodes", []) if c != product.barcode]
             db.add(product)
             created += 1
-        else:
-            if float(product.selling_price) != float(v["selling_price"]):
-                price_deltas.append({"sku": v["sku"], "old": float(product.selling_price), "new": v["selling_price"]})
-            product.name = v.get("name") or product.name
-            product.tax_rate = v["tax_rate"]
-            product.hsn_code = v.get("hsn_code") or product.hsn_code
-            updated += 1
+            continue
+        if product is None:
+            continue
+        changes = v.get("_changes") or {}
+        touched = False
+        for field, change in changes.items():
+            if field in PRICE_FIELDS:
+                continue
+            if field == "other_barcodes":
+                have = {b.barcode for b in product.alt_barcodes}
+                for code in change["new"]:
+                    if code not in have and code != product.barcode:
+                        product.alt_barcodes.append(ProductBarcode(barcode=code))
+                touched = True
+                continue
+            setattr(product, field, change["new"])
+            touched = True
+        if touched:
+            await bump_revision(db, product)
+        price_part = {f: c for f, c in changes.items() if f in PRICE_FIELDS}
+        if price_part:
+            price_changes.append(
+                {
+                    "product_id": str(product.id),
+                    "sku": product.sku,
+                    "old": {f: c["old"] for f, c in price_part.items()},
+                    "new": {f: c["new"] for f, c in price_part.items()},
+                }
+            )
+        updated += 1
 
-    # Bulk repricing becomes one approval request holding every delta, not a silent change.
-    if price_deltas:
-        await submit_or_apply(
+    pending_approval = 0
+    if price_changes:
+        request = await submit_or_apply(
             db,
             current=current,
-            request_type="config_change",
+            request_type="bulk_price_change",
             entity_type="import_batch",
             entity_id=batch.id,
             old_value=None,
-            new_value={"price_deltas": price_deltas},
-            reason=f"Bulk price changes from import {batch.file_name}",
+            new_value={"changes": price_changes},
+            reason=f"Price changes from import {batch.file_name}",
             store_id=None,
         )
+        pending_approval = 0 if request.status == "approved" else len(price_changes)
 
     batch.status = "applied"
     await write_audit(
@@ -163,17 +248,37 @@ async def commit_products_batch(db: AsyncSession, batch_id: uuid.UUID, current: 
         action="import.committed",
         entity_type="import_batch",
         entity_id=batch.id,
-        new_value={"created": created, "updated": updated, "price_deltas": len(price_deltas)},
+        new_value={"created": created, "updated": updated, "price_changes": len(price_changes), "pending_approval": pending_approval},
     )
     await db.commit()
-    return {"created": created, "updated": updated, "price_changes_pending_approval": len(price_deltas)}
+    return {
+        "created": created,
+        "updated": updated,
+        "price_changes": len(price_changes),
+        "price_changes_pending_approval": pending_approval,
+    }
 
 
-async def stage_opening_stock_file(db: AsyncSession, *, file_bytes: bytes, filename: str, store_id: uuid.UUID, uploaded_by: uuid.UUID) -> ImportBatch:
-    wb = openpyxl.load_workbook(io_bytes(file_bytes), read_only=True)
-    ws = wb.active
-    rows = list(ws.iter_rows(values_only=True))
-    header, *data_rows = rows
+async def stage_opening_stock_file(
+    db: AsyncSession,
+    *,
+    file_bytes: bytes,
+    filename: str,
+    uploaded_by: uuid.UUID,
+    store_id: uuid.UUID | None = None,
+    warehouse_id: uuid.UUID | None = None,
+) -> ImportBatch:
+    """Opening stock for ONE location, picked on screen: a store or a warehouse."""
+    if (store_id is None) == (warehouse_id is None):
+        raise ValueError("Pick either a store or a warehouse to load stock into")
+    try:
+        header, data_rows = _rows_of(file_bytes)
+    except ValueError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise ValueError("Could not read this file — upload an .xlsx Excel file") from exc
+    if "sku" not in header or "quantity" not in header:
+        raise ValueError("The first row must have the columns sku and quantity")
 
     batch = ImportBatch(
         import_type="opening_stock", store_id=store_id, uploaded_by=uploaded_by, file_name=filename,
@@ -183,26 +288,40 @@ async def stage_opening_stock_file(db: AsyncSession, *, file_bytes: bytes, filen
     await db.flush()
 
     products = {p.sku: p for p in (await db.execute(select(Product))).scalars().all()}
-    existing_balances = {
-        b.product_id for b in (await db.execute(select(InventoryBalance).where(InventoryBalance.store_id == store_id))).scalars().all()
-    }
+    if store_id is not None:
+        already = {
+            b.product_id for b in (await db.execute(select(InventoryBalance).where(InventoryBalance.store_id == store_id))).scalars().all()
+        }
+    else:
+        already = {
+            b.product_id
+            for b in (await db.execute(select(WarehouseBalance).where(WarehouseBalance.warehouse_id == warehouse_id))).scalars().all()
+        }
+    seen: set[str] = set()
 
     for i, row in enumerate(data_rows, start=2):
         values = dict(zip(header, row, strict=False))
         messages: list[str] = []
-        sku = str(values.get("sku") or "").strip()
+        sku = clean_text(values.get("sku")) or ""
         product = products.get(sku)
-        if product is None:
-            messages.append(f"Unknown SKU {sku}")
-        elif product.id in existing_balances:
-            messages.append("Opening stock already set for this product/store — re-run is a likely duplicate")
+        if not sku:
+            messages.append("SKU is missing")
+        elif product is None:
+            messages.append(f"Unknown SKU {sku} — add the product first")
+        elif product.id in already:
+            messages.append("Opening stock was already loaded for this product here")
+        if sku in seen:
+            messages.append("This SKU appears twice in the file")
+        seen.add(sku)
         try:
             quantity = float(values.get("quantity") or 0)
+            if quantity <= 0:
+                messages.append("quantity must be more than 0")
         except (TypeError, ValueError):
-            messages.append("quantity is not numeric")
+            messages.append("quantity is not a number")
             quantity = 0
 
-        batch_number = str(values.get("batch_number") or "").strip() or None
+        batch_number = clean_text(values.get("batch_number"))
         mfg_date = expiry_date = None
         for field in ("mfg_date", "expiry_date"):
             try:
@@ -227,7 +346,9 @@ async def stage_opening_stock_file(db: AsyncSession, *, file_bytes: bytes, filen
                 line_number=i,
                 parsed_values={
                     "sku": sku,
+                    "name": product.name if product else None,
                     "product_id": str(product.id) if product else None,
+                    "warehouse_id": str(warehouse_id) if warehouse_id else None,
                     "quantity": quantity,
                     "batch_number": batch_number,
                     "mfg_date": mfg_date.isoformat() if mfg_date else None,
@@ -252,23 +373,29 @@ async def commit_opening_stock_batch(db: AsyncSession, batch_id: uuid.UUID, curr
         if row.computed_action != "create" or row.validation_messages:
             continue
         v = row.parsed_values
-        await apply_movement(
-            db,
-            product_id=uuid.UUID(v["product_id"]),
-            store_id=batch.store_id,
-            delta=v["quantity"],
-            reason_code="opening_stock",
-            source_type="import_row",
-            source_id=row.id,
-            created_by=current.user_id,
-            device_id=None,
-        )
+        product_id = uuid.UUID(v["product_id"])
+        warehouse_id = uuid.UUID(v["warehouse_id"]) if v.get("warehouse_id") else None
+        if warehouse_id is None:
+            await apply_movement(
+                db,
+                product_id=product_id,
+                store_id=batch.store_id,
+                delta=v["quantity"],
+                reason_code="opening_stock",
+                source_type="import_row",
+                source_id=row.id,
+                created_by=current.user_id,
+                device_id=None,
+            )
+        else:
+            await adjust_warehouse_balance(db, product_id=product_id, warehouse_id=warehouse_id, delta=v["quantity"])
         if v.get("expiry_date") or v.get("mfg_date") or v.get("batch_number"):
-            product = await db.get(Product, uuid.UUID(v["product_id"]))
+            product = await db.get(Product, product_id)
             db.add(
                 InventoryBatch(
                     product_id=product.id,
-                    store_id=batch.store_id,
+                    store_id=batch.store_id if warehouse_id is None else None,
+                    warehouse_id=warehouse_id,
                     batch_number=v.get("batch_number") or "OPENING",
                     mfg_date=date.fromisoformat(v["mfg_date"]) if v.get("mfg_date") else None,
                     expiry_date=date.fromisoformat(v["expiry_date"]) if v.get("expiry_date") else None,

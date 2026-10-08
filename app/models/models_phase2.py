@@ -15,6 +15,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -108,6 +109,9 @@ class Transfer(Base):
     received_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"))
     dispatched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     received_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # TR-000123 on screen and paper; assigned by the database.
+    transfer_no: Mapped[int] = mapped_column(server_default=text("nextval('transfer_no_seq')"))
+    note: Mapped[str | None] = mapped_column(Text)
 
     items: Mapped[list["TransferItem"]] = relationship(cascade="all, delete-orphan", lazy="selectin")
 

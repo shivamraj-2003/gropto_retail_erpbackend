@@ -1,15 +1,16 @@
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser, require_permission
 from app.core.database import get_db
-from app.models.models import Product
-from app.schemas.schemas import ProductCreate, ProductOut, ProductPriceChangeRequest, ProductPullResponse
+from app.models.models import Product, ProductBarcode
+from app.schemas.schemas import ProductCreate, ProductOut, ProductPriceChangeRequest, ProductPullResponse, ProductUpdate
 from app.services.approvals import submit_or_apply
 from app.services.audit import write_audit
+from app.services.catalog import barcode_owner, bump_revision, clean_barcodes
 
 router = APIRouter(prefix="/products", tags=["products"])
 
@@ -18,6 +19,8 @@ router = APIRouter(prefix="/products", tags=["products"])
 async def list_products(
     q: str | None = None,
     active_only: bool = True,
+    limit: int = 200,
+    offset: int = 0,
     db: AsyncSession = Depends(get_db),
     _current: CurrentUser = Depends(require_permission("catalog.product.view")),
 ) -> list[Product]:
@@ -25,8 +28,17 @@ async def list_products(
     if active_only:
         stmt = stmt.where(Product.is_active.is_(True))
     if q:
-        stmt = stmt.where(Product.name.ilike(f"%{q}%"))
-    result = await db.execute(stmt.limit(200))
+        like = f"%{q.strip()}%"
+        stmt = stmt.where(
+            or_(
+                Product.name.ilike(like),
+                Product.sku.ilike(like),
+                Product.barcode.ilike(like),
+                Product.brand.ilike(like),
+                Product.id.in_(select(ProductBarcode.product_id).where(ProductBarcode.barcode.ilike(like))),
+            )
+        )
+    result = await db.execute(stmt.order_by(Product.name).limit(min(max(limit, 1), 500)).offset(max(offset, 0)))
     return list(result.scalars().all())
 
 
@@ -44,13 +56,54 @@ async def pull_catalogue(
     return ProductPullResponse(products=rows, revision_watermark=watermark)
 
 
+def _plain(value):
+    return float(value) if hasattr(value, "quantize") else value
+
+
+def _check_numbers(**values: float | None) -> None:
+    labels = {"selling_price": "Selling price", "mrp": "MRP", "purchase_price": "Purchase price", "pack_size": "Pack size", "tax_rate": "GST %"}
+    for key, value in values.items():
+        if value is None:
+            continue
+        if value < 0:
+            raise HTTPException(status_code=400, detail=f"{labels.get(key, key)} cannot be negative")
+        if key == "tax_rate" and value > 100:
+            raise HTTPException(status_code=400, detail="GST % must be between 0 and 100")
+
+
+async def _assert_unique(
+    db: AsyncSession, *, sku: str | None, barcodes: list[str], except_id: uuid.UUID | None = None
+) -> None:
+    if sku:
+        clash = (await db.execute(select(Product.id).where(Product.sku == sku))).scalar_one_or_none()
+        if clash is not None and clash != except_id:
+            raise HTTPException(status_code=409, detail=f"SKU {sku} already exists")
+    for code in barcodes:
+        owner = await barcode_owner(db, code)
+        if owner is not None and owner != except_id:
+            raise HTTPException(status_code=409, detail=f"Barcode {code} already belongs to another product")
+
+
 @router.post("", response_model=ProductOut, status_code=201)
 async def create_product(
     payload: ProductCreate,
     db: AsyncSession = Depends(get_db),
     current: CurrentUser = Depends(require_permission("catalog.product.create")),
 ) -> Product:
-    product = Product(**payload.model_dump())
+    data = payload.model_dump(exclude={"extra_barcodes"})
+    data["sku"] = data["sku"].strip()
+    data["name"] = data["name"].strip()
+    data["barcode"], extras = clean_barcodes(data["barcode"], payload.extra_barcodes)
+    if not data["sku"] or not data["name"]:
+        raise HTTPException(status_code=400, detail="SKU and name are required")
+    _check_numbers(selling_price=data["selling_price"], mrp=data["mrp"], purchase_price=data["purchase_price"], pack_size=data["pack_size"], tax_rate=data["tax_rate"])
+    if not data["mrp"]:
+        data["mrp"] = data["selling_price"]
+    elif data["mrp"] < data["selling_price"]:
+        raise HTTPException(status_code=400, detail="MRP cannot be lower than the selling price")
+    await _assert_unique(db, sku=data["sku"], barcodes=([data["barcode"]] if data["barcode"] else []) + extras)
+    product = Product(**data)
+    product.alt_barcodes = [ProductBarcode(barcode=code) for code in extras]
     db.add(product)
     await db.flush()
     await write_audit(
@@ -67,6 +120,96 @@ async def create_product(
     await db.commit()
     await db.refresh(product)
     return product
+
+
+@router.put("/{product_id}", response_model=ProductOut)
+async def update_product(
+    product_id: uuid.UUID,
+    payload: ProductUpdate,
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(require_permission("catalog.product.create")),
+) -> Product:
+    """Edit the details that are not customer-facing prices. Selling price and MRP
+    change through /price-change (approval)."""
+    product = await db.get(Product, product_id)
+    if product is None:
+        raise HTTPException(status_code=404, detail="Product not found")
+    changes = {k: v for k, v in payload.model_dump(exclude_unset=True, exclude={"extra_barcodes"}).items()}
+    if "name" in changes:
+        changes["name"] = (changes["name"] or "").strip()
+        if not changes["name"]:
+            raise HTTPException(status_code=400, detail="Name cannot be empty")
+    for key in ("hsn_code", "brand", "uom"):
+        if key in changes:
+            changes[key] = (changes[key] or "").strip() or None
+    # Barcodes: the final set (main + extras) is what must be unique.
+    main_in = changes.get("barcode", product.barcode)
+    extras_in = payload.extra_barcodes if payload.extra_barcodes is not None else [b.barcode for b in product.alt_barcodes]
+    new_main, new_extras = clean_barcodes(main_in, extras_in)
+    if "barcode" in changes:
+        changes["barcode"] = new_main
+    if changes.get("uom") is None and "uom" in changes:
+        changes.pop("uom")
+    _check_numbers(purchase_price=changes.get("purchase_price"), pack_size=changes.get("pack_size"), tax_rate=changes.get("tax_rate"))
+    await _assert_unique(db, sku=None, barcodes=([new_main] if new_main else []) + new_extras, except_id=product_id)
+    old = {k: _plain(getattr(product, k)) for k in changes}
+    old_extras = [b.barcode for b in product.alt_barcodes]
+    for key, value in changes.items():
+        setattr(product, key, value)
+    if payload.extra_barcodes is not None or "barcode" in changes:
+        keep = set(new_extras)
+        for existing in list(product.alt_barcodes):
+            if existing.barcode not in keep:
+                product.alt_barcodes.remove(existing)
+        have = {b.barcode for b in product.alt_barcodes}
+        await db.flush()  # free a code that moved from "extra" to "main" before the main column takes it
+        for code in new_extras:
+            if code not in have:
+                product.alt_barcodes.append(ProductBarcode(barcode=code))
+        if old_extras != new_extras:
+            changes["extra_barcodes"] = new_extras
+            old["extra_barcodes"] = old_extras
+    await bump_revision(db, product)
+    await write_audit(
+        db,
+        user_id=current.user_id,
+        role_code=current.role_code,
+        store_id=None,
+        device_id=current.device_id,
+        action="product.updated",
+        entity_type="product",
+        entity_id=product.id,
+        old_value=old,
+        new_value=changes,
+    )
+    await db.commit()
+    await db.refresh(product)
+    return product
+
+
+@router.post("/{product_id}/reactivate")
+async def reactivate_product(
+    product_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(require_permission("catalog.product.create")),
+) -> dict:
+    product = await db.get(Product, product_id)
+    if product is None:
+        raise HTTPException(status_code=404, detail="Product not found")
+    product.is_active = True
+    await bump_revision(db, product)
+    await write_audit(
+        db,
+        user_id=current.user_id,
+        role_code=current.role_code,
+        store_id=None,
+        device_id=current.device_id,
+        action="product.reactivated",
+        entity_type="product",
+        entity_id=product.id,
+    )
+    await db.commit()
+    return {"status": "active"}
 
 
 @router.post("/{product_id}/price-change")

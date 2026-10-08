@@ -36,6 +36,7 @@ from app.services import payments as payments_service
 from app.services import sms as sms_service
 from app.services.audit import write_audit
 from app.services.coupons import validate_and_apply_coupon
+from app.services.catalog import product_has_barcode
 from app.services.inventory import adjust_damaged, adjust_reserved, apply_movement, get_available_to_promise
 from app.services.loyalty import DuplicateLedgerEntry, apply_ledger_entry, get_config, get_earn_multiplier
 from app.services.pricing import resolve_price
@@ -263,7 +264,7 @@ async def pick_order(db: AsyncSession, *, current: CurrentUser, order: Order, pa
 
         if picked.scanned_barcode is not None:
             product = await db.get(Product, effective_product_id)
-            if product is None or product.barcode != picked.scanned_barcode:
+            if product is None or not await product_has_barcode(db, product, picked.scanned_barcode):
                 raise HTTPException(status_code=409, detail="Scanned barcode does not match the expected (or substituted) product")
 
         item.picked_qty = picked.picked_qty

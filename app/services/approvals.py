@@ -22,6 +22,7 @@ from app.api.deps import CurrentUser
 from app.models.models import ApprovalRequest, ApprovalRule, ApprovalStep, Product
 from app.services import rbac
 from app.services.audit import write_audit
+from app.services.catalog import bump_revision
 
 HandlerFn = Callable[[AsyncSession, ApprovalRequest], Awaitable[None]]
 _HANDLERS: dict[str, HandlerFn] = {}
@@ -306,7 +307,29 @@ async def _handle_price_change(db: AsyncSession, request: ApprovalRequest) -> No
         product.selling_price = request.new_value["selling_price"]
     if "mrp" in request.new_value:
         product.mrp = request.new_value["mrp"]
-    product.revision = product.revision + 1 if product.revision else 1
+    await bump_revision(db, product)
+
+
+@register_handler("bulk_price_change")
+async def _handle_bulk_price_change(db: AsyncSession, request: ApprovalRequest) -> None:
+    """Selling-price / MRP changes from a product import, approved as one request.
+    A product whose price moved since the import was read is skipped (stale), not overwritten."""
+    applied = skipped = 0
+    for change in (request.new_value or {}).get("changes", []):
+        product = await db.get(Product, uuid.UUID(change["product_id"]))
+        if product is None:
+            skipped += 1
+            continue
+        old = change.get("old") or {}
+        if any(old.get(f) is not None and abs(float(getattr(product, f)) - float(old[f])) >= 0.005 for f in ("selling_price", "mrp") if f in old):
+            skipped += 1
+            continue
+        for field, value in (change.get("new") or {}).items():
+            if field in ("selling_price", "mrp"):
+                setattr(product, field, value)
+        await bump_revision(db, product)
+        applied += 1
+    request.review_note = f"{applied} price change(s) applied, {skipped} skipped (product changed or missing)"
 
 
 @register_handler("scheduled_price_change")
@@ -332,6 +355,7 @@ async def _handle_product_deactivation(db: AsyncSession, request: ApprovalReques
         request.status = "stale"
         return
     product.is_active = False
+    await bump_revision(db, product)
 
 
 @register_handler("high_discount")
@@ -351,7 +375,7 @@ async def _handle_high_discount_noop(db: AsyncSession, request: ApprovalRequest)
     for field in ("percent", "flat_amount", "active"):
         if field in request.new_value:
             setattr(rule, field, request.new_value[field])
-    rule.revision = rule.revision + 1 if rule.revision else 1
+    await bump_revision(db, rule)
 
 
 @register_handler("loyalty_rule_change")

@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser, require_permission, require_store_access, require_warehouse_access
 from app.core.database import get_db
+from app.services.catalog import product_has_barcode
 from app.models.models import Product
 from app.models.models_phase2 import Warehouse
 from app.models.models_phase2 import Transfer
@@ -464,7 +465,7 @@ async def confirm_pick(
 
     if payload.scanned_barcode is not None:
         product = await db.get(Product, task.product_id)
-        if product is None or product.barcode != payload.scanned_barcode:
+        if product is None or not await product_has_barcode(db, product, payload.scanned_barcode):
             raise HTTPException(status_code=409, detail="Scanned barcode does not match this pick task's product")
 
     if payload.scanned_location_id is not None:

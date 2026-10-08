@@ -130,6 +130,7 @@ class TransferCreate(BaseModel):
     dest_type: str
     dest_id: uuid.UUID
     items: list[TransferItemIn]
+    note: str | None = None
 
 
 class TransferReceiveItem(BaseModel):
@@ -142,25 +143,62 @@ class TransferReceive(BaseModel):
 
 
 class TransferOut(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
+    """One transfer as a row: who sent what where, with totals — names, not IDs."""
+
     id: uuid.UUID
+    transfer_no: int
+    number: str  # TR-000123
     source_type: str
     source_id: uuid.UUID
+    source_name: str
     dest_type: str
     dest_id: uuid.UUID
+    dest_name: str
     status: str
+    note: str | None = None
+    dispatched_at: datetime | None = None
+    received_at: datetime | None = None
+    dispatched_by_name: str | None = None
+    received_by_name: str | None = None
+    line_count: int = 0
+    total_units: float = 0
+    total_value: float = 0  # at cost price
 
 
 class TransferItemOut(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
+    """One product line with everything a person checking the goods needs."""
+
     id: uuid.UUID
     product_id: uuid.UUID
+    sku: str
+    name: str
+    brand: str | None = None
+    barcode: str | None = None
+    hsn_code: str | None = None
+    tax_rate: float = 0
+    uom: str = "EA"
+    unit_cost: float = 0
     dispatched_qty: float
     received_qty: float | None
+    difference: float | None = None  # received - dispatched (negative = short)
+    value: float = 0  # dispatched qty x cost
 
 
 class TransferDetailOut(TransferOut):
     items: list[TransferItemOut]
+
+
+class TransferSourceStockOut(BaseModel):
+    product_id: uuid.UUID
+    sku: str
+    name: str
+    brand: str | None = None
+    barcode: str | None = None
+    hsn_code: str | None = None
+    tax_rate: float = 0
+    uom: str = "EA"
+    unit_cost: float = 0
+    available: float
 
 
 # ---------------------------------------------------------------------------

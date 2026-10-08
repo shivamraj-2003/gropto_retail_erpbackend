@@ -16,7 +16,8 @@ from fastapi import HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser
-from app.models.models_phase2 import Transfer, TransferItem
+from app.models.models import Product, Store
+from app.models.models_phase2 import Transfer, TransferItem, Warehouse
 from app.schemas.schemas_phase2 import TransferCreate, TransferReceive
 from app.services.approvals import approval_threshold, submit_or_apply
 from app.services.audit import write_audit
@@ -25,7 +26,36 @@ from app.services.inventory import adjust_in_transit, adjust_warehouse_balance, 
 DISCREPANCY_APPROVAL_THRESHOLD = 20  # absolute units variance on any one line; above this needs review before closing
 
 
+async def _assert_place_exists(db: AsyncSession, kind: str, place_id) -> str:
+    if kind == "store":
+        place = await db.get(Store, place_id)
+    elif kind == "warehouse":
+        place = await db.get(Warehouse, place_id)
+    else:
+        raise HTTPException(status_code=400, detail=f"Unknown place type {kind}")
+    if place is None:
+        raise HTTPException(status_code=404, detail=f"That {kind} was not found")
+    if not getattr(place, "is_active", True):
+        raise HTTPException(status_code=409, detail=f"{place.name} is switched off")
+    return place.name
+
+
 async def dispatch_transfer(db: AsyncSession, *, current: CurrentUser, payload: TransferCreate) -> Transfer:
+    if not payload.items:
+        raise HTTPException(status_code=400, detail="Add at least one product to transfer")
+    if payload.source_type == payload.dest_type and payload.source_id == payload.dest_id:
+        raise HTTPException(status_code=400, detail="From and To are the same place — pick a different destination")
+    await _assert_place_exists(db, payload.source_type, payload.source_id)
+    await _assert_place_exists(db, payload.dest_type, payload.dest_id)
+    seen_products = set()
+    for item in payload.items:
+        if item.dispatched_qty <= 0:
+            raise HTTPException(status_code=400, detail="Every quantity must be more than 0")
+        if item.product_id in seen_products:
+            raise HTTPException(status_code=400, detail="The same product is listed twice — combine it into one line")
+        seen_products.add(item.product_id)
+        if await db.get(Product, item.product_id) is None:
+            raise HTTPException(status_code=404, detail="A product in this transfer was not found")
     for item in payload.items:
         if payload.source_type == "store":
             balance = await get_balance(db, product_id=item.product_id, store_id=payload.source_id)
@@ -34,9 +64,10 @@ async def dispatch_transfer(db: AsyncSession, *, current: CurrentUser, payload: 
         else:
             raise HTTPException(status_code=400, detail=f"Unknown source_type {payload.source_type}")
         if balance < item.dispatched_qty:
+            product = await db.get(Product, item.product_id)
             raise HTTPException(
                 status_code=409,
-                detail=f"Insufficient stock for product {item.product_id}: have {balance}, dispatching {item.dispatched_qty}",
+                detail=f"Not enough stock of {product.name} ({product.sku}): {balance:g} available, you are sending {item.dispatched_qty:g}",
             )
 
     transfer = Transfer(
@@ -46,6 +77,7 @@ async def dispatch_transfer(db: AsyncSession, *, current: CurrentUser, payload: 
         dest_id=payload.dest_id,
         status="dispatched",
         dispatched_by=current.user_id,
+        note=(payload.note or "").strip() or None,
     )
     db.add(transfer)
     await db.flush()
@@ -91,10 +123,15 @@ async def receive_transfer(db: AsyncSession, *, current: CurrentUser, transfer: 
 
     discrepancy = False
     items_by_id = {item.id: item for item in transfer.items}
+    sent_ids = {r.transfer_item_id for r in payload.items}
+    if sent_ids != set(items_by_id) or len(payload.items) != len(items_by_id):
+        raise HTTPException(status_code=400, detail="Enter the received quantity for every product in this transfer")
     for received in payload.items:
         item = items_by_id.get(received.transfer_item_id)
         if item is None:
             raise HTTPException(status_code=400, detail="Unknown transfer item")
+        if received.received_qty < 0:
+            raise HTTPException(status_code=400, detail="Received quantity cannot be negative")
         item.received_qty = received.received_qty
         if received.received_qty != item.dispatched_qty:
             discrepancy = True
@@ -175,5 +212,43 @@ async def resolve_discrepancy(db: AsyncSession, *, current: CurrentUser, transfe
         entity_type="transfer",
         entity_id=transfer.id,
         reason=note,
+    )
+    return transfer
+
+
+async def cancel_transfer(db: AsyncSession, *, current: CurrentUser, transfer: Transfer, reason: str | None) -> Transfer:
+    """Called off before it arrived: the goods go back to the sender and the
+    inbound figure at the destination is cleared."""
+    if transfer.status != "dispatched":
+        raise HTTPException(status_code=409, detail=f"Only a transfer still on its way can be cancelled (this one is {transfer.status})")
+    for item in transfer.items:
+        qty = float(item.dispatched_qty)
+        if transfer.source_type == "store":
+            await apply_movement(
+                db,
+                product_id=item.product_id,
+                store_id=transfer.source_id,
+                delta=qty,
+                reason_code="transfer_cancelled",
+                source_type="transfer_cancel",
+                source_id=item.id,
+                created_by=current.user_id,
+                device_id=current.device_id,
+            )
+        else:
+            await adjust_warehouse_balance(db, product_id=item.product_id, warehouse_id=transfer.source_id, delta=qty)
+        if transfer.dest_type == "store":
+            await adjust_in_transit(db, product_id=item.product_id, store_id=transfer.dest_id, delta=-qty)
+    transfer.status = "cancelled"
+    await write_audit(
+        db,
+        user_id=current.user_id,
+        role_code=current.role_code,
+        store_id=transfer.source_id if transfer.source_type == "store" else None,
+        device_id=current.device_id,
+        action="transfer.cancelled",
+        entity_type="transfer",
+        entity_id=transfer.id,
+        reason=reason,
     )
     return transfer
