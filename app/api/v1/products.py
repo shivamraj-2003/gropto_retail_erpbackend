@@ -6,7 +6,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser, require_permission
 from app.core.database import get_db
-from app.models.models import Product, ProductBarcode
+from app.models.models import InventoryBalance, Product, ProductBarcode, Store
+from app.models.models_phase2 import Warehouse, WarehouseBalance
 from app.schemas.schemas import ProductCreate, ProductOut, ProductPriceChangeRequest, ProductPullResponse, ProductUpdate
 from app.services.approvals import submit_or_apply
 from app.services.audit import write_audit
@@ -35,6 +36,7 @@ async def list_products(
                 Product.sku.ilike(like),
                 Product.barcode.ilike(like),
                 Product.brand.ilike(like),
+                Product.hsn_code.ilike(like),
                 Product.id.in_(select(ProductBarcode.product_id).where(ProductBarcode.barcode.ilike(like))),
             )
         )
@@ -210,6 +212,41 @@ async def reactivate_product(
     )
     await db.commit()
     return {"status": "active"}
+
+
+@router.get("/{product_id}/stock")
+async def product_stock(
+    product_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(require_permission("catalog.product.view")),
+) -> dict:
+    """Where this product is: quantity in every store and warehouse the caller may see."""
+    product = await db.get(Product, product_id)
+    if product is None:
+        raise HTTPException(status_code=404, detail="Product not found")
+    places: list[dict] = []
+    store_rows = (
+        await db.execute(
+            select(Store.id, Store.name, Store.code, InventoryBalance.quantity, InventoryBalance.reserved, InventoryBalance.in_transit)
+            .join(InventoryBalance, InventoryBalance.store_id == Store.id)
+            .where(InventoryBalance.product_id == product_id)
+        )
+    ).all()
+    for sid, name, code, qty, reserved, in_transit in store_rows:
+        if current.owns_store(sid):
+            places.append({"place_type": "store", "place_id": str(sid), "name": name, "code": code, "quantity": float(qty), "reserved": float(reserved), "on_the_way": float(in_transit)})
+    wh_rows = (
+        await db.execute(
+            select(Warehouse.id, Warehouse.name, Warehouse.code, WarehouseBalance.quantity)
+            .join(WarehouseBalance, WarehouseBalance.warehouse_id == Warehouse.id)
+            .where(WarehouseBalance.product_id == product_id)
+        )
+    ).all()
+    for wid, name, code, qty in wh_rows:
+        if current.owns_warehouse(wid):
+            places.append({"place_type": "warehouse", "place_id": str(wid), "name": name, "code": code, "quantity": float(qty), "reserved": 0.0, "on_the_way": 0.0})
+    places.sort(key=lambda r: (-r["quantity"], r["name"]))
+    return {"places": places, "total": round(sum(r["quantity"] for r in places), 3)}
 
 
 @router.post("/{product_id}/price-change")

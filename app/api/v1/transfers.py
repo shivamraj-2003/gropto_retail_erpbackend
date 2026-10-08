@@ -162,6 +162,7 @@ async def list_transfers(
                 Product.name.ilike(like),
                 Product.sku.ilike(like),
                 Product.barcode.ilike(like),
+                Product.hsn_code.ilike(like),
                 Product.id.in_(select(ProductBarcode.product_id).where(ProductBarcode.barcode.ilike(like))),
             )
         )
@@ -213,6 +214,7 @@ async def source_stock(
                 Product.sku.ilike(like),
                 Product.brand.ilike(like),
                 Product.barcode.ilike(like),
+                Product.hsn_code.ilike(like),
                 Product.id.in_(select(ProductBarcode.product_id).where(ProductBarcode.barcode.ilike(like))),
             )
         )
