@@ -82,8 +82,11 @@ async def create_user(
             raise HTTPException(status_code=403, detail="Cannot assign a store outside your scope")
     if not payload.email and not payload.phone:
         raise HTTPException(status_code=400, detail="email or phone required")
-    if payload.role_code in SINGLE_STORE_ROLES and len(payload.store_ids) > 1:
-        raise HTTPException(status_code=400, detail=f"{payload.role_code} can only be assigned to one store")
+    if payload.role_code in SINGLE_STORE_ROLES and len(payload.store_ids) != 1:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{payload.role_code.replace('_', ' ').title()} must be assigned to exactly one store — pick the store they work in",
+        )
 
     if payload.email:
         existing = await db.execute(select(User).where(User.email == payload.email))
@@ -146,8 +149,10 @@ async def update_user(
     for store_id in payload.store_ids or []:
         if not current.owns_store(store_id):
             raise HTTPException(status_code=403, detail="Cannot assign a store outside your scope")
-    if payload.store_ids is not None and effective_role in SINGLE_STORE_ROLES and len(payload.store_ids) > 1:
-        raise HTTPException(status_code=400, detail=f"{effective_role} can only be assigned to one store")
+    if payload.store_ids is not None and effective_role in SINGLE_STORE_ROLES and len(payload.store_ids) != 1:
+        raise HTTPException(status_code=400, detail=f"{effective_role} must be assigned to exactly one store")
+    if payload.store_ids is None and effective_role in SINGLE_STORE_ROLES and not current_store_ids:
+        raise HTTPException(status_code=400, detail=f"{effective_role} needs a store — pick one for this user")
 
     old_value: dict = {"role_code": current_role_code, "store_ids": [str(s) for s in current_store_ids]}
     new_value: dict = {}

@@ -63,6 +63,18 @@ async def _load_user_store_ids(db: AsyncSession, user_id: uuid.UUID) -> list[uui
     return list({*direct.scalars().all(), *via_cluster.scalars().all()})
 
 
+async def _token_store_ids(db: AsyncSession, user_id: uuid.UUID, device: Device | None) -> list[str]:
+    """Stores the signed-in session works on. The till's own store comes first
+    (bills, cash and shifts belong to the till); a user with no assigned store
+    — a CEO, say, or any all-stores role — still gets the till's store so
+    billing and cash work there instead of failing with "no store"."""
+    ids = [str(s) for s in await _load_user_store_ids(db, user_id)]
+    home = str(device.store_id) if device is not None and device.store_id else None
+    if home:
+        ids = [home] + [s for s in ids if s != home] if (home in ids or not ids) else ids
+    return ids
+
+
 async def _default_device_fingerprint(db: AsyncSession, user: User) -> str:
     """Fallback identity for a login that carries no device_fingerprint.
 
@@ -141,8 +153,16 @@ async def login(payload: LoginRequest, db: AsyncSession = Depends(get_db)) -> Lo
     # company scope counts as assignment) instead of a hardcoded role list.
     access = await resolve_access(db, user)
     if not access.global_scope:
+        if not access.store_ids:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You are not assigned to any store yet. Ask an administrator to assign you one.",
+            )
         if device.store_id and device.store_id not in access.store_ids:
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="User not assigned to this store")
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You are not assigned to the store this till belongs to. Ask an administrator to assign you to it.",
+            )
     device.last_seen_at = datetime.now(timezone.utc)
 
     if user.mfa_enabled:
@@ -158,7 +178,7 @@ async def login(payload: LoginRequest, db: AsyncSession = Depends(get_db)) -> Lo
 
 
 async def _issue_tokens(db: AsyncSession, *, user: User, role: Role, device: Device) -> tuple[str, str]:
-    store_ids = [str(s) for s in await _load_user_store_ids(db, user.id)]
+    store_ids = await _token_store_ids(db, user.id, device)
     access_token = create_access_token(
         user_id=user.id, role_code=role.code, store_ids=store_ids, device_id=str(device.id)
     )
@@ -323,7 +343,7 @@ async def refresh(payload: RefreshRequest, db: AsyncSession = Depends(get_db)) -
 
     role = await db.get(Role, user.role_id)
 
-    store_ids = [str(s) for s in await _load_user_store_ids(db, user.id)]
+    store_ids = await _token_store_ids(db, user.id, device)
 
     # Rotate: revoke old, issue new in the same family.
     token_row.revoked = True
@@ -639,10 +659,22 @@ async def me(current: CurrentUser = Depends(get_current_user), db: AsyncSession 
         device = await db.get(Device, current.device_id)
         device_code = device.code if device else None
 
-    primary_store_code = None
-    if current.store_ids:
-        store = await db.get(Store, current.store_ids[0])
-        primary_store_code = store.code if store else None
+    home_store_id = None
+    if current.device_id:
+        device = await db.get(Device, current.device_id)
+        home_store_id = device.store_id if device and device.store_id else None
+    # Stores shown on the profile: the assigned ones, plus the till's own store
+    # (for all-stores roles with nothing assigned, that is the store they bill in).
+    shown_ids = list(dict.fromkeys(([home_store_id] if home_store_id else []) + list(current.store_ids)))
+    store_rows = (
+        (await db.execute(select(Store).where(Store.id.in_(shown_ids)))).scalars().all() if shown_ids else []
+    )
+    by_id = {s.id: s for s in store_rows}
+    store_details = [
+        {"id": str(sid), "code": by_id[sid].code, "name": by_id[sid].name} for sid in shown_ids if sid in by_id
+    ]
+    primary_store = by_id.get(home_store_id) if home_store_id else (by_id.get(current.store_ids[0]) if current.store_ids else None)
+    primary_store_code = primary_store.code if primary_store else None
 
     access = current.access
     return {
@@ -655,6 +687,8 @@ async def me(current: CurrentUser = Depends(get_current_user), db: AsyncSession 
         "all_stores": current.sees_all_stores(),
         "permissions": sorted(current.permissions),
         "stores": [str(s) for s in current.store_ids],
+        "store_details": store_details,
+        "home_store_id": str(home_store_id) if home_store_id else None,
         "device_id": str(current.device_id) if current.device_id else None,
         # Needed on-device to format bill numbers as store_code-device_code-seq
         # (§4 of the plan) rather than an opaque sequence.
