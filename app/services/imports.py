@@ -177,12 +177,13 @@ async def commit_products_batch(db: AsyncSession, batch_id: uuid.UUID, current: 
 
     created, updated = 0, 0
     price_changes: list[dict] = []
+    by_sku = {p.sku: p for p in (await db.execute(select(Product))).scalars().all()}
 
     for row in batch.rows:
         if row.computed_action not in ("create", "update") or row.validation_messages:
             continue
         v = row.parsed_values
-        product = (await db.execute(select(Product).where(Product.sku == v["sku"]))).scalar_one_or_none()
+        product = by_sku.get(v["sku"])
         if row.computed_action == "create" and product is None:
             product = Product(
                 sku=v["sku"], name=v["name"], barcode=v.get("barcode"), uom=v.get("uom") or "EA",
@@ -191,6 +192,7 @@ async def commit_products_batch(db: AsyncSession, batch_id: uuid.UUID, current: 
             )
             product.alt_barcodes = [ProductBarcode(barcode=c) for c in v.get("other_barcodes", []) if c != product.barcode]
             db.add(product)
+            by_sku[product.sku] = product
             created += 1
             continue
         if product is None:

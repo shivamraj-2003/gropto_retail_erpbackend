@@ -1,7 +1,10 @@
+import io
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import or_, select
+from fastapi.responses import StreamingResponse
+from openpyxl import Workbook
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser, require_permission
@@ -16,19 +19,10 @@ from app.services.catalog import barcode_owner, bump_revision, clean_barcodes
 router = APIRouter(prefix="/products", tags=["products"])
 
 
-@router.get("", response_model=list[ProductOut])
-async def list_products(
-    q: str | None = None,
-    active_only: bool = True,
-    limit: int = 200,
-    offset: int = 0,
-    db: AsyncSession = Depends(get_db),
-    _current: CurrentUser = Depends(require_permission("catalog.product.view")),
-) -> list[Product]:
-    stmt = select(Product)
+def _filtered(stmt, q: str | None, active_only: bool, missing: str | None):
     if active_only:
         stmt = stmt.where(Product.is_active.is_(True))
-    if q:
+    if q and q.strip():
         like = f"%{q.strip()}%"
         stmt = stmt.where(
             or_(
@@ -40,8 +34,78 @@ async def list_products(
                 Product.id.in_(select(ProductBarcode.product_id).where(ProductBarcode.barcode.ilike(like))),
             )
         )
+    # "Needs attention" views for a big catalogue: what is still incomplete.
+    if missing == "hsn":
+        stmt = stmt.where(or_(Product.hsn_code.is_(None), Product.hsn_code == ""))
+    elif missing == "barcode":
+        stmt = stmt.where(or_(Product.barcode.is_(None), Product.barcode == ""))
+    elif missing == "price":
+        stmt = stmt.where(or_(Product.selling_price <= 0, Product.mrp <= 0))
+    elif missing == "cost":
+        stmt = stmt.where(Product.purchase_price <= 0)
+    return stmt
+
+
+@router.get("", response_model=list[ProductOut])
+async def list_products(
+    q: str | None = None,
+    active_only: bool = True,
+    missing: str | None = None,
+    limit: int = 200,
+    offset: int = 0,
+    db: AsyncSession = Depends(get_db),
+    _current: CurrentUser = Depends(require_permission("catalog.product.view")),
+) -> list[Product]:
+    """`missing` = hsn | barcode | price | cost keeps only products still lacking that."""
+    stmt = _filtered(select(Product), q, active_only, missing)
     result = await db.execute(stmt.order_by(Product.name).limit(min(max(limit, 1), 500)).offset(max(offset, 0)))
     return list(result.scalars().all())
+
+
+@router.get("/count")
+async def count_products(
+    q: str | None = None,
+    active_only: bool = True,
+    missing: str | None = None,
+    db: AsyncSession = Depends(get_db),
+    _current: CurrentUser = Depends(require_permission("catalog.product.view")),
+) -> dict:
+    stmt = _filtered(select(func.count()).select_from(Product), q, active_only, missing)
+    return {"total": (await db.execute(stmt)).scalar_one()}
+
+
+@router.get("/export")
+async def export_products(
+    q: str | None = None,
+    active_only: bool = True,
+    missing: str | None = None,
+    db: AsyncSession = Depends(get_db),
+    _current: CurrentUser = Depends(require_permission("catalog.product.view")),
+) -> StreamingResponse:
+    """Every product (or the filtered ones) in the same columns the import reads, so the
+    file can be edited in Excel and uploaded back through Import Data."""
+    rows = (await db.execute(_filtered(select(Product), q, active_only, missing).order_by(Product.name))).scalars().all()
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Products"
+    ws.append(["sku", "name", "barcode", "uom", "purchase_price", "selling_price", "mrp", "tax_rate", "hsn_code", "other_barcodes"])
+    for p in rows:
+        ws.append(
+            [
+                p.sku, p.name, p.barcode or "", p.uom, float(p.purchase_price), float(p.selling_price), float(p.mrp),
+                float(p.tax_rate), p.hsn_code or "", ", ".join(b.barcode for b in p.alt_barcodes),
+            ]
+        )
+    for col, width in zip("ABCDEFGHIJ", (16, 36, 18, 8, 14, 14, 10, 8, 12, 30)):
+        ws.column_dimensions[col].width = width
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": 'attachment; filename="products.xlsx"'},
+    )
 
 
 @router.get("/pull", response_model=ProductPullResponse)
