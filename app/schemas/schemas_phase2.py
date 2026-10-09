@@ -316,6 +316,9 @@ class PurchaseOrderItemOut(BaseModel):
     discount_amount: float
     tax_rate: float
     received_qty: float
+    product_name: str | None = None
+    product_sku: str | None = None
+    hsn_code: str | None = None
 
 
 class PurchaseOrderOut(BaseModel):

@@ -196,6 +196,19 @@ class PurchaseOrderItem(Base):
     # this PO line — the field that was missing entirely, which is why
     # over/under-receiving was never checked.
     received_qty: Mapped[float] = mapped_column(Numeric(12, 3), default=0)
+    product = relationship("Product", lazy="joined")
+
+    @property
+    def product_name(self) -> str | None:
+        return self.product.name if self.product else None
+
+    @property
+    def product_sku(self) -> str | None:
+        return self.product.sku if self.product else None
+
+    @property
+    def hsn_code(self) -> str | None:
+        return getattr(self.product, "hsn_code", None) if self.product else None
 
 
 class VendorPerformanceSnapshot(Base):
