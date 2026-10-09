@@ -2,14 +2,14 @@ import uuid
 from datetime import date
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import func, select, text
+from sqlalchemy import func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import CurrentUser, require_permission, require_store_access, require_warehouse_access
+from app.api.deps import CurrentUser, require_any_permission, require_permission, require_store_access, require_warehouse_access
 from app.core.database import get_db
 from app.services.catalog import product_has_barcode
-from app.models.models import Product
-from app.models.models_phase2 import Warehouse
+from app.models.models import Product, ProductBarcode
+from app.models.models_phase2 import Warehouse, WarehouseBalance
 from app.models.models_phase2 import Transfer
 from app.models.models_phase4 import (
     InventoryBatch,
@@ -39,6 +39,79 @@ from app.services.inventory import adjust_warehouse_balance, get_warehouse_balan
 from app.services.transfers import dispatch_transfer
 
 router = APIRouter(prefix="/wms", tags=["wms"])
+
+
+@router.get("/stock")
+async def warehouse_stock(
+    warehouse_id: uuid.UUID,
+    q: str | None = None,
+    limit: int = 10,
+    offset: int = 0,
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(
+        require_any_permission("wms.pick.view", "wms.putaway.view", "wms.indent.view", "wms.batch.view", "inventory.stock.view")
+    ),
+) -> dict:
+    """What is in one warehouse: every product with stock, with HSN, cost value and the soonest expiry.
+    Search by name, SKU, brand, HSN or any barcode of a product."""
+    require_warehouse_access(warehouse_id, current)
+    if await db.get(Warehouse, warehouse_id) is None:
+        raise HTTPException(status_code=404, detail="Warehouse not found")
+    base = (
+        select(Product, WarehouseBalance.quantity)
+        .join(WarehouseBalance, WarehouseBalance.product_id == Product.id)
+        .where(WarehouseBalance.warehouse_id == warehouse_id, WarehouseBalance.quantity != 0)
+    )
+    if q and q.strip():
+        like = f"%{q.strip()}%"
+        base = base.where(
+            or_(
+                Product.name.ilike(like), Product.sku.ilike(like), Product.brand.ilike(like), Product.barcode.ilike(like),
+                Product.hsn_code.ilike(like),
+                Product.id.in_(select(ProductBarcode.product_id).where(ProductBarcode.barcode.ilike(like))),
+            )
+        )
+    sub_q = base.subquery()
+    total = (await db.execute(select(func.count()).select_from(sub_q))).scalar_one()
+    sums = (
+        await db.execute(
+            select(
+                func.coalesce(func.sum(WarehouseBalance.quantity), 0),
+                func.coalesce(func.sum(WarehouseBalance.quantity * Product.purchase_price), 0),
+            )
+            .select_from(WarehouseBalance)
+            .join(Product, Product.id == WarehouseBalance.product_id)
+            .where(WarehouseBalance.warehouse_id == warehouse_id, WarehouseBalance.quantity != 0, Product.id.in_(select(sub_q.c.id)))
+        )
+    ).one()
+    capped = min(max(limit, 1), 200)
+    rows = (await db.execute(base.order_by(Product.name).limit(capped).offset(max(offset, 0)))).all()
+    ids = [p.id for p, _ in rows]
+    batch_info: dict = {}
+    if ids:
+        for pid, n, soonest in (
+            await db.execute(
+                select(InventoryBatch.product_id, func.count(), func.min(InventoryBatch.expiry_date))
+                .where(InventoryBatch.warehouse_id == warehouse_id, InventoryBatch.product_id.in_(ids), InventoryBatch.quantity > 0)
+                .group_by(InventoryBatch.product_id)
+            )
+        ).all():
+            batch_info[pid] = (n, soonest)
+    items = []
+    for p, quantity in rows:
+        n, soonest = batch_info.get(p.id, (0, None))
+        items.append(
+            {
+                "product_id": str(p.id), "sku": p.sku, "name": p.name, "brand": p.brand, "barcode": p.barcode,
+                "hsn_code": p.hsn_code, "tax_rate": float(p.tax_rate), "uom": p.uom, "quantity": float(quantity),
+                "unit_cost": float(p.purchase_price), "value": round(float(quantity) * float(p.purchase_price), 2),
+                "batch_count": n, "nearest_expiry": soonest.isoformat() if soonest else None,
+            }
+        )
+    return {
+        "items": items, "total": total, "limit": capped, "offset": offset,
+        "total_units": round(float(sums[0]), 3), "total_value": round(float(sums[1]), 2),
+    }
 
 
 @router.get("/batches", response_model=list[InventoryBatchOut])

@@ -453,12 +453,30 @@ async def list_coupons(
     return list(result.scalars().all())
 
 
+def _check_coupon(payload: CouponCreate) -> None:
+    if not payload.code.strip():
+        raise HTTPException(status_code=400, detail="Coupon code is required")
+    if payload.discount_type not in ("percent", "flat"):
+        raise HTTPException(status_code=400, detail="Discount type must be percent or flat")
+    if payload.discount_value <= 0:
+        raise HTTPException(status_code=400, detail="Discount value must be more than 0")
+    if payload.discount_type == "percent" and payload.discount_value > 100:
+        raise HTTPException(status_code=400, detail="A percentage discount cannot be more than 100")
+    if payload.start_date and payload.end_date and payload.end_date < payload.start_date:
+        raise HTTPException(status_code=400, detail="The end date is before the start date")
+    for label, value in (("Minimum cart", payload.min_cart_value), ("Maximum discount", payload.max_discount_amount)):
+        if value is not None and value < 0:
+            raise HTTPException(status_code=400, detail=f"{label} cannot be negative")
+
+
 @router.post("/coupons", response_model=CouponOut, status_code=201)
 async def create_coupon(
     payload: CouponCreate,
     db: AsyncSession = Depends(get_db),
     current: CurrentUser = Depends(require_permission("promotion.coupon.create")),
 ) -> Coupon:
+    _check_coupon(payload)
+    payload.code = payload.code.strip().upper()
     existing = (await db.execute(select(Coupon).where(Coupon.code == payload.code))).scalar_one_or_none()
     if existing is not None:
         raise HTTPException(status_code=409, detail=f"Coupon code {payload.code} already exists")
@@ -491,6 +509,11 @@ async def update_coupon(
     coupon = await db.get(Coupon, coupon_id)
     if coupon is None:
         raise HTTPException(status_code=404, detail="Coupon not found")
+    _check_coupon(payload)
+    payload.code = payload.code.strip().upper()
+    clash = (await db.execute(select(Coupon.id).where(Coupon.code == payload.code))).scalar_one_or_none()
+    if clash is not None and clash != coupon.id:
+        raise HTTPException(status_code=409, detail=f"Coupon code {payload.code} already exists")
     old_value = {"active": coupon.active, "discount_value": float(coupon.discount_value)}
     for field, value in payload.model_dump().items():
         setattr(coupon, field, value)
@@ -509,3 +532,29 @@ async def update_coupon(
     await db.commit()
     await db.refresh(coupon)
     return coupon
+
+
+@router.delete("/coupons/{coupon_id}")
+async def delete_coupon(
+    coupon_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(require_permission("promotion.coupon.update")),
+) -> dict:
+    """Only a coupon nobody has used can be deleted; a used one is switched off instead so its history stays."""
+    from sqlalchemy import func
+
+    from app.models.models_phase4 import CouponRedemption
+
+    coupon = await db.get(Coupon, coupon_id)
+    if coupon is None:
+        raise HTTPException(status_code=404, detail="Coupon not found")
+    used = (await db.execute(select(func.count()).select_from(CouponRedemption).where(CouponRedemption.coupon_id == coupon_id))).scalar_one()
+    if used:
+        raise HTTPException(status_code=409, detail=f"{coupon.code} has been used {used} time(s) — switch it off instead of deleting it")
+    await write_audit(
+        db, user_id=current.user_id, role_code=current.role_code, store_id=None, device_id=current.device_id,
+        action="coupon.deleted", entity_type="coupon", entity_id=coupon.id, old_value={"code": coupon.code},
+    )
+    await db.delete(coupon)
+    await db.commit()
+    return {"status": "deleted"}

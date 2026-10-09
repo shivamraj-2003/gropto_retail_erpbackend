@@ -118,6 +118,53 @@ async def create_loyalty_tier(
     return tier
 
 
+@router.put("/loyalty/tiers/{tier_id}", response_model=LoyaltyTierOut)
+async def update_loyalty_tier(
+    tier_id: uuid.UUID,
+    payload: LoyaltyTierIn,
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(require_permission("loyalty.tier.create")),
+) -> LoyaltyTier:
+    tier = await db.get(LoyaltyTier, tier_id)
+    if tier is None:
+        raise HTTPException(status_code=404, detail="Tier not found")
+    if not payload.name.strip():
+        raise HTTPException(status_code=400, detail="Tier name is required")
+    if payload.min_lifetime_points < 0 or payload.earn_rate_multiplier <= 0:
+        raise HTTPException(status_code=400, detail="Minimum points cannot be negative and the multiplier must be above 0")
+    old = {"name": tier.name, "min_lifetime_points": float(tier.min_lifetime_points), "earn_rate_multiplier": float(tier.earn_rate_multiplier)}
+    for key, value in payload.model_dump().items():
+        setattr(tier, key, value)
+    await write_audit(
+        db, user_id=current.user_id, role_code=current.role_code, store_id=None, device_id=current.device_id,
+        action="loyalty_tier.updated", entity_type="loyalty_tier", entity_id=tier.id, old_value=old, new_value=payload.model_dump(mode="json"),
+    )
+    await db.commit()
+    await db.refresh(tier)
+    return tier
+
+
+@router.delete("/loyalty/tiers/{tier_id}")
+async def delete_loyalty_tier(
+    tier_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(require_permission("loyalty.tier.create")),
+) -> dict:
+    """A tier is only a rule ("from N lifetime points, earn x times faster"); customers' tiers are worked out
+    from their points, so removing one changes nobody's points — they simply fall back to the tier below."""
+    tier = await db.get(LoyaltyTier, tier_id)
+    if tier is None:
+        raise HTTPException(status_code=404, detail="Tier not found")
+    await write_audit(
+        db, user_id=current.user_id, role_code=current.role_code, store_id=None, device_id=current.device_id,
+        action="loyalty_tier.deleted", entity_type="loyalty_tier", entity_id=tier.id,
+        old_value={"name": tier.name, "min_lifetime_points": float(tier.min_lifetime_points)},
+    )
+    await db.delete(tier)
+    await db.commit()
+    return {"status": "deleted"}
+
+
 @router.get("/loyalty/customers/{customer_id}/tier")
 async def get_customer_tier(
     customer_id: uuid.UUID,

@@ -1,5 +1,7 @@
 import uuid
 
+from pydantic import BaseModel
+
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -177,6 +179,52 @@ async def update_user(
     if request.status == "approved":
         return UserUpdateResult(status="updated")
     return UserUpdateResult(status="pending_approval", request_id=request.id)
+
+
+class UserActiveIn(BaseModel):
+    active: bool
+
+
+@router.post("/{user_id}/active")
+async def set_user_active(
+    user_id: uuid.UUID,
+    payload: UserActiveIn,
+    current: CurrentUser = Depends(require_permission("user.user.update")),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Switch a person off (they left) or back on. Their history stays; they just cannot sign in.
+    Switching off also signs them out of every device."""
+    from app.models.models import RefreshToken
+    from app.services.audit import write_audit
+
+    user = await db.get(User, user_id)
+    if user is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    if user.id == current.user_id:
+        raise HTTPException(status_code=400, detail="You cannot switch off your own account")
+    await assert_can_manage_user(db, current, user)
+    if not payload.active and user.is_super_admin:
+        others = (
+            await db.execute(select(func.count()).select_from(User).where(User.is_super_admin.is_(True), User.is_active.is_(True), User.id != user.id))
+        ).scalar_one()
+        if others == 0:
+            raise HTTPException(status_code=409, detail="This is the last active Super Admin — it cannot be switched off")
+    user.is_active = payload.active
+    if not payload.active:
+        for token in (await db.execute(select(RefreshToken).where(RefreshToken.user_id == user.id, RefreshToken.revoked.is_(False)))).scalars().all():
+            token.revoked = True
+    await write_audit(
+        db,
+        user_id=current.user_id,
+        role_code=current.role_code,
+        store_id=None,
+        device_id=current.device_id,
+        action="user.activated" if payload.active else "user.deactivated",
+        entity_type="user",
+        entity_id=user.id,
+    )
+    await db.commit()
+    return {"status": "active" if payload.active else "switched_off"}
 
 
 @router.post("/{user_id}/reset-password", status_code=204)
