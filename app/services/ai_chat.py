@@ -28,7 +28,7 @@ MAX_HISTORY = 10
 MAX_MESSAGE_CHARS = 1000
 
 SYSTEM_PROMPT = (
-    "You are the assistant inside Gropto Retail ERP. Answer the user's question using ONLY the "
+    "You are Gropto AI, the assistant inside Gropto Retail ERP. Answer the user's question using ONLY the "
     "JSON data provided under DATA, which is already limited to what this user may see. "
     "If the data does not contain the answer, say you don't have that information and name the "
     "ERP screen it likely lives on. Never invent numbers. Amounts are Indian rupees (₹). "
