@@ -19,6 +19,7 @@ from app.schemas.schemas_phase4 import (
     SavedAudienceOut,
 )
 from app.services import crm as crm_service
+from app.services import crm_store
 from app.services.audit import write_audit
 from app.services.channels import get_supported_channels
 
@@ -50,9 +51,13 @@ async def customer_360(
 
 @router.get("/segments/rfm")
 async def rfm_segments(
+    store_id: uuid.UUID | None = None,
     db: AsyncSession = Depends(get_db),
-    _current: CurrentUser = Depends(require_permission("crm.analytics.view")),
+    current: CurrentUser = Depends(require_permission("crm.analytics.view")),
 ) -> list[dict]:
+    if store_id is not None:
+        require_store_access(store_id, current)
+        return await crm_store.rfm_segments(db, store_id)
     return await crm_service.rfm_segments(db)
 
 
@@ -190,9 +195,13 @@ async def list_customers(
 
 @router.get("/analytics/clv")
 async def clv_dashboard(
+    store_id: uuid.UUID | None = None,
     db: AsyncSession = Depends(get_db),
-    _current: CurrentUser = Depends(require_permission("crm.analytics.view")),
+    current: CurrentUser = Depends(require_permission("crm.analytics.view")),
 ) -> dict:
+    if store_id is not None:
+        require_store_access(store_id, current)
+        return await crm_store.clv_summary(db, store_id)
     from app.models.models_phase4 import ClvSnapshot
     from app.services.clv import compute_clv_snapshots, get_clv_summary
 
@@ -215,9 +224,13 @@ async def refresh_clv(
 
 @router.get("/analytics/retention")
 async def retention_dashboard(
+    store_id: uuid.UUID | None = None,
     db: AsyncSession = Depends(get_db),
-    _current: CurrentUser = Depends(require_permission("crm.analytics.view")),
+    current: CurrentUser = Depends(require_permission("crm.analytics.view")),
 ) -> dict:
+    if store_id is not None:
+        require_store_access(store_id, current)
+        return await crm_store.retention(db, store_id)
     from app.services.clv import get_retention_metrics
 
     return await get_retention_metrics(db)
@@ -225,9 +238,13 @@ async def retention_dashboard(
 
 @router.get("/analytics/churn")
 async def churn_analysis(
+    store_id: uuid.UUID | None = None,
     db: AsyncSession = Depends(get_db),
-    _current: CurrentUser = Depends(require_permission("crm.analytics.view")),
+    current: CurrentUser = Depends(require_permission("crm.analytics.view")),
 ) -> dict:
+    if store_id is not None:
+        require_store_access(store_id, current)
+        return await crm_store.churn(db, store_id)
     from app.models.models_phase4 import RfmCohortSnapshot
 
     rows = (await db.execute(select(RfmCohortSnapshot).where(RfmCohortSnapshot.churn_risk_flag == True))).scalars().all()  # noqa: E712

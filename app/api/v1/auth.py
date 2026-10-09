@@ -569,6 +569,7 @@ async def list_devices(
     status_filter: str | None = None,
     limit: int = 20,
     offset: int = 0,
+    store_id: uuid.UUID | None = None,
     current: CurrentUser = Depends(require_permission("device.terminal.view")),
     db: AsyncSession = Depends(get_db),
 ) -> Page[DeviceOut]:
@@ -577,6 +578,10 @@ async def list_devices(
         stmt = stmt.where(Device.status == status_filter)
     if not current.sees_all_stores():
         stmt = stmt.where(Device.store_id.in_(current.store_ids))
+    if store_id is not None:
+        if not current.owns_store(store_id):
+            raise HTTPException(status_code=403, detail="No access to this store")
+        stmt = stmt.where(Device.store_id == store_id)
     capped_limit = min(limit, 200)
     total = (await db.execute(select(func.count()).select_from(stmt.subquery()))).scalar_one()
     result = await db.execute(stmt.order_by(Device.created_at.desc()).limit(capped_limit).offset(offset))

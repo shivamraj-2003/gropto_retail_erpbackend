@@ -7,7 +7,7 @@ from openpyxl import Workbook
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import CurrentUser, require_permission
+from app.api.deps import CurrentUser, require_permission, require_store_access
 from app.core.database import get_db
 from app.models.models import InventoryBalance, Product, ProductBarcode, Store
 from app.models.models_phase2 import Warehouse, WarehouseBalance
@@ -53,13 +53,28 @@ async def list_products(
     missing: str | None = None,
     limit: int = 200,
     offset: int = 0,
+    store_id: uuid.UUID | None = None,
     db: AsyncSession = Depends(get_db),
-    _current: CurrentUser = Depends(require_permission("catalog.product.view")),
+    current: CurrentUser = Depends(require_permission("catalog.product.view")),
 ) -> list[Product]:
-    """`missing` = hsn | barcode | price | cost keeps only products still lacking that."""
+    """`missing` = hsn | barcode | price | cost keeps only products still lacking that.
+    With `store_id`, every product also carries `store_quantity`: how many that store holds right now."""
     stmt = _filtered(select(Product), q, active_only, missing)
     result = await db.execute(stmt.order_by(Product.name).limit(min(max(limit, 1), 500)).offset(max(offset, 0)))
-    return list(result.scalars().all())
+    rows = list(result.scalars().all())
+    if store_id is not None:
+        require_store_access(store_id, current)
+        held = {
+            b.product_id: float(b.quantity)
+            for b in (
+                await db.execute(
+                    select(InventoryBalance).where(InventoryBalance.store_id == store_id, InventoryBalance.product_id.in_([p.id for p in rows]))
+                )
+            ).scalars().all()
+        } if rows else {}
+        for p in rows:
+            p.store_quantity = held.get(p.id, 0.0)  # type: ignore[attr-defined]
+    return rows
 
 
 @router.get("/count")

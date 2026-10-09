@@ -224,6 +224,7 @@ class StoreCredentialRow(BaseModel):
 class ProductOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: uuid.UUID
+    store_quantity: float | None = None
     sku: str
     barcode: str | None
     name: str

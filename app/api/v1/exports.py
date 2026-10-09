@@ -7,6 +7,7 @@ are never included.
 """
 
 import io
+import re
 import uuid
 from dataclasses import dataclass
 
@@ -16,7 +17,7 @@ from openpyxl import Workbook
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import CurrentUser, get_current_user
+from app.api.deps import CurrentUser, get_current_user, require_store_access
 from app.core.database import get_reporting_db
 
 router = APIRouter(prefix="/exports", tags=["exports"])
@@ -91,6 +92,17 @@ KINDS: dict[str, Kind] = {
            where {scope} order by o.created_at desc""",
         ["Order", "Date", "Channel", "Store", "Customer", "Phone", "Status", "Payment mode", "Payment status", "Subtotal", "Discount", "Delivery fee", "Total"],
         scope="o.allocated_store_id = any(:store_ids)",
+    ),
+    "bills": Kind(
+        "reports.sales.export", "Bills",
+        """select sa.bill_number, to_char(sa.billed_at, 'YYYY-MM-DD HH24:MI'), s.name, u.full_name,
+                  (select count(*) from public.sale_items si where si.sale_id = sa.id),
+                  coalesce((select string_agg(distinct pm.mode, ', ') from public.payments pm where pm.sale_id = sa.id), ''),
+                  sa.discount_total, sa.tax_total, sa.grand_total, sa.status
+           from public.sales sa left join public.stores s on s.id = sa.store_id left join public.users u on u.id = sa.cashier_id
+           where {scope} order by sa.billed_at desc""",
+        ["Bill", "Billed at", "Store", "Cashier", "Items", "Paid by", "Discount", "GST", "Total", "Status"],
+        scope="sa.store_id = any(:store_ids)",
     ),
     "returns": Kind(
         "pos.return.view", "Returns",
@@ -241,32 +253,85 @@ KINDS: dict[str, Kind] = {
 }
 
 
-def _scoped_sql(kind: Kind, current: CurrentUser) -> tuple[str, dict]:
-    """Fill the {scope} placeholder: no filter for everyone-sees-all roles and non-store lists, the caller's stores otherwise."""
+_STORE_COLUMN = re.compile(r"^([a-z_]+\.[a-z_]+) = any\(:store_ids\)$")
+
+
+def _scoped_sql(kind: Kind, current: CurrentUser, view_store: uuid.UUID | None = None) -> tuple[str, dict]:
+    """Fill the {scope} placeholder: no filter for everyone-sees-all roles and non-store lists, the caller's stores otherwise.
+    With view_store, the list is narrowed to that one store (only for lists whose scope is a plain store column)."""
+    params: dict = {}
     if not kind.scope or current.sees_all_stores():
-        return kind.sql.replace("{scope}", "true"), {}
-    return kind.sql.replace("{scope}", kind.scope), {"store_ids": list(current.store_ids)}
+        scope = "true"
+    else:
+        scope = kind.scope
+        params["store_ids"] = list(current.store_ids)
+    if view_store is not None:
+        match = _STORE_COLUMN.match(kind.scope or "")
+        if match is None:
+            raise HTTPException(status_code=400, detail="This list cannot be narrowed to one store")
+        scope = f"({scope}) and {match.group(1)} = :view_store"
+        params["view_store"] = view_store
+    return kind.sql.replace("{scope}", scope), params
 
 
-@router.get("/{kind}")
-async def export_list(
-    kind: str,
-    db: AsyncSession = Depends(get_reporting_db),
-    current: CurrentUser = Depends(get_current_user),
-) -> StreamingResponse:
+def _spec_for(kind: str, current: CurrentUser) -> Kind:
     spec = KINDS.get(kind)
     if spec is None:
         raise HTTPException(status_code=404, detail="Unknown export")
     if not current.has_permission(spec.permission):
         raise HTTPException(status_code=403, detail=f"Permission denied: {spec.permission}")
-    sql, params = _scoped_sql(spec, current)
+    return spec
+
+
+def _cell(v):
+    return float(v) if hasattr(v, "quantize") else (str(v) if isinstance(v, uuid.UUID) else v)
+
+
+@router.get("/{kind}/view")
+async def view_list(
+    kind: str,
+    store_id: uuid.UUID,
+    q: str | None = None,
+    limit: int = 10,
+    offset: int = 0,
+    db: AsyncSession = Depends(get_reporting_db),
+    current: CurrentUser = Depends(get_current_user),
+) -> dict:
+    """The same list as the Excel download, as rows on screen, for one store — used when you look at a store other than
+    the till's own. Search matches any column."""
+    spec = _spec_for(kind, current)
+    require_store_access(store_id, current)
+    sql, params = _scoped_sql(spec, current, store_id)
+    where = ""
+    if q and q.strip():
+        where = " where t::text ilike :q"
+        params["q"] = f"%{q.strip()}%"
+    total = (await db.execute(text(f"select count(*) from ({sql}) t{where}"), params)).scalar_one()
+    page = await db.execute(
+        text(f"select * from ({sql}) t{where} limit :lim offset :off"),
+        {**params, "lim": max(1, min(limit, 200)), "off": max(0, offset)},
+    )
+    return {"headers": spec.headers, "rows": [[_cell(v) for v in row] for row in page.all()], "total": int(total)}
+
+
+@router.get("/{kind}")
+async def export_list(
+    kind: str,
+    store_id: uuid.UUID | None = None,
+    db: AsyncSession = Depends(get_reporting_db),
+    current: CurrentUser = Depends(get_current_user),
+) -> StreamingResponse:
+    spec = _spec_for(kind, current)
+    if store_id is not None:
+        require_store_access(store_id, current)
+    sql, params = _scoped_sql(spec, current, store_id)
     result = await db.execute(text(sql), params)
     wb = Workbook()
     ws = wb.active
     ws.title = spec.title[:30]
     ws.append(spec.headers)
     for row in result.all():
-        ws.append([float(v) if hasattr(v, "quantize") else (str(v) if isinstance(v, uuid.UUID) else v) for v in row])
+        ws.append([_cell(v) for v in row])
     for idx, header in enumerate(spec.headers, start=1):
         ws.column_dimensions[ws.cell(row=1, column=idx).column_letter].width = max(12, min(40, len(header) + 6))
     buf = io.BytesIO()

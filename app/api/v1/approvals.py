@@ -18,10 +18,16 @@ async def list_approvals(
     status_filter: str | None = "pending",
     limit: int = 20,
     offset: int = 0,
+    store_id: uuid.UUID | None = None,
     db: AsyncSession = Depends(get_db),
     current: CurrentUser = Depends(require_permission("approval.request.view")),
 ) -> Page[ApprovalOut]:
     stmt = select(ApprovalRequest)
+    if store_id is not None:
+        # one store's requests, plus company-wide ones that belong to no store (new store, new user ...)
+        if not current.owns_store(store_id):
+            raise HTTPException(status_code=403, detail="No access to this store")
+        stmt = stmt.where((ApprovalRequest.store_id == store_id) | (ApprovalRequest.store_id.is_(None)))
     if status_filter:
         stmt = stmt.where(ApprovalRequest.status == status_filter)
     if not current.sees_all_stores():

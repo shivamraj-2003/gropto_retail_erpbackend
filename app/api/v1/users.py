@@ -49,11 +49,17 @@ async def _to_user_out(db: AsyncSession, user: User, role_code: str) -> UserOut:
 async def list_users(
     limit: int = 20,
     offset: int = 0,
+    store_id: uuid.UUID | None = None,
     current: CurrentUser = Depends(require_permission("user.user.view")),
     db: AsyncSession = Depends(get_db),
 ) -> UsersPage:
     stmt = select(User, Role.code).join(Role, Role.id == User.role_id)
-    if not current.sees_all_stores():
+    if store_id is not None:
+        # the people assigned to this one store
+        if not current.owns_store(store_id):
+            raise HTTPException(status_code=403, detail="No access to this store")
+        stmt = stmt.join(UserStore, UserStore.user_id == User.id).where(UserStore.store_id == store_id).distinct()
+    elif not current.sees_all_stores():
         stmt = stmt.join(UserStore, UserStore.user_id == User.id).where(UserStore.store_id.in_(current.store_ids)).distinct()
 
     capped_limit = min(limit, 500)
