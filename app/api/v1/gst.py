@@ -49,6 +49,37 @@ async def get_store_applicability(
     )
 
 
+@router.get("/store-applicability/export")
+async def export_store_applicability(
+    financial_year: int | None = None,
+    db: AsyncSession = Depends(get_reporting_db),
+    current: CurrentUser = Depends(require_permission("gst.applicability.view")),
+):
+    """The per-store ₹5 crore check as an Excel file."""
+    import io
+
+    from fastapi.responses import StreamingResponse
+    from openpyxl import Workbook
+
+    rows = await get_store_applicability(financial_year, db, current)
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "E-invoice by store"
+    ws.append(["Code", "Store", "GSTIN", "Sales this year", "Sales last year", "Limit", "% of limit", "E-invoice", "Note"])
+    for r in rows:
+        status = "Not yet" if not r["einvoice_required"] else ("On (switched on)" if r["einvoice_flag"] else "On (over limit)")
+        ws.append([r["code"], r["name"], r["gstin"] or "", r["turnover"], r["previous_year_turnover"], r["threshold"],
+                   round(r["percent_of_threshold"], 1), status, r["note"] or ""])
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": 'attachment; filename="einvoice-by-store.xlsx"'},
+    )
+
+
 @router.get("/einvoices", response_model=list[EInvoiceOut])
 async def list_einvoices(
     status_filter: str | None = None,

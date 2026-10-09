@@ -39,6 +39,7 @@ from app.api.v1 import (
     stores,
     sync,
     transfers,
+    exports,
     users,
     wms,
 )
@@ -53,6 +54,7 @@ api_router.include_router(sync.router)
 api_router.include_router(approvals.router)
 api_router.include_router(purchases.router)
 api_router.include_router(reports.router)
+api_router.include_router(exports.router)
 api_router.include_router(ai.router)
 api_router.include_router(imports.router)
 api_router.include_router(dashboard.router)

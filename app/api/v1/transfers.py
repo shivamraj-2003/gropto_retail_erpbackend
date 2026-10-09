@@ -1,7 +1,10 @@
+import io
 import uuid
 from datetime import date, datetime, time, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import StreamingResponse
+from openpyxl import Workbook
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -112,21 +115,15 @@ async def _build(db: AsyncSession, transfers: list[Transfer], *, with_lines: boo
     return out
 
 
-@router.get("", response_model=Page[TransferOut])
-async def list_transfers(
-    status_filter: str | None = None,
-    q: str | None = None,
-    place_type: str | None = None,
-    place_id: uuid.UUID | None = None,
-    date_from: date | None = None,
-    date_to: date | None = None,
-    limit: int = 20,
-    offset: int = 0,
-    db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("transfer.transfer.view")),
-) -> Page[TransferOut]:
-    """`q` finds a transfer by its number (TR-12, 12), a product name/SKU/barcode on it, or a note.
-    `place_type`+`place_id` keeps transfers going to or from that place."""
+def _filtered(
+    current: CurrentUser,
+    status_filter: str | None,
+    q: str | None,
+    place_type: str | None,
+    place_id: uuid.UUID | None,
+    date_from: date | None,
+    date_to: date | None,
+):
     stmt = select(Transfer)
     if not current.sees_all_stores():
         mine = [s for s in current.store_ids]
@@ -170,11 +167,75 @@ async def list_transfers(
         if digits.isdigit():
             conds.append(Transfer.transfer_no == int(digits))
         stmt = stmt.where(or_(*conds))
+    return stmt
+
+
+@router.get("", response_model=Page[TransferOut])
+async def list_transfers(
+    status_filter: str | None = None,
+    q: str | None = None,
+    place_type: str | None = None,
+    place_id: uuid.UUID | None = None,
+    date_from: date | None = None,
+    date_to: date | None = None,
+    limit: int = 20,
+    offset: int = 0,
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(require_permission("transfer.transfer.view")),
+) -> Page[TransferOut]:
+    """`q` finds a transfer by its number (TR-12, 12), a product name/SKU/barcode/HSN on it, or a note.
+    `place_type`+`place_id` keeps transfers going to or from that place."""
+    stmt = _filtered(current, status_filter, q, place_type, place_id, date_from, date_to)
     capped_limit = min(max(limit, 1), 200)
     total = (await db.execute(select(func.count()).select_from(stmt.subquery()))).scalar_one()
     result = await db.execute(stmt.order_by(Transfer.dispatched_at.desc()).limit(capped_limit).offset(max(offset, 0)))
     rows = await _build(db, list(result.scalars().all()), with_lines=False)
     return Page(items=rows, total=total, limit=capped_limit, offset=offset)
+
+
+def _lines_workbook(docs: list[dict], title: str) -> StreamingResponse:
+    """One row per product line, with the transfer details repeated on each row (easy to filter and total in Excel)."""
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Transfers"
+    ws.append(["Transfer", "Sent on", "From", "To", "Status", "Sent by", "Received on", "Received by", "Note",
+               "SKU", "Product", "Brand", "Barcode", "HSN", "GST %", "Unit", "Cost price", "Sent", "Received", "Difference", "Value (cost)"])
+    for d in docs:
+        for i in d["items"]:
+            ws.append([
+                d["number"], d["dispatched_at"].strftime("%Y-%m-%d %H:%M") if d["dispatched_at"] else "",
+                d["source_name"], d["dest_name"], d["status"], d["dispatched_by_name"] or "",
+                d["received_at"].strftime("%Y-%m-%d %H:%M") if d["received_at"] else "", d["received_by_name"] or "", d["note"] or "",
+                i["sku"], i["name"], i["brand"] or "", i["barcode"] or "", i["hsn_code"] or "", i["tax_rate"], i["uom"], i["unit_cost"],
+                i["dispatched_qty"], "" if i["received_qty"] is None else i["received_qty"], "" if i["difference"] is None else i["difference"], i["value"],
+            ])
+    for col, width in zip("ABCDEFGHIJKLMNOPQRSTU", (12, 17, 22, 22, 14, 16, 17, 16, 24, 14, 32, 14, 16, 10, 8, 7, 11, 9, 10, 11, 13)):
+        ws.column_dimensions[col].width = width
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{title}.xlsx"'},
+    )
+
+
+@router.get("/export")
+async def export_transfers(
+    status_filter: str | None = None,
+    q: str | None = None,
+    place_type: str | None = None,
+    place_id: uuid.UUID | None = None,
+    date_from: date | None = None,
+    date_to: date | None = None,
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(require_permission("transfer.transfer.view")),
+) -> StreamingResponse:
+    """Every product line of the transfers matching the same filters as the list (up to 2,000 transfers)."""
+    stmt = _filtered(current, status_filter, q, place_type, place_id, date_from, date_to)
+    transfers = list((await db.execute(stmt.order_by(Transfer.dispatched_at.desc()).limit(2000))).scalars().all())
+    return _lines_workbook(await _build(db, transfers, with_lines=True), "transfers")
 
 
 @router.get("/source-stock", response_model=list[TransferSourceStockOut])
@@ -241,6 +302,17 @@ async def _get_visible(db: AsyncSession, transfer_id: uuid.UUID, current: Curren
     if transfer is None or not _may_see(transfer, current):
         raise HTTPException(status_code=404, detail="Transfer not found")
     return transfer
+
+
+@router.get("/{transfer_id}/export")
+async def export_transfer(
+    transfer_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(require_permission("transfer.transfer.view")),
+) -> StreamingResponse:
+    transfer = await _get_visible(db, transfer_id, current)
+    docs = await _build(db, [transfer], with_lines=True)
+    return _lines_workbook(docs, docs[0]["number"])
 
 
 @router.get("/{transfer_id}", response_model=TransferDetailOut)
