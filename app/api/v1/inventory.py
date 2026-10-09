@@ -5,6 +5,7 @@ from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser, require_permission, require_store_access
+from app.api.v1.products import _filtered as _filtered_products
 from app.core.database import get_db
 from app.models.models import InventoryBalance, Product
 from app.models.models_phase4 import ReasonCodeMaster
@@ -206,6 +207,37 @@ async def mark_damaged(
     )
     await db.commit()
     return {"status": "marked_damaged"}
+
+
+@router.get("/store-stock")
+async def store_stock(
+    store_id: uuid.UUID,
+    q: str | None = None,
+    limit: int = 500,
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(require_permission("inventory.stock.view")),
+) -> list[dict]:
+    """Live stock of one store for the Check Stock screen when you look at a store other than the till's own
+    (the till only keeps its own store's stock on the computer). Search matches name, SKU, barcode (incl. extra
+    barcodes), brand and HSN."""
+    require_store_access(store_id, current)
+    stmt = (
+        select(Product.id, Product.sku, Product.name, Product.barcode, Product.selling_price, Product.mrp, InventoryBalance.quantity)
+        .join(
+            InventoryBalance,
+            (InventoryBalance.product_id == Product.id) & (InventoryBalance.store_id == store_id),
+            isouter=True,
+        )
+    )
+    stmt = _filtered_products(stmt, q, True, None).order_by(Product.name).limit(max(1, min(limit, 1000)))
+    rows = (await db.execute(stmt)).all()
+    return [
+        {
+            "product_id": str(r.id), "sku": r.sku, "name": r.name, "barcode": r.barcode,
+            "selling_price": float(r.selling_price or 0), "mrp": float(r.mrp or 0), "quantity": float(r.quantity or 0),
+        }
+        for r in rows
+    ]
 
 
 @router.get("/store-snapshot")
