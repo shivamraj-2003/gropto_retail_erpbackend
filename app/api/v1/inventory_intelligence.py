@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser, require_permission, require_store_access
 from app.core.database import get_db
-from app.models.models import Store
+from app.models.models import InventoryBalance, Product, Store
 from app.models.models_phase4 import AbcXyzMetric, ExpiryForecastSnapshot
 from app.schemas.schemas_phase4 import AbcXyzOut, ExpiryForecastOut
 
@@ -55,7 +55,7 @@ async def get_abc_xyz_analysis(
     store_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
     current: CurrentUser = Depends(require_permission("inventory.intelligence.view")),
-) -> list[AbcXyzMetric]:
+) -> list[dict]:
     require_store_access(store_id, current)
     result = await db.execute(select(AbcXyzMetric).where(AbcXyzMetric.store_id == store_id))
     rows = list(result.scalars().all())
@@ -63,7 +63,34 @@ async def get_abc_xyz_analysis(
         # Nothing ever populates this table on its own — compute it now rather
         # than return an empty list forever.
         rows = await _compute_abc_xyz(db, store_id)
-    return rows
+    return await _with_product(db, store_id, rows)
+
+
+async def _with_product(db: AsyncSession, store_id: uuid.UUID, rows: list[AbcXyzMetric]) -> list[dict]:
+    """Add product name, SKU, barcode and the stock on hand so the screen can show and filter by them."""
+    ids = [r.product_id for r in rows]
+    products = {}
+    on_hand: dict = {}
+    if ids:
+        for p in (await db.execute(select(Product).where(Product.id.in_(ids)))).scalars().all():
+            products[p.id] = p
+        for b in (
+            await db.execute(select(InventoryBalance).where(InventoryBalance.store_id == store_id, InventoryBalance.product_id.in_(ids)))
+        ).scalars().all():
+            on_hand[b.product_id] = float(b.quantity)
+    out = []
+    for r in rows:
+        p = products.get(r.product_id)
+        out.append(
+            {
+                "id": r.id, "product_id": r.product_id, "store_id": r.store_id, "abc_class": r.abc_class,
+                "xyz_class": r.xyz_class, "stock_turns": r.stock_turns, "days_of_inventory": r.days_of_inventory,
+                "calculated_at": r.calculated_at,
+                "product_name": p.name if p else None, "sku": p.sku if p else None,
+                "barcode": p.barcode if p else None, "on_hand": on_hand.get(r.product_id, 0.0),
+            }
+        )
+    return out
 
 
 async def _compute_abc_xyz(db: AsyncSession, store_id: uuid.UUID) -> list[AbcXyzMetric]:
@@ -140,14 +167,14 @@ async def recalculate_abc_xyz(
     store_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
     current: CurrentUser = Depends(require_permission("inventory.intelligence.update")),
-) -> list[AbcXyzMetric]:
+) -> list[dict]:
     """Point 7 audit fix: ABC/XYZ was previously computed once, lazily, the
     first time the table happened to be empty for a store — and then frozen
     forever with no way to refresh it as sales data changed. This forces a
     real recompute on demand; see also the daily scheduled job."""
     require_store_access(store_id, current)
     await db.execute(delete(AbcXyzMetric).where(AbcXyzMetric.store_id == store_id))
-    return await _compute_abc_xyz(db, store_id)
+    return await _with_product(db, store_id, await _compute_abc_xyz(db, store_id))
 
 
 async def refresh_all_abc_xyz(db: AsyncSession) -> int:

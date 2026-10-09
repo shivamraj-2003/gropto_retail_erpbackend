@@ -152,6 +152,10 @@ class AbcXyzOut(BaseModel):
     stock_turns: float
     days_of_inventory: float
     calculated_at: datetime
+    product_name: str | None = None
+    sku: str | None = None
+    barcode: str | None = None
+    on_hand: float = 0
 
 
 class ExpiryForecastOut(BaseModel):
