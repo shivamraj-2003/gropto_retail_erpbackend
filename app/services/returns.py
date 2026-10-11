@@ -52,10 +52,37 @@ async def create_return(db: AsyncSession, *, current: CurrentUser, payload: Retu
     # validated against the real SaleItem, netting out quantity already
     # returned against it previously (so the same line can't be over-returned
     # across multiple separate return requests either).
+    # A discount on the whole bill is not on any single line, so what the customer really paid per line is the line
+    # value scaled by (bill total paid / sum of line values). Refunds are capped at that, never at the sticker price.
+    all_lines = (await db.execute(select(SaleItem.line_total).where(SaleItem.sale_id == payload.sale_id))).scalars().all()
+    line_sum = sum(float(v) for v in all_lines)
+    paid_ratio = min(float(sale.grand_total) / line_sum, 1.0) if line_sum > 0 else 1.0
+
     for item in payload.items:
         sale_item = await db.get(SaleItem, item.sale_item_id)
         if sale_item is None or sale_item.sale_id != payload.sale_id:
-            raise HTTPException(status_code=400, detail=f"Sale item {item.sale_item_id} does not belong to sale {payload.sale_id}")
+            # A bill made on a till carries the till's own line ids, which the server replaces with its own when the bill
+            # syncs. So match the line by product instead (the first line of that product with units still returnable).
+            candidates = (
+                await db.execute(
+                    select(SaleItem).where(SaleItem.sale_id == payload.sale_id, SaleItem.product_id == item.product_id).order_by(SaleItem.id)
+                )
+            ).scalars().all()
+            sale_item = None
+            for candidate in candidates:
+                done = (
+                    await db.execute(
+                        select(ReturnItem.quantity)
+                        .join(Return, Return.id == ReturnItem.return_id)
+                        .where(ReturnItem.sale_item_id == candidate.id, Return.status != "rejected")
+                    )
+                ).scalars().all()
+                if float(candidate.quantity) - sum(float(q) for q in done) + REFUND_TOLERANCE >= item.quantity:
+                    sale_item = candidate
+                    break
+            if sale_item is None:
+                raise HTTPException(status_code=400, detail="This product is not on that bill, or its units were already returned")
+            item.sale_item_id = sale_item.id
 
         already_returned = (
             await db.execute(
@@ -73,7 +100,7 @@ async def create_return(db: AsyncSession, *, current: CurrentUser, payload: Retu
             )
 
         unit_net_price = (float(sale_item.line_total) / float(sale_item.quantity)) if float(sale_item.quantity) else 0.0
-        max_refund = unit_net_price * item.quantity
+        max_refund = unit_net_price * item.quantity * paid_ratio
         if item.refund_amount > max_refund + REFUND_TOLERANCE:
             raise HTTPException(
                 status_code=400,
