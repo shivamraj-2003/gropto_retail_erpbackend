@@ -434,6 +434,8 @@ class Sale(Base):
     document_type: Mapped[str] = mapped_column(String, default="invoice")  # invoice, credit_note, debit_note
     customer_gstin: Mapped[str | None] = mapped_column(String)
     status: Mapped[str] = mapped_column(String, default="completed")
+    cash_received: Mapped[float | None] = mapped_column(Numeric(12, 2))
+    change_given: Mapped[float | None] = mapped_column(Numeric(12, 2))
     client_idempotency_key: Mapped[str] = mapped_column(String, unique=True, nullable=False)
     billed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     synced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

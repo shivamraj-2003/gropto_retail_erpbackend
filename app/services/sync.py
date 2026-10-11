@@ -208,6 +208,8 @@ async def process_sale(db: AsyncSession, sale_in: SaleIn) -> SyncItemVerdict:
             override_reason=override_reason,
             place_of_supply=place_of_supply,
             customer_gstin=sale_in.customer_gstin,
+            cash_received=sale_in.cash_received,
+            change_given=sale_in.change_given,
             client_idempotency_key=sale_in.client_idempotency_key,
             billed_at=sale_in.billed_at,
         )
