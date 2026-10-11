@@ -1,6 +1,6 @@
 import secrets
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pyotp
 from pydantic import BaseModel, Field
@@ -43,6 +43,9 @@ from app.services.audit import write_audit
 from app.services.rbac import resolve_access
 from app.services.rate_limit import is_login_locked, record_login_failure, record_login_success
 
+
+# How long after a rotation the old refresh token may still be presented once more (see refresh()).
+REFRESH_REPLAY_GRACE = timedelta(minutes=2)
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -313,15 +316,30 @@ async def refresh(payload: RefreshRequest, db: AsyncSession = Depends(get_db)) -
     if token_row is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid refresh token")
 
+    lost_reply_successor: RefreshToken | None = None
     if token_row.revoked:
-        # Reuse of a rotated token: revoke the whole family and force re-login everywhere.
-        await db.execute(
-            RefreshToken.__table__.update()
-            .where(RefreshToken.family_id == token_row.family_id)
-            .values(revoked=True)
-        )
-        await db.commit()
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Refresh token reuse detected")
+        # A token that was only just rotated and is presented again is almost always a refresh whose answer never
+        # reached the app (slow or dropped connection), not theft: the app still holds the old token. Within a short
+        # window, hand out a fresh token instead of cancelling the login.
+        newest = (
+            await db.execute(
+                select(RefreshToken)
+                .where(RefreshToken.family_id == token_row.family_id, RefreshToken.revoked.is_(False))
+                .order_by(RefreshToken.created_at.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if newest is not None and (datetime.now(timezone.utc) - newest.created_at) <= REFRESH_REPLAY_GRACE:
+            lost_reply_successor = newest
+        else:
+            # Reuse of a rotated token well after the fact: revoke the whole family and force re-login everywhere.
+            await db.execute(
+                RefreshToken.__table__.update()
+                .where(RefreshToken.family_id == token_row.family_id)
+                .values(revoked=True)
+            )
+            await db.commit()
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Refresh token reuse detected")
 
     expires_at = token_row.expires_at
     if expires_at.tzinfo is None:
@@ -348,6 +366,8 @@ async def refresh(payload: RefreshRequest, db: AsyncSession = Depends(get_db)) -
 
     # Rotate: revoke old, issue new in the same family.
     token_row.revoked = True
+    if lost_reply_successor is not None:
+        lost_reply_successor.revoked = True  # the token the app never received; keep one live token per family
     raw_refresh, refresh_hash = new_refresh_token()
     db.add(
         RefreshToken(
