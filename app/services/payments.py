@@ -57,3 +57,45 @@ def refund_payment(payment_id: str, amount_rupees: float) -> dict:
     rupees at the call site; Razorpay wants paise (integer)."""
     client = _client()
     return client.payment.refund(payment_id, {"amount": int(round(amount_rupees * 100))})
+
+
+def create_upi_qr(amount_rupees: float, receipt: str, notes: dict | None = None, valid_minutes: int = 10) -> dict:
+    """A one-time UPI QR for an exact amount, shown on the customer-facing display. The customer scans it with any
+    UPI app; there is no widget on the till. Needs "QR Codes" switched on for the Razorpay account."""
+    import time
+
+    return _client().qrcode.create(
+        {
+            "type": "upi_qr",
+            "name": "Gropto",
+            "usage": "single_use",
+            "fixed_amount": True,
+            "payment_amount": int(round(amount_rupees * 100)),
+            "description": receipt[:100],
+            "close_by": int(time.time()) + max(valid_minutes, 3) * 60,
+            "notes": {**(notes or {}), "receipt": receipt},
+        }
+    )
+
+
+def upi_qr_status(qr_id: str, expected_rupees: float) -> dict:
+    """Asks Razorpay (never trusts the till) whether this QR has been paid, for the full amount."""
+    client = _client()
+    qr = client.qrcode.fetch(qr_id)
+    paid_paise = int(qr.get("payments_amount_received") or 0)
+    expected = int(round(expected_rupees * 100))
+    if int(qr.get("payments_count_received") or 0) >= 1 and paid_paise >= expected:
+        payments = client.qrcode.fetch_all_payments(qr_id).get("items", [])
+        captured = next((p for p in payments if p.get("status") in ("captured", "authorized")), None)
+        if captured:
+            return {"status": "paid", "payment_id": captured["id"]}
+    if qr.get("status") == "closed":
+        return {"status": "expired", "payment_id": None}
+    return {"status": "waiting", "payment_id": None}
+
+
+def close_upi_qr(qr_id: str) -> None:
+    try:
+        _client().qrcode.close(qr_id)
+    except Exception:  # already closed or expired — nothing to undo
+        pass
