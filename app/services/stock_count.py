@@ -28,12 +28,26 @@ HIGH_VARIANCE_THRESHOLD = 50  # absolute units on any single line triggers appro
 
 
 async def initiate_count(db: AsyncSession, *, current: CurrentUser, payload: StockCountCreate) -> StockCount:
-    stmt = select(InventoryBalance.product_id, InventoryBalance.quantity).where(InventoryBalance.store_id == payload.store_id)
     if payload.product_ids:
-        stmt = stmt.where(InventoryBalance.product_id.in_(payload.product_ids))
+        # Counting chosen products: one that has never been stocked here (a brand-new product) is included with 0 expected
+        wanted = (await db.execute(select(Product.id).where(Product.id.in_(payload.product_ids), Product.is_active.is_(True)))).scalars().all()
+        on_hand = dict(
+            (
+                await db.execute(
+                    select(InventoryBalance.product_id, InventoryBalance.quantity).where(
+                        InventoryBalance.store_id == payload.store_id, InventoryBalance.product_id.in_(wanted)
+                    )
+                )
+            ).all()
+        )
+        rows = [(pid, on_hand.get(pid, 0)) for pid in wanted]
     else:
-        stmt = stmt.join(Product, Product.id == InventoryBalance.product_id).where(Product.is_active.is_(True))
-    rows = (await db.execute(stmt)).all()
+        stmt = (
+            select(InventoryBalance.product_id, InventoryBalance.quantity)
+            .join(Product, Product.id == InventoryBalance.product_id)
+            .where(InventoryBalance.store_id == payload.store_id, Product.is_active.is_(True))
+        )
+        rows = (await db.execute(stmt)).all()
     if not rows:
         raise HTTPException(status_code=400, detail="No stocked products found for this store to count")
 

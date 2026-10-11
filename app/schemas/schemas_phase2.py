@@ -47,7 +47,7 @@ class ReturnLinkExchangeIn(BaseModel):
 
 class StockCountCreate(BaseModel):
     store_id: uuid.UUID
-    product_ids: list[uuid.UUID] | None = None  # None = every active product with a balance row at this store
+    product_ids: list[uuid.UUID] | None = None  # None = every active product with stock at this store; a list = just these (new products allowed)
 
 
 class StockCountLineOut(BaseModel):
