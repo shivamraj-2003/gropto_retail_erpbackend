@@ -23,15 +23,17 @@ from app.services.loyalty import DuplicateLedgerEntry, apply_ledger_entry, get_b
 from app.services.wallet import DuplicateWalletEntry, InsufficientWalletBalance, debit_wallet
 
 
-async def _get_or_create_customer(db: AsyncSession, phone: str | None) -> Customer | None:
+async def _get_or_create_customer(db: AsyncSession, phone: str | None, name: str | None = None) -> Customer | None:
     if not phone:
         return None
     result = await db.execute(select(Customer).where(Customer.phone == phone))
     customer = result.scalar_one_or_none()
     if customer is None:
-        customer = Customer(phone=phone)
+        customer = Customer(phone=phone, name=(name or "").strip() or None)
         db.add(customer)
         await db.flush()
+    elif name and name.strip() and not customer.name:
+        customer.name = name.strip()  # first time we learn the name; a name already on file is never overwritten
     return customer
 
 
@@ -160,7 +162,7 @@ async def process_sale(db: AsyncSession, sale_in: SaleIn) -> SyncItemVerdict:
             override_user_id = overrider.id
             override_reason = sale_in.override_reason
 
-        customer = await _get_or_create_customer(db, sale_in.customer_phone)
+        customer = await _get_or_create_customer(db, sale_in.customer_phone, sale_in.customer_name)
 
         # Point 4 audit fix: nothing previously validated that payments summed
         # to the bill amount at all — "split amounts total exactly to bill

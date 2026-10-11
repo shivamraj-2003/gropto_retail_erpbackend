@@ -34,6 +34,7 @@ async def lookup_customer(
     return {
         "customer_id": customer.id,
         "phone": customer.phone,
+        "name": customer.name,
         "loyalty_balance_points": loyalty_balance,
         "loyalty_redeemable_value": round(loyalty_balance * float(config.redeem_value), 2)
         if loyalty_balance >= float(config.min_balance_to_redeem)

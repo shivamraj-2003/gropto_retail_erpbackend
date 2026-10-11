@@ -110,6 +110,7 @@ class GiftVoucherOut(BaseModel):
 class CustomerLookupOut(BaseModel):
     customer_id: uuid.UUID
     phone: str
+    name: str | None = None
     loyalty_balance_points: float
     loyalty_redeemable_value: float
     wallet_balance: float

@@ -376,6 +376,7 @@ class SaleIn(BaseModel):
     bill_number: str
     cashier_id: uuid.UUID
     customer_phone: str | None = None
+    customer_name: str | None = None
     items: list[SaleItemIn]
     payments: list[PaymentIn]
     discount_total: float = 0

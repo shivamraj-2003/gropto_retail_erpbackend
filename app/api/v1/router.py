@@ -20,6 +20,7 @@ from app.api.v1 import (
     gst,
     hr,
     hr_advanced,
+    bill_settings,
     imports,
     inventory,
     inventory_intelligence,
@@ -57,6 +58,7 @@ api_router.include_router(reports.router)
 api_router.include_router(exports.router)
 api_router.include_router(ai.router)
 api_router.include_router(imports.router)
+api_router.include_router(bill_settings.router)
 api_router.include_router(dashboard.router)
 api_router.include_router(loyalty.router)
 api_router.include_router(stores.router)

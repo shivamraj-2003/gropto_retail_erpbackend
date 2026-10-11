@@ -3,6 +3,7 @@ import uuid
 from datetime import datetime, timezone
 
 import pyotp
+from pydantic import BaseModel, Field
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -657,6 +658,36 @@ async def store_credentials(
     ]
 
 
+class ProfileIn(BaseModel):
+    full_name: str = Field(min_length=2, max_length=80)
+    phone: str | None = Field(default=None, max_length=20)
+
+
+@router.put("/me/profile")
+async def update_my_profile(
+    payload: ProfileIn, current: CurrentUser = Depends(get_current_user), db: AsyncSession = Depends(get_db)
+) -> dict:
+    """Anyone can correct their own display name and phone (the name shows on the bill as the cashier). Email, role and
+    stores stay under Users."""
+    user = await db.get(User, current.user_id)
+    if user is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    phone = (payload.phone or "").strip() or None
+    if phone and phone != user.phone:
+        taken = (await db.execute(select(User.id).where(User.phone == phone, User.id != user.id))).first()
+        if taken:
+            raise HTTPException(status_code=400, detail="That phone number is already used by someone else")
+    old = {"full_name": user.full_name, "phone": user.phone}
+    user.full_name = payload.full_name.strip()
+    user.phone = phone
+    await write_audit(
+        db, user_id=user.id, role_code=current.role_code, store_id=None, device_id=current.device_id, action="UPDATE",
+        entity_type="user", entity_id=user.id, old_value=old, new_value={"full_name": user.full_name, "phone": user.phone},
+    )
+    await db.commit()
+    return {"full_name": user.full_name, "phone": user.phone}
+
+
 @router.get("/me")
 async def me(current: CurrentUser = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> dict:
     device_code = None
@@ -681,9 +712,12 @@ async def me(current: CurrentUser = Depends(get_current_user), db: AsyncSession 
     primary_store = by_id.get(home_store_id) if home_store_id else (by_id.get(current.store_ids[0]) if current.store_ids else None)
     primary_store_code = primary_store.code if primary_store else None
 
+    me_user = await db.get(User, current.user_id)
     access = current.access
     return {
         "user_id": str(current.user_id),
+        "full_name": me_user.full_name if me_user else None,
+        "phone": me_user.phone if me_user else None,
         "role": current.role_code,
         # Point 14: what the UI needs to gate routes/buttons. Display only —
         # every endpoint re-checks server-side.

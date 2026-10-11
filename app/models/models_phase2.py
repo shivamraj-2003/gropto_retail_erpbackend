@@ -494,3 +494,26 @@ class FraudAlert(Base):
     resolved_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"))
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     resolution_note: Mapped[str | None] = mapped_column(Text)
+
+
+class BillSettings(Base):
+    """What the printed bill says (shop name, address, tax numbers, offer lines, terms). One row per store; the row with
+    store_id null is the company-wide default every store without its own row uses."""
+
+    __tablename__ = "bill_settings"
+    id: Mapped[uuid.UUID] = uuid_pk()
+    store_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("stores.id", ondelete="CASCADE"), unique=True)
+    heading: Mapped[str | None] = mapped_column(String)
+    brand_name: Mapped[str | None] = mapped_column(String)
+    legal_name: Mapped[str | None] = mapped_column(String)
+    address: Mapped[str | None] = mapped_column(Text)
+    gstin: Mapped[str | None] = mapped_column(String)
+    fssai_no: Mapped[str | None] = mapped_column(String)
+    cin_no: Mapped[str | None] = mapped_column(String)
+    phone: Mapped[str | None] = mapped_column(String)
+    website: Mapped[str | None] = mapped_column(String)
+    footer_text: Mapped[str | None] = mapped_column(Text)  # one line per row
+    terms_text: Mapped[str | None] = mapped_column(Text)  # one line per row
+    sign_off: Mapped[str | None] = mapped_column(String)
+    thanks_text: Mapped[str | None] = mapped_column(String)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
