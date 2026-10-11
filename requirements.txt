@@ -1,6 +1,7 @@
 fastapi==0.115.0
 uvicorn[standard]==0.30.6
 sqlalchemy==2.0.35
+greenlet==3.5.6  # sqlalchemy's async engine needs it; not auto-installed on macOS arm64
 asyncpg==0.29.0
 alembic==1.13.3
 psycopg2-binary==2.9.9
