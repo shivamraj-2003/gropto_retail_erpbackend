@@ -310,6 +310,41 @@ async def _handle_price_change(db: AsyncSession, request: ApprovalRequest) -> No
     await bump_revision(db, product)
 
 
+@register_handler("price_variant_add")
+async def _handle_price_variant_add(db: AsyncSession, request: ApprovalRequest) -> None:
+    from app.models.models import ProductPriceVariant
+
+    product = await db.get(Product, request.entity_id)
+    if product is None:
+        request.status = "stale"
+        return
+    value = request.new_value or {}
+    db.add(
+        ProductPriceVariant(
+            product_id=product.id,
+            mrp=value["mrp"],
+            selling_price=value["selling_price"],
+            label=(value.get("label") or "Other price").strip()[:40] or "Other price",
+        )
+    )
+    await db.flush()
+    await db.refresh(product, attribute_names=["price_variants"])
+    await bump_revision(db, product)
+
+
+@register_handler("price_variant_remove")
+async def _handle_price_variant_remove(db: AsyncSession, request: ApprovalRequest) -> None:
+    from app.models.models import ProductPriceVariant
+
+    product = await db.get(Product, request.entity_id)
+    variant = await db.get(ProductPriceVariant, uuid.UUID(request.new_value["variant_id"])) if request.new_value else None
+    if product is None or variant is None or variant.product_id != product.id:
+        request.status = "stale"
+        return
+    variant.is_active = False
+    await bump_revision(db, product)
+
+
 @register_handler("bulk_price_change")
 async def _handle_bulk_price_change(db: AsyncSession, request: ApprovalRequest) -> None:
     """Selling-price / MRP changes from a product import, approved as one request.
@@ -426,12 +461,23 @@ async def _handle_cash_movement_approval(db: AsyncSession, request: ApprovalRequ
 async def _handle_transfer_discrepancy_resolution(db: AsyncSession, request: ApprovalRequest) -> None:
     from app.models.models_phase2 import Transfer
 
+    from app.services.transfers import apply_resolution
+
     payload = request.new_value
     transfer = await db.get(Transfer, uuid.UUID(payload["transfer_id"]))
     if transfer is None or transfer.status != "discrepancy":
         request.status = "stale"
         return
-    transfer.status = "resolved"
+    # the choices made for each short / extra line (older requests had none: they only closed the transfer)
+    await apply_resolution(
+        db,
+        transfer=transfer,
+        actions=payload.get("actions") or {},
+        note=payload.get("note"),
+        user_id=request.requested_by,
+        role_code="approval",
+        device_id=None,
+    )
 
 
 @register_handler("stock_count_adjustment")

@@ -410,7 +410,7 @@ async def ceo_command_center(
                 """
                 select
                     count(*) filter (where g.status = 'draft' or g.status = 'qc_hold') as pending_grns,
-                    (select count(*) from transfers where status = 'dispatched') as pending_transfers,
+                    (select count(*) from transfers where status in ('dispatched', 'partially_received')) as pending_transfers,
                     (select coalesce(avg(case when gi.received_qty = gi.expected_qty then 100.0 else
                         greatest(0, 100 - abs(gi.received_qty - gi.expected_qty) / nullif(gi.expected_qty, 0) * 100) end), 100)
                      from grn_items gi) as pick_accuracy_pct

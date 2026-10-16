@@ -467,7 +467,7 @@ async def transfer_ageing_report(
                 select id, dest_type, dest_id, status, dispatched_at,
                        extract(day from now() - dispatched_at) as days_in_transit
                 from transfers
-                where status = 'dispatched'
+                where status in ('dispatched', 'partially_received')
                 order by dispatched_at asc
                 """
             )

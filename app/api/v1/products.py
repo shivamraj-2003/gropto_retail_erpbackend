@@ -3,6 +3,7 @@ import uuid
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
 from openpyxl import Workbook
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -353,6 +354,76 @@ async def request_price_change(
         old_value=old_value,
         new_value=new_value,
         reason=payload.reason,
+        store_id=None,
+    )
+    await db.commit()
+    return {"approval_request_id": str(request.id), "status": request.status}
+
+
+class PriceVariantRequest(BaseModel):
+    mrp: float = Field(gt=0)
+    selling_price: float = Field(gt=0)
+    label: str = "Old stock"
+    reason: str | None = None
+
+
+@router.post("/{product_id}/other-prices")
+async def add_other_price(
+    product_id: uuid.UUID,
+    payload: PriceVariantRequest,
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(require_permission("pricing.price.update")),
+) -> dict:
+    """One more price this product is on sale at (old stock after a price rise). Like any price change it goes through
+    approval: a Super Admin applies it at once, anyone else creates a pending request."""
+    product = await db.get(Product, product_id)
+    if product is None:
+        raise HTTPException(status_code=404, detail="Product not found")
+    if payload.selling_price > payload.mrp:
+        raise HTTPException(status_code=400, detail="The selling price cannot be above the MRP")
+    same = [
+        v for v in product.price_variants
+        if v.is_active and float(v.mrp) == payload.mrp and float(v.selling_price) == payload.selling_price
+    ]
+    if same or (float(product.mrp) == payload.mrp and float(product.selling_price) == payload.selling_price):
+        raise HTTPException(status_code=409, detail="This product already has that price")
+    request = await submit_or_apply(
+        db,
+        current=current,
+        request_type="price_variant_add",
+        entity_type="product",
+        entity_id=product_id,
+        old_value={"selling_price": float(product.selling_price), "mrp": float(product.mrp)},
+        new_value={"mrp": payload.mrp, "selling_price": payload.selling_price, "label": payload.label.strip()[:40] or "Old stock"},
+        reason=payload.reason,
+        store_id=None,
+    )
+    await db.commit()
+    return {"approval_request_id": str(request.id), "status": request.status}
+
+
+@router.post("/{product_id}/other-prices/{variant_id}/remove")
+async def remove_other_price(
+    product_id: uuid.UUID,
+    variant_id: uuid.UUID,
+    reason: str | None = None,
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(require_permission("pricing.price.update")),
+) -> dict:
+    """Stop offering an extra price (the old stock is gone). Approval rules are the same as adding one."""
+    product = await db.get(Product, product_id)
+    variant = next((v for v in (product.price_variants if product else []) if v.id == variant_id and v.is_active), None)
+    if product is None or variant is None:
+        raise HTTPException(status_code=404, detail="That price was not found")
+    request = await submit_or_apply(
+        db,
+        current=current,
+        request_type="price_variant_remove",
+        entity_type="product",
+        entity_id=product_id,
+        old_value={"mrp": float(variant.mrp), "selling_price": float(variant.selling_price)},
+        new_value={"variant_id": str(variant_id)},
+        reason=reason,
         store_id=None,
     )
     await db.commit()

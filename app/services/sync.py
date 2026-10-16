@@ -4,6 +4,7 @@ replay because of three layers of dedup: unique client_idempotency_key on sales,
 device-generated primary keys, and unique bill numbers per store+device.
 """
 
+import uuid
 
 from fastapi import HTTPException
 from sqlalchemy import select
@@ -280,12 +281,19 @@ async def process_sale(db: AsyncSession, sale_in: SaleIn) -> SyncItemVerdict:
                     mrp_snapshot=item.mrp_snapshot,
                 )
             )
+
+        # Stock leaves once per product, with the quantities of all its lines added up. (The same product can be on a bill
+        # more than once, e.g. at two prices, and a movement is recorded per sale and product.)
+        quantity_by_product: dict[uuid.UUID, float] = {}
+        for item in sale_in.items:
+            quantity_by_product[item.product_id] = quantity_by_product.get(item.product_id, 0) + item.quantity
+        for product_id, quantity in quantity_by_product.items():
             try:
                 await apply_movement(
                     db,
-                    product_id=item.product_id,
+                    product_id=product_id,
                     store_id=sale_in.store_id,
-                    delta=-item.quantity,
+                    delta=-quantity,
                     reason_code="sale",
                     source_type="sale_item",
                     source_id=sale.id,
@@ -295,14 +303,14 @@ async def process_sale(db: AsyncSession, sale_in: SaleIn) -> SyncItemVerdict:
                 # A sale is a fact — the goods physically left the shop — so it always
                 # applies even if it drives stock negative; negative stock is flagged,
                 # never blocked, and surfaced for review.
-                resulting = await get_stock_balance(db, product_id=item.product_id, store_id=sale_in.store_id)
+                resulting = await get_stock_balance(db, product_id=product_id, store_id=sale_in.store_id)
                 if resulting < 0:
                     db.add(
                         SyncFailure(
                             device_id=sale_in.device_id,
                             payload={
                                 "sale_id": str(sale.id),
-                                "product_id": str(item.product_id),
+                                "product_id": str(product_id),
                                 "resulting_quantity": resulting,
                             },
                             error="negative_stock_flagged_for_review",

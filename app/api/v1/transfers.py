@@ -22,7 +22,16 @@ from app.schemas.schemas_phase2 import (
     TransferReceive,
     TransferSourceStockOut,
 )
-from app.services.transfers import cancel_transfer, dispatch_transfer, receive_transfer, resolve_discrepancy
+from app.services.transfer_math import LineQty, open_qty
+from app.services.transfers import (
+    cancel_transfer,
+    delete_draft,
+    dispatch_transfer,
+    receive_transfer,
+    resolve_discrepancy,
+    send_draft,
+    update_draft,
+)
 
 router = APIRouter(prefix="/transfers", tags=["transfers"])
 
@@ -38,6 +47,10 @@ def _may_see(transfer: Transfer, current: CurrentUser) -> bool:
     """A store-scoped user sees transfers that touch one of their stores; warehouse legs follow warehouse scope."""
     if current.sees_all_stores():
         return True
+    if transfer.status == "draft":  # a saved draft belongs to the sender until it is sent
+        return (transfer.source_type == "store" and current.owns_store(transfer.source_id)) or (
+            transfer.source_type == "warehouse" and current.owns_warehouse(transfer.source_id)
+        )
     for kind, place_id in ((transfer.source_type, transfer.source_id), (transfer.dest_type, transfer.dest_id)):
         if kind == "store" and current.owns_store(place_id):
             return True
@@ -69,6 +82,7 @@ async def _build(db: AsyncSession, transfers: list[Transfer], *, with_lines: boo
             cost = float(p.purchase_price) if p else 0.0
             sent = float(item.dispatched_qty)
             got = float(item.received_qty) if item.received_qty is not None else None
+            damaged = float(item.damaged_qty or 0)
             units += sent
             value += sent * cost
             lines.append(
@@ -85,7 +99,12 @@ async def _build(db: AsyncSession, transfers: list[Transfer], *, with_lines: boo
                     "unit_cost": cost,
                     "dispatched_qty": sent,
                     "received_qty": got,
-                    "difference": None if got is None else round(got - sent, 3),
+                    "damaged_qty": damaged,
+                    # unaccounted for: positive = missing, negative = more arrived than was sent
+                    "open_qty": open_qty(LineQty(sent, got or 0.0, damaged)) if t.status not in ("draft", "dispatched") else 0.0,
+                    "settled_qty": float(item.settled_qty or 0),
+                    "resolution": item.resolution,
+                    "difference": None if got is None and damaged == 0 else round((got or 0.0) + damaged - sent, 3),
                     "value": round(sent * cost, 2),
                 }
             )
@@ -135,6 +154,9 @@ def _filtered(
                 Transfer.dest_type == "warehouse",
             )
         )
+    if not current.sees_all_stores():
+        mine_src = [s for s in current.store_ids]
+        stmt = stmt.where(or_(Transfer.status != "draft", and_(Transfer.source_type == "store", Transfer.source_id.in_(mine_src))))
     if status_filter:
         stmt = stmt.where(Transfer.status == status_filter)
     if place_type and place_id:
@@ -340,6 +362,52 @@ async def create_transfer(
     return (await _build(db, [transfer], with_lines=False))[0]
 
 
+@router.put("/{transfer_id}", response_model=TransferOut)
+async def edit_draft(
+    transfer_id: uuid.UUID,
+    payload: TransferCreate,
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(require_permission("transfer.transfer.create")),
+) -> dict:
+    """Change a saved draft (nothing has left the sender yet)."""
+    transfer = await _get_visible(db, transfer_id, current)
+    _scope_place(transfer.source_type, transfer.source_id, current)
+    _scope_place(payload.source_type, payload.source_id, current)
+    _scope_place(payload.dest_type, payload.dest_id, current)
+    transfer = await update_draft(db, current=current, transfer=transfer, payload=payload)
+    await db.commit()
+    await db.refresh(transfer)
+    return (await _build(db, [transfer], with_lines=False))[0]
+
+
+@router.post("/{transfer_id}/send", response_model=TransferOut)
+async def send(
+    transfer_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(require_permission("transfer.transfer.create")),
+) -> dict:
+    """Send a saved draft: the stock is checked and taken out of the sender now."""
+    transfer = await _get_visible(db, transfer_id, current)
+    _scope_place(transfer.source_type, transfer.source_id, current)
+    transfer = await send_draft(db, current=current, transfer=transfer)
+    await db.commit()
+    await db.refresh(transfer)
+    return (await _build(db, [transfer], with_lines=False))[0]
+
+
+@router.delete("/{transfer_id}", status_code=204)
+async def remove_draft(
+    transfer_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(require_permission("transfer.transfer.create")),
+) -> None:
+    """Throw away a saved draft. A transfer that was already sent is cancelled instead."""
+    transfer = await _get_visible(db, transfer_id, current)
+    _scope_place(transfer.source_type, transfer.source_id, current)
+    await delete_draft(db, current=current, transfer=transfer)
+    await db.commit()
+
+
 @router.post("/{transfer_id}/receive", response_model=TransferOut)
 async def receive(
     transfer_id: uuid.UUID,
@@ -386,7 +454,9 @@ async def resolve_transfer_discrepancy(
     if transfer is None:
         raise HTTPException(status_code=404, detail="Transfer not found")
     _scope_place(transfer.dest_type, transfer.dest_id, current)
-    result = await resolve_discrepancy(db, current=current, transfer=transfer, note=payload.note)
+    result = await resolve_discrepancy(
+        db, current=current, transfer=transfer, note=payload.note, actions={str(l.transfer_item_id): l.action for l in payload.lines}
+    )
     await db.commit()
     if isinstance(result, dict):
         return {"approval_request_id": str(result["approval_request_id"]), "status": result["status"]}

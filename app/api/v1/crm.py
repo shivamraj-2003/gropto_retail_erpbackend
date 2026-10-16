@@ -4,6 +4,8 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.models.models import Customer, Sale, SaleItem
+
 from app.api.deps import CurrentUser, require_permission, require_store_access
 from app.core.database import get_db
 from app.models.models_phase3 import Campaign
@@ -47,6 +49,138 @@ async def customer_360(
     _current: CurrentUser = Depends(require_permission("crm.customer.view")),
 ) -> dict:
     return await crm_service.customer_360(db, customer_id=customer_id)
+
+
+def _sales_scope(stmt, store_id: uuid.UUID | None, current: CurrentUser):
+    """Only the stores this person may see (or the one chosen at the top)."""
+    if store_id:
+        require_store_access(store_id, current)
+        return stmt.where(Sale.store_id == store_id)
+    if not current.sees_all_stores():
+        return stmt.where(Sale.store_id.in_(current.store_ids))
+    return stmt
+
+
+@router.get("/customers/{customer_id}/purchases")
+async def customer_purchases(
+    customer_id: uuid.UUID,
+    store_id: uuid.UUID | None = None,
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(require_permission("crm.customer.view")),
+) -> dict:
+    """What this customer has bought: their latest bills with the items, and the products they buy most."""
+    customer = await db.get(Customer, customer_id)
+    if customer is None:
+        raise HTTPException(status_code=404, detail="Customer not found")
+    bills = (
+        await db.execute(
+            _sales_scope(select(Sale).where(Sale.customer_id == customer_id, Sale.status == "completed"), store_id, current)
+            .order_by(Sale.billed_at.desc())
+            .limit(30)
+        )
+    ).scalars().all()
+    fav = (
+        await db.execute(
+            _sales_scope(
+                select(
+                    SaleItem.product_id,
+                    func.max(SaleItem.product_name_snapshot),
+                    func.sum(SaleItem.quantity),
+                    func.sum(SaleItem.line_total),
+                    func.count(func.distinct(Sale.id)),
+                    func.max(Sale.billed_at),
+                )
+                .join(Sale, Sale.id == SaleItem.sale_id)
+                .where(Sale.customer_id == customer_id, Sale.status == "completed"),
+                store_id,
+                current,
+            )
+            .group_by(SaleItem.product_id)
+            .order_by(func.sum(SaleItem.line_total).desc())
+            .limit(10)
+        )
+    ).all()
+    return {
+        "customer": {"id": str(customer.id), "name": customer.name, "phone": customer.phone},
+        "bills": [
+            {
+                "id": str(b.id),
+                "bill_number": b.bill_number,
+                "billed_at": b.billed_at.isoformat(),
+                "grand_total": float(b.grand_total),
+                "store_id": str(b.store_id),
+                "items": [
+                    {"name": i.product_name_snapshot, "quantity": float(i.quantity), "line_total": float(i.line_total)} for i in b.items
+                ],
+            }
+            for b in bills
+        ],
+        "favourites": [
+            {
+                "product_id": str(pid),
+                "name": name,
+                "quantity": float(qty),
+                "spent": round(float(spent), 2),
+                "times": int(times),
+                "last_bought": last.isoformat() if last else None,
+            }
+            for pid, name, qty, spent, times, last in fav
+        ],
+    }
+
+
+@router.get("/products/{product_id}/buyers")
+async def product_buyers(
+    product_id: uuid.UUID,
+    store_id: uuid.UUID | None = None,
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(require_permission("crm.customer.view")),
+) -> dict:
+    """Who buys this product: the customers who bought it most, and how much went to customers who gave no number."""
+    base = (
+        select(
+            Customer.id,
+            Customer.name,
+            Customer.phone,
+            func.sum(SaleItem.quantity),
+            func.sum(SaleItem.line_total),
+            func.count(func.distinct(Sale.id)),
+            func.max(Sale.billed_at),
+        )
+        .select_from(SaleItem)
+        .join(Sale, Sale.id == SaleItem.sale_id)
+        .outerjoin(Customer, Customer.id == Sale.customer_id)
+        .where(SaleItem.product_id == product_id, Sale.status == "completed")
+    )
+    rows = (
+        await db.execute(
+            _sales_scope(base, store_id, current)
+            .group_by(Customer.id, Customer.name, Customer.phone)
+            .order_by(func.sum(SaleItem.line_total).desc())
+        )
+    ).all()
+    buyers, walk_in = [], {"quantity": 0.0, "spent": 0.0, "bills": 0}
+    for cid, name, phone, qty, spent, bills, last in rows:
+        if cid is None:
+            walk_in = {"quantity": float(qty), "spent": round(float(spent), 2), "bills": int(bills)}
+            continue
+        buyers.append(
+            {
+                "customer_id": str(cid),
+                "name": name,
+                "phone": phone,
+                "quantity": float(qty),
+                "spent": round(float(spent), 2),
+                "bills": int(bills),
+                "last_bought": last.isoformat() if last else None,
+            }
+        )
+    return {
+        "total_customers": len(buyers),
+        "total_quantity": round(sum(b["quantity"] for b in buyers) + walk_in["quantity"], 3),
+        "buyers": buyers[:25],
+        "walk_in": walk_in,
+    }
 
 
 @router.get("/segments/rfm")

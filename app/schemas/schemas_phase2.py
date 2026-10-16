@@ -132,15 +132,24 @@ class TransferCreate(BaseModel):
     dest_id: uuid.UUID
     items: list[TransferItemIn]
     note: str | None = None
+    # True = save it for later: nothing is taken out of the sender's stock until it is sent.
+    draft: bool = False
 
 
 class TransferReceiveItem(BaseModel):
     transfer_item_id: uuid.UUID
-    received_qty: float
+    # Good units that arrived in THIS delivery (not the total so far).
+    received_qty: float = 0
+    # Units in this delivery that arrived damaged and cannot be sold.
+    damaged_qty: float = 0
 
 
 class TransferReceive(BaseModel):
+    # Only the lines that arrived in this delivery need to be listed.
     items: list[TransferReceiveItem]
+    # True = nothing more is coming: whatever is still missing is a shortage to settle.
+    close: bool = False
+    note: str | None = None
 
 
 class TransferOut(BaseModel):
@@ -181,7 +190,12 @@ class TransferItemOut(BaseModel):
     unit_cost: float = 0
     dispatched_qty: float
     received_qty: float | None
-    difference: float | None = None  # received - dispatched (negative = short)
+    damaged_qty: float = 0
+    # Still unaccounted for: positive = missing, negative = more arrived than was sent.
+    open_qty: float = 0
+    settled_qty: float = 0
+    resolution: str | None = None
+    difference: float | None = None  # (received + damaged) - dispatched (negative = short)
     value: float = 0  # dispatched qty x cost
 
 
@@ -543,8 +557,16 @@ class GrnOut(BaseModel):
     created_at: datetime
 
 
+class TransferResolveLine(BaseModel):
+    transfer_item_id: uuid.UUID
+    # write_off | return_to_source (missing goods)  /  reduce_sender | send_back (more arrived than sent)
+    action: str
+
+
 class TransferDiscrepancyResolveIn(BaseModel):
     note: str | None = None
+    # What to do about each short or extra line. Not needed when only damage is left.
+    lines: list[TransferResolveLine] = []
 
 
 # ---------------------------------------------------------------------------

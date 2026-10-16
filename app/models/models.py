@@ -310,6 +310,23 @@ class Product(Base):
     alt_barcodes: Mapped[list["ProductBarcode"]] = relationship(
         lazy="selectin", cascade="all, delete-orphan", order_by="ProductBarcode.created_at"
     )
+    price_variants: Mapped[list["ProductPriceVariant"]] = relationship(
+        lazy="selectin", cascade="all, delete-orphan", order_by="ProductPriceVariant.created_at"
+    )
+
+
+class ProductPriceVariant(Base):
+    """An extra price a product is on sale at (usually old stock after a price rise). The product's own selling price
+    and MRP stay the current ones; billing offers the choice when a product has variants."""
+
+    __tablename__ = "product_price_variants"
+    id: Mapped[uuid.UUID] = uuid_pk()
+    product_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("products.id", ondelete="CASCADE"), nullable=False)
+    mrp: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False)
+    selling_price: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False)
+    label: Mapped[str] = mapped_column(String, nullable=False, default="Other price")
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class InventoryBalance(Base):

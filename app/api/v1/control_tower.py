@@ -326,7 +326,7 @@ async def _evaluate_ceo_alerts(db: AsyncSession) -> list[CeoAlert]:
                 """
                 select id, dest_type, dest_id, dispatched_at
                 from transfers
-                where status = 'dispatched' and dispatched_at < now() - interval '3 days'
+                where status in ('dispatched', 'partially_received') and dispatched_at < now() - interval '3 days'
                 """
             )
         )

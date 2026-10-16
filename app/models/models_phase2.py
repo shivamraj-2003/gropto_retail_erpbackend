@@ -104,7 +104,9 @@ class Transfer(Base):
     source_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
     dest_type: Mapped[str] = mapped_column(String, nullable=False)
     dest_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
-    status: Mapped[str] = mapped_column(String, default="dispatched")  # dispatched, received, discrepancy
+    # draft (saved, nothing moved), dispatched (on the way), partially_received (some arrived, rest awaited),
+    # received (all accounted for), discrepancy (closed with a shortage / excess / damage to settle), resolved, cancelled
+    status: Mapped[str] = mapped_column(String, default="dispatched")
     dispatched_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"))
     received_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"))
     dispatched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
@@ -122,7 +124,13 @@ class TransferItem(Base):
     transfer_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("transfers.id", ondelete="CASCADE"))
     product_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("products.id"), nullable=False)
     dispatched_qty: Mapped[float] = mapped_column(Numeric(12, 3), nullable=False)
+    # Good units counted in at the destination, all deliveries added up (None until something arrives).
     received_qty: Mapped[float | None] = mapped_column(Numeric(12, 3))
+    # Arrived but not sellable; recorded here, not added to sellable stock.
+    damaged_qty: Mapped[float] = mapped_column(Numeric(12, 3), nullable=False, default=0, server_default="0")
+    # How much of the shortage / excess was settled, and how (write_off, return_to_source, reduce_sender, send_back).
+    settled_qty: Mapped[float] = mapped_column(Numeric(12, 3), nullable=False, default=0, server_default="0")
+    resolution: Mapped[str | None] = mapped_column(String)
 
 
 # ---------------------------------------------------------------------------

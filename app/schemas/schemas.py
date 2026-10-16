@@ -221,6 +221,15 @@ class StoreCredentialRow(BaseModel):
 # Products
 # ---------------------------------------------------------------------------
 
+class PriceVariantOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: uuid.UUID
+    mrp: float
+    selling_price: float
+    label: str
+    is_active: bool = True
+
+
 class ProductOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: uuid.UUID
@@ -239,6 +248,8 @@ class ProductOut(BaseModel):
     brand: str | None = None
     # The other barcodes of this product (the main one is `barcode`).
     alt_barcodes: list[str] = []
+    # The extra prices still on offer (old stock); billing lets the cashier pick one.
+    price_variants: list[PriceVariantOut] = []
     is_active: bool
     revision: int
 
@@ -246,6 +257,11 @@ class ProductOut(BaseModel):
     @classmethod
     def _barcode_strings(cls, value):
         return [getattr(v, "barcode", v) for v in (value or [])]
+
+    @field_validator("price_variants", mode="before")
+    @classmethod
+    def _only_active_variants(cls, value):
+        return [v for v in (value or []) if getattr(v, "is_active", True)]
 
 
 class ProductCreate(BaseModel):
