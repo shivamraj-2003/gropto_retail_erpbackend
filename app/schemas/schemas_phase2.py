@@ -599,11 +599,11 @@ class LoyaltyConfigOut(BaseModel):
 
 
 class LoyaltyConfigChange(BaseModel):
-    earn_rate: float | None = None
-    redeem_value: float | None = None
-    min_balance_to_redeem: float | None = None
-    max_redeem_share: float | None = None
-    points_expiry_days: int | None = None
+    earn_rate: float | None = Field(default=None, ge=0)
+    redeem_value: float | None = Field(default=None, ge=0)
+    min_balance_to_redeem: float | None = Field(default=None, ge=0)
+    max_redeem_share: float | None = Field(default=None, ge=0, le=1)
+    points_expiry_days: int | None = Field(default=None, ge=0)
     reason: str | None = None
 
 
