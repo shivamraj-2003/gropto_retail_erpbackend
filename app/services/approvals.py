@@ -319,15 +319,19 @@ async def _handle_price_variant_add(db: AsyncSession, request: ApprovalRequest) 
         request.status = "stale"
         return
     value = request.new_value or {}
-    db.add(
-        ProductPriceVariant(
-            product_id=product.id,
-            mrp=value["mrp"],
-            selling_price=value["selling_price"],
-            label=(value.get("label") or "Other price").strip()[:40] or "Other price",
-        )
+    variant = ProductPriceVariant(
+        product_id=product.id,
+        mrp=value["mrp"],
+        selling_price=value["selling_price"],
+        label=(value.get("label") or "Other price").strip()[:40] or "Other price",
     )
+    db.add(variant)
     await db.flush()
+    if value.get("store_id") and float(value.get("quantity") or 0) > 0:
+        from app.models.models import PriceVariantStock
+
+        db.add(PriceVariantStock(variant_id=variant.id, store_id=uuid.UUID(value["store_id"]), quantity=float(value["quantity"])))
+        await db.flush()
     await db.refresh(product, attribute_names=["price_variants"])
     await bump_revision(db, product)
 

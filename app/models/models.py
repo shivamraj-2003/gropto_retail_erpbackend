@@ -329,6 +329,16 @@ class ProductPriceVariant(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+class PriceVariantStock(Base):
+    """Units of one extra price a store holds. A share of InventoryBalance.quantity, never a second stock."""
+
+    __tablename__ = "price_variant_stock"
+    variant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("product_price_variants.id", ondelete="CASCADE"), primary_key=True)
+    store_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("stores.id"), primary_key=True)
+    quantity: Mapped[float] = mapped_column(Numeric(14, 3), default=0)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 class InventoryBalance(Base):
     __tablename__ = "inventory_balances"
     product_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("products.id"), primary_key=True)
@@ -561,6 +571,18 @@ class Vendor(Base):
     bank_account_number: Mapped[str | None] = mapped_column(String)
     bank_ifsc: Mapped[str | None] = mapped_column(String)
     bank_name: Mapped[str | None] = mapped_column(String)
+    # What a proper purchase bill shows about the seller.
+    legal_name: Mapped[str | None] = mapped_column(String)
+    pan_number: Mapped[str | None] = mapped_column(String)
+    cin_number: Mapped[str | None] = mapped_column(String)
+    fssai_number: Mapped[str | None] = mapped_column(String)
+    address_line1: Mapped[str | None] = mapped_column(String)
+    address_line2: Mapped[str | None] = mapped_column(String)
+    city: Mapped[str | None] = mapped_column(String)
+    state: Mapped[str | None] = mapped_column(String)
+    pincode: Mapped[str | None] = mapped_column(String)
+    contact_person: Mapped[str | None] = mapped_column(String)
+    alt_phone: Mapped[str | None] = mapped_column(String)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
 
 

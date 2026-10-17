@@ -44,6 +44,32 @@ async def _find_customer(db: AsyncSession, phone: str | None) -> Customer | None
     return (await db.execute(select(Customer).where(Customer.phone == phone))).scalar_one_or_none()
 
 
+async def _use_up_price_stock(db: AsyncSession, sale_in: SaleIn) -> None:
+    """A line sold at an extra (old) price lowers that price's share of the store's stock. The store total is moved
+    separately, for every line; this only keeps the split by price right."""
+    from app.models.models import PriceVariantStock, ProductPriceVariant
+    from app.services.price_stock import after_sale, match_variant
+
+    product_ids = list({i.product_id for i in sale_in.items})
+    rows = (
+        await db.execute(select(ProductPriceVariant).where(ProductPriceVariant.product_id.in_(product_ids), ProductPriceVariant.is_active.is_(True)))
+    ).scalars().all()
+    if not rows:
+        return
+    by_product: dict[uuid.UUID, list[dict]] = {}
+    for v in rows:
+        by_product.setdefault(v.product_id, []).append({"id": v.id, "mrp": float(v.mrp), "selling_price": float(v.selling_price)})
+    sold: dict[str, float] = {}
+    for item in sale_in.items:
+        vid = match_variant(by_product.get(item.product_id, []), item.mrp_snapshot, item.unit_price)
+        if vid:
+            sold[vid] = sold.get(vid, 0) + item.quantity
+    for vid, qty in sold.items():
+        share = await db.get(PriceVariantStock, (uuid.UUID(vid), sale_in.store_id))
+        if share is not None:
+            share.quantity = after_sale(float(share.quantity), qty)
+
+
 async def process_sale(db: AsyncSession, sale_in: SaleIn) -> SyncItemVerdict:
     existing = await db.get(Sale, sale_in.id)
     if existing is not None:
@@ -284,6 +310,7 @@ async def process_sale(db: AsyncSession, sale_in: SaleIn) -> SyncItemVerdict:
 
         # Stock leaves once per product, with the quantities of all its lines added up. (The same product can be on a bill
         # more than once, e.g. at two prices, and a movement is recorded per sale and product.)
+        await _use_up_price_stock(db, sale_in)
         quantity_by_product: dict[uuid.UUID, float] = {}
         for item in sale_in.items:
             quantity_by_product[item.product_id] = quantity_by_product.get(item.product_id, 0) + item.quantity

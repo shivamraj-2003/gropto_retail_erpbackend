@@ -10,12 +10,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser, require_permission, require_store_access
 from app.core.database import get_db
-from app.models.models import InventoryBalance, Product, ProductBarcode, Store
+from app.models.models import InventoryBalance, PriceVariantStock, Product, ProductBarcode, Store
 from app.models.models_phase2 import Warehouse, WarehouseBalance
 from app.schemas.schemas import ProductCreate, ProductOut, ProductPriceChangeRequest, ProductPullResponse, ProductUpdate
 from app.services.approvals import submit_or_apply
 from app.services.audit import write_audit
 from app.services.catalog import barcode_owner, bump_revision, clean_barcodes
+from app.services.price_stock import split_stock
 
 router = APIRouter(prefix="/products", tags=["products"])
 
@@ -75,7 +76,104 @@ async def list_products(
         } if rows else {}
         for p in rows:
             p.store_quantity = held.get(p.id, 0.0)  # type: ignore[attr-defined]
+        with_variants = [p for p in rows if any(v.is_active for v in p.price_variants)]
+        if with_variants:
+            shares = {
+                (s.variant_id): float(s.quantity)
+                for s in (
+                    await db.execute(
+                        select(PriceVariantStock).where(
+                            PriceVariantStock.store_id == store_id,
+                            PriceVariantStock.variant_id.in_([v.id for p in with_variants for v in p.price_variants]),
+                        )
+                    )
+                ).scalars().all()
+            }
+            for p in with_variants:
+                p.price_split = _price_split(p, held.get(p.id, 0.0), shares)  # type: ignore[attr-defined]
     return rows
+
+
+def _price_split(product: Product, total: float, shares: dict) -> list[dict]:
+    """The units this store holds at each price of a product: the extra prices first, the current price with the rest."""
+    active = [v for v in product.price_variants if v.is_active]
+    current, per_variant = split_stock(total, [(str(v.id), shares.get(v.id, 0.0)) for v in active])
+    out = [{"key": "", "label": "Current price", "mrp": float(product.mrp), "selling_price": float(product.selling_price), "quantity": current}]
+    out += [{"key": str(v.id), "label": v.label, "mrp": float(v.mrp), "selling_price": float(v.selling_price), "quantity": per_variant[str(v.id)]} for v in active]
+    return out
+
+
+@router.get("/{product_id}/price-stock")
+async def price_stock(
+    product_id: uuid.UUID,
+    store_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(require_permission("catalog.product.view")),
+) -> dict:
+    """How many units a store holds at each price of one product."""
+    require_store_access(store_id, current)
+    product = await db.get(Product, product_id)
+    if product is None:
+        raise HTTPException(status_code=404, detail="Product not found")
+    balance = await db.get(InventoryBalance, (product_id, store_id))
+    total = float(balance.quantity) if balance else 0.0
+    shares = {
+        s.variant_id: float(s.quantity)
+        for s in (await db.execute(select(PriceVariantStock).where(PriceVariantStock.store_id == store_id))).scalars().all()
+    }
+    return {"product_id": str(product_id), "store_id": str(store_id), "total": total, "prices": _price_split(product, total, shares)}
+
+
+class PriceStockIn(BaseModel):
+    store_id: uuid.UUID
+    quantity: float = Field(ge=0)
+
+
+@router.put("/{product_id}/other-prices/{variant_id}/stock")
+async def set_price_stock(
+    product_id: uuid.UUID,
+    variant_id: uuid.UUID,
+    payload: PriceStockIn,
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(require_permission("inventory.stock.adjust")),
+) -> dict:
+    """Say how many of the store's units carry this extra price. It is a share of the stock the store already holds, so
+    it cannot be more than that stock (together with the other extra prices); the rest is at the current price."""
+    require_store_access(payload.store_id, current)
+    product = await db.get(Product, product_id)
+    variant = next((v for v in (product.price_variants if product else []) if v.id == variant_id and v.is_active), None)
+    if product is None or variant is None:
+        raise HTTPException(status_code=404, detail="That price was not found")
+    balance = await db.get(InventoryBalance, (product_id, payload.store_id))
+    total = float(balance.quantity) if balance else 0.0
+    others = 0.0
+    for v in product.price_variants:
+        if v.is_active and v.id != variant_id:
+            row = await db.get(PriceVariantStock, (v.id, payload.store_id))
+            others += float(row.quantity) if row else 0.0
+    if payload.quantity + others > total + 0.0005:
+        room = max(total - others, 0.0)
+        raise HTTPException(status_code=400, detail=f"The store holds {total:g} in all; at most {room:g} can be at this price")
+    row = await db.get(PriceVariantStock, (variant_id, payload.store_id))
+    old = float(row.quantity) if row else 0.0
+    if row is None:
+        db.add(PriceVariantStock(variant_id=variant_id, store_id=payload.store_id, quantity=payload.quantity))
+    else:
+        row.quantity = payload.quantity
+    await write_audit(
+        db,
+        user_id=current.user_id,
+        role_code=current.role_code,
+        store_id=payload.store_id,
+        device_id=None,
+        action="inventory.price_stock_set",
+        entity_type="product",
+        entity_id=product_id,
+        old_value={"variant": variant.label, "quantity": old},
+        new_value={"variant": variant.label, "quantity": payload.quantity},
+    )
+    await db.commit()
+    return {"variant_id": str(variant_id), "quantity": payload.quantity}
 
 
 @router.get("/count")
@@ -365,6 +463,9 @@ class PriceVariantRequest(BaseModel):
     selling_price: float = Field(gt=0)
     label: str = "Old stock"
     reason: str | None = None
+    # How many units a store holds at this price (optional; can be set later too).
+    store_id: uuid.UUID | None = None
+    quantity: float = Field(default=0, ge=0)
 
 
 @router.post("/{product_id}/other-prices")
@@ -394,7 +495,12 @@ async def add_other_price(
         entity_type="product",
         entity_id=product_id,
         old_value={"selling_price": float(product.selling_price), "mrp": float(product.mrp)},
-        new_value={"mrp": payload.mrp, "selling_price": payload.selling_price, "label": payload.label.strip()[:40] or "Old stock"},
+        new_value={
+            "mrp": payload.mrp,
+            "selling_price": payload.selling_price,
+            "label": payload.label.strip()[:40] or "Old stock",
+            **({"store_id": str(payload.store_id), "quantity": payload.quantity} if payload.store_id and payload.quantity > 0 else {}),
+        },
         reason=payload.reason,
         store_id=None,
     )

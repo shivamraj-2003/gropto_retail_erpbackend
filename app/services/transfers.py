@@ -381,7 +381,7 @@ async def resolve_discrepancy(
         (max(abs(open_qty(l)), l.damaged) for l in _lines(transfer)),
         default=0.0,
     )
-    if max_variance > await approval_threshold(db, "transfer_discrepancy_resolution", DISCREPANCY_APPROVAL_THRESHOLD) and not current.is_super_admin:
+    if not current.is_super_admin and max_variance > await approval_threshold(db, "transfer_discrepancy_resolution", DISCREPANCY_APPROVAL_THRESHOLD):
         request = await submit_or_apply(
             db,
             current=current,

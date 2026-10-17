@@ -1,7 +1,8 @@
 import uuid
+from datetime import date
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.models import Customer, Sale, SaleItem
@@ -129,57 +130,166 @@ async def customer_purchases(
     }
 
 
+_DAY = "Asia/Kolkata"
+
+
+def _product_sales(product_id: uuid.UUID, store_id: uuid.UUID | None, current: CurrentUser, date_from: date | None, date_to: date | None):
+    """Completed sale lines of one product in the stores this person may see, optionally within India calendar days."""
+    cond = [SaleItem.product_id == product_id, Sale.status == "completed"]
+    day = func.date(func.timezone(_DAY, Sale.billed_at))
+    if date_from:
+        cond.append(day >= date_from)
+    if date_to:
+        cond.append(day <= date_to)
+    return _sales_scope(select(SaleItem).join(Sale, Sale.id == SaleItem.sale_id).where(*cond), store_id, current)
+
+
 @router.get("/products/{product_id}/buyers")
 async def product_buyers(
     product_id: uuid.UUID,
     store_id: uuid.UUID | None = None,
+    date_from: date | None = None,
+    date_to: date | None = None,
+    q: str | None = None,
+    sort: str = "spent",
+    limit: int = 25,
+    offset: int = 0,
     db: AsyncSession = Depends(get_db),
     current: CurrentUser = Depends(require_permission("crm.customer.view")),
 ) -> dict:
-    """Who buys this product: the customers who bought it most, and how much went to customers who gave no number."""
+    """Who buys this product, one page at a time (there can be lakhs of buyers). Totals cover everyone in the date range;
+    `q` narrows the list to a name or mobile number; `sort` is spent | quantity | bills | last."""
+    limit = min(max(limit, 1), 100)
+    offset = max(offset, 0)
+    lines = _product_sales(product_id, store_id, current, date_from, date_to).subquery()
+    # one row per known customer
+    per = (
+        select(
+            Customer.id.label("cid"),
+            Customer.name.label("name"),
+            Customer.phone.label("phone"),
+            func.sum(lines.c.quantity).label("qty"),
+            func.sum(lines.c.line_total).label("spent"),
+            func.count(func.distinct(lines.c.sale_id)).label("bills"),
+            func.max(Sale.billed_at).label("last"),
+        )
+        .select_from(lines)
+        .join(Sale, Sale.id == lines.c.sale_id)
+        .join(Customer, Customer.id == Sale.customer_id)
+        .group_by(Customer.id, Customer.name, Customer.phone)
+    )
+    if q and q.strip():
+        like = f"%{q.strip()}%"
+        per = per.where(or_(Customer.name.ilike(like), Customer.phone.ilike(like)))
+    per = per.subquery()
+    order = {"quantity": per.c.qty.desc(), "bills": per.c.bills.desc(), "last": per.c.last.desc()}.get(sort, per.c.spent.desc())
+    matching = (await db.execute(select(func.count()).select_from(per))).scalar_one()
+    rows = (await db.execute(select(per).order_by(order, per.c.cid).limit(limit).offset(offset))).all()
+
+    # totals over the whole date range, not just this page
+    known = (
+        await db.execute(
+            select(
+                func.count(func.distinct(Sale.customer_id)),
+                func.coalesce(func.sum(lines.c.quantity), 0),
+                func.coalesce(func.sum(lines.c.line_total), 0),
+                func.count(func.distinct(lines.c.sale_id)),
+            )
+            .select_from(lines)
+            .join(Sale, Sale.id == lines.c.sale_id)
+            .where(Sale.customer_id.is_not(None))
+        )
+    ).one()
+    walk = (
+        await db.execute(
+            select(
+                func.coalesce(func.sum(lines.c.quantity), 0),
+                func.coalesce(func.sum(lines.c.line_total), 0),
+                func.count(func.distinct(lines.c.sale_id)),
+            )
+            .select_from(lines)
+            .join(Sale, Sale.id == lines.c.sale_id)
+            .where(Sale.customer_id.is_(None))
+        )
+    ).one()
+    return {
+        "total_customers": int(known[0]),
+        "total_quantity": round(float(known[1]) + float(walk[0]), 3),
+        "matching": int(matching),
+        "limit": limit,
+        "offset": offset,
+        "buyers": [
+            {
+                "customer_id": str(r.cid),
+                "name": r.name,
+                "phone": r.phone,
+                "quantity": float(r.qty),
+                "spent": round(float(r.spent), 2),
+                "bills": int(r.bills),
+                "last_bought": r.last.isoformat() if r.last else None,
+            }
+            for r in rows
+        ],
+        "walk_in": {"quantity": float(walk[0]), "spent": round(float(walk[1]), 2), "bills": int(walk[2])},
+    }
+
+
+@router.get("/products/{product_id}/sales")
+async def product_sales(
+    product_id: uuid.UUID,
+    store_id: uuid.UUID | None = None,
+    date_from: date | None = None,
+    date_to: date | None = None,
+    q: str | None = None,
+    limit: int = 25,
+    offset: int = 0,
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(require_permission("crm.customer.view")),
+) -> dict:
+    """The bills this product was sold on, newest first, one page at a time. `q` matches the bill number, customer name
+    or mobile number, so a lost bill can be found by when and what was bought."""
+    limit = min(max(limit, 1), 100)
+    offset = max(offset, 0)
+    lines = _product_sales(product_id, store_id, current, date_from, date_to).subquery()
     base = (
         select(
-            Customer.id,
+            Sale.id,
+            Sale.bill_number,
+            Sale.billed_at,
+            Sale.store_id,
             Customer.name,
             Customer.phone,
-            func.sum(SaleItem.quantity),
-            func.sum(SaleItem.line_total),
-            func.count(func.distinct(Sale.id)),
-            func.max(Sale.billed_at),
+            lines.c.quantity,
+            lines.c.unit_price,
+            lines.c.line_total,
         )
-        .select_from(SaleItem)
-        .join(Sale, Sale.id == SaleItem.sale_id)
+        .select_from(lines)
+        .join(Sale, Sale.id == lines.c.sale_id)
         .outerjoin(Customer, Customer.id == Sale.customer_id)
-        .where(SaleItem.product_id == product_id, Sale.status == "completed")
     )
-    rows = (
-        await db.execute(
-            _sales_scope(base, store_id, current)
-            .group_by(Customer.id, Customer.name, Customer.phone)
-            .order_by(func.sum(SaleItem.line_total).desc())
-        )
-    ).all()
-    buyers, walk_in = [], {"quantity": 0.0, "spent": 0.0, "bills": 0}
-    for cid, name, phone, qty, spent, bills, last in rows:
-        if cid is None:
-            walk_in = {"quantity": float(qty), "spent": round(float(spent), 2), "bills": int(bills)}
-            continue
-        buyers.append(
-            {
-                "customer_id": str(cid),
-                "name": name,
-                "phone": phone,
-                "quantity": float(qty),
-                "spent": round(float(spent), 2),
-                "bills": int(bills),
-                "last_bought": last.isoformat() if last else None,
-            }
-        )
+    if q and q.strip():
+        like = f"%{q.strip()}%"
+        base = base.where(or_(Sale.bill_number.ilike(like), Customer.name.ilike(like), Customer.phone.ilike(like)))
+    sub = base.subquery()
+    total = (await db.execute(select(func.count()).select_from(sub))).scalar_one()
+    rows = (await db.execute(base.order_by(Sale.billed_at.desc(), Sale.id).limit(limit).offset(offset))).all()
     return {
-        "total_customers": len(buyers),
-        "total_quantity": round(sum(b["quantity"] for b in buyers) + walk_in["quantity"], 3),
-        "buyers": buyers[:25],
-        "walk_in": walk_in,
+        "total": int(total),
+        "limit": limit,
+        "offset": offset,
+        "sales": [
+            {
+                "sale_id": str(r[0]),
+                "bill_number": r[1],
+                "billed_at": r[2].isoformat() if r[2] else None,
+                "customer_name": r[4],
+                "customer_phone": r[5],
+                "quantity": float(r[6]),
+                "unit_price": float(r[7]),
+                "line_total": round(float(r[8]), 2),
+            }
+            for r in rows
+        ],
     }
 
 

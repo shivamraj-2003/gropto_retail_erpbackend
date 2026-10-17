@@ -250,6 +250,8 @@ class ProductOut(BaseModel):
     alt_barcodes: list[str] = []
     # The extra prices still on offer (old stock); billing lets the cashier pick one.
     price_variants: list[PriceVariantOut] = []
+    # With a store chosen on the list: units of each price that store holds (only for products with extra prices).
+    price_split: list[dict] | None = None
     is_active: bool
     revision: int
 
@@ -493,6 +495,17 @@ class VendorCreate(BaseModel):
     bank_account_number: str | None = None
     bank_ifsc: str | None = None
     bank_name: str | None = None
+    legal_name: str | None = None
+    pan_number: str | None = None
+    cin_number: str | None = None
+    fssai_number: str | None = None
+    address_line1: str | None = None
+    address_line2: str | None = None
+    city: str | None = None
+    state: str | None = None
+    pincode: str | None = None
+    contact_person: str | None = None
+    alt_phone: str | None = None
 
 
 class VendorOut(VendorCreate):
@@ -515,6 +528,17 @@ class VendorUpdateIn(BaseModel):
     bank_account_number: str | None = None
     bank_ifsc: str | None = None
     bank_name: str | None = None
+    legal_name: str | None = None
+    pan_number: str | None = None
+    cin_number: str | None = None
+    fssai_number: str | None = None
+    address_line1: str | None = None
+    address_line2: str | None = None
+    city: str | None = None
+    state: str | None = None
+    pincode: str | None = None
+    contact_person: str | None = None
+    alt_phone: str | None = None
     is_active: bool | None = None
 
 
