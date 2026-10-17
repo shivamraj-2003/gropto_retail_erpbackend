@@ -237,7 +237,12 @@ async def request_discount_rule_change(
     if rule is None:
         raise HTTPException(status_code=404, detail="Discount rule not found")
 
-    old_value = {"percent": rule.percent, "flat_amount": rule.flat_amount, "active": rule.active}
+    # Numeric columns come back as Decimal, which cannot be stored in the request's JSON: turn them into plain numbers
+    old_value = {
+        "percent": float(rule.percent) if rule.percent is not None else None,
+        "flat_amount": float(rule.flat_amount) if rule.flat_amount is not None else None,
+        "active": rule.active,
+    }
     new_value = {k: v for k, v in payload.model_dump(exclude={"reason"}).items() if v is not None}
     if not new_value:
         raise HTTPException(status_code=400, detail="No fields to change")
