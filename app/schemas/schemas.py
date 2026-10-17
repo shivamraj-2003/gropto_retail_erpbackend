@@ -226,6 +226,7 @@ class PriceVariantOut(BaseModel):
     id: uuid.UUID
     mrp: float
     selling_price: float
+    purchase_price: float | None = None
     label: str
     is_active: bool = True
 
@@ -266,6 +267,15 @@ class ProductOut(BaseModel):
         return [v for v in (value or []) if getattr(v, "is_active", True)]
 
 
+class OtherPriceIn(BaseModel):
+    """One more price (another batch / old stock) a new product is on sale at."""
+
+    mrp: float
+    selling_price: float
+    purchase_price: float | None = None
+    label: str = "Old stock"
+
+
 class ProductCreate(BaseModel):
     sku: str
     barcode: str | None = None
@@ -280,6 +290,8 @@ class ProductCreate(BaseModel):
     hsn_code: str | None = None
     brand: str | None = None
     extra_barcodes: list[str] = []
+    # Other batches of the same product at a different price (billing asks which one is on the pack).
+    other_prices: list[OtherPriceIn] = []
 
 
 class ProductUpdate(BaseModel):

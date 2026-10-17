@@ -520,10 +520,10 @@ async def margin_bridge_report(
                 select s.store_id,
                        sum(si.quantity) filter (where date_trunc('month', s.billed_at) = date_trunc('month', now())) as qty_cur,
                        sum(si.line_total) filter (where date_trunc('month', s.billed_at) = date_trunc('month', now())) as rev_cur,
-                       sum(si.quantity * p.purchase_price) filter (where date_trunc('month', s.billed_at) = date_trunc('month', now())) as cogs_cur,
+                       sum(si.quantity * coalesce(si.cost_snapshot, p.purchase_price)) filter (where date_trunc('month', s.billed_at) = date_trunc('month', now())) as cogs_cur,
                        sum(si.quantity) filter (where date_trunc('month', s.billed_at) = date_trunc('month', now() - interval '1 month')) as qty_prior,
                        sum(si.line_total) filter (where date_trunc('month', s.billed_at) = date_trunc('month', now() - interval '1 month')) as rev_prior,
-                       sum(si.quantity * p.purchase_price) filter (where date_trunc('month', s.billed_at) = date_trunc('month', now() - interval '1 month')) as cogs_prior
+                       sum(si.quantity * coalesce(si.cost_snapshot, p.purchase_price)) filter (where date_trunc('month', s.billed_at) = date_trunc('month', now() - interval '1 month')) as cogs_prior
                 from sales s
                 join sale_items si on si.sale_id = s.id
                 join products p on p.id = si.product_id

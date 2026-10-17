@@ -324,6 +324,8 @@ class ProductPriceVariant(Base):
     product_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("products.id", ondelete="CASCADE"), nullable=False)
     mrp: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False)
     selling_price: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False)
+    # What this batch cost; empty = same as the product's cost price.
+    purchase_price: Mapped[float | None] = mapped_column(Numeric(12, 2), nullable=True)
     label: Mapped[str] = mapped_column(String, nullable=False, default="Other price")
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
@@ -501,6 +503,9 @@ class SaleItem(Base):
     # selling price. Snapshotted at billing time (like product_name_snapshot)
     # so it survives later MRP changes to the product catalogue.
     mrp_snapshot: Mapped[float | None] = mapped_column(Numeric(12, 2))
+    # The cost of the old-price batch this line was sold from, when that batch has its own cost.
+    # Empty = the product's cost price (margin reports use coalesce(cost_snapshot, product cost)).
+    cost_snapshot: Mapped[float | None] = mapped_column(Numeric(12, 2))
 
 
 class Payment(Base):

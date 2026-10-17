@@ -264,8 +264,8 @@ async def private_label_margin(
                        sum(si.quantity) as units_sold,
                        sum(si.line_total) as revenue,
                        sum(si.taxable_value) as taxable_revenue,
-                       sum(si.quantity * p.purchase_price) as cost,
-                       sum(si.line_total) - sum(si.quantity * p.purchase_price) as gross_margin
+                       sum(si.quantity * coalesce(si.cost_snapshot, p.purchase_price)) as cost,
+                       sum(si.line_total) - sum(si.quantity * coalesce(si.cost_snapshot, p.purchase_price)) as gross_margin
                 from products p
                 join sale_items si on si.product_id = p.id
                 join sales s on s.id = si.sale_id

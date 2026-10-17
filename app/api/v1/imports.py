@@ -42,6 +42,30 @@ TEMPLATES = {
             "You will see a row-by-row preview first. Nothing is saved until you press Save.",
         ],
     },
+    "other-prices": {
+        "permission": "import.product.import",
+        "sheet": "Other prices",
+        "file": "other-prices-import-template.xlsx",
+        "columns": ["sku", "mrp", "selling_price", "purchase_price", "label"],
+        "examples": [
+            ["EXAMPLE-001", 250, 240, 200, "Old stock"],
+            ["EXAMPLE-001", 245, 235, 195, "Batch B2409"],
+        ],
+        "help": [
+            ("sku", "Yes", "The SKU of a product that already exists. The same SKU can be on several rows, one per price.", "BOURN-500"),
+            ("mrp", "Yes", "The MRP printed on this batch.", "250"),
+            ("selling_price", "Yes", "What the customer pays for this batch. Cannot be above the MRP.", "240"),
+            ("purchase_price", "No", "What this batch cost you, per unit. Empty = same cost as the product.", "200"),
+            ("label", "No", "A short name the cashier sees when picking the price. Empty = Old stock.", "Old stock"),
+        ],
+        "notes": [
+            "The product keeps its current price too; billing asks which price is on the pack.",
+            "Like any price change, a Super Admin's rows apply at once and anyone else's wait for approval.",
+            "Set how many units are at each price afterwards, on the product's Price screen.",
+            "A .csv file with the same columns works too.",
+            "Delete the two EXAMPLE rows before you upload.",
+        ],
+    },
     "opening-stock": {
         "permission": "import.opening_stock.import",
         "sheet": "Opening stock",
@@ -135,6 +159,32 @@ async def stage_products(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return await import_service.preview_batch(db, batch.id)
+
+
+@router.post("/other-prices/stage")
+async def stage_other_prices(
+    file: UploadFile,
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(require_permission("import.product.import")),
+) -> dict:
+    content = await file.read()
+    try:
+        batch = await import_service.stage_other_prices_file(db, file_bytes=content, filename=file.filename, uploaded_by=current.user_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return await import_service.preview_batch(db, batch.id)
+
+
+@router.post("/other-prices/{batch_id}/commit")
+async def commit_other_prices(
+    batch_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(require_permission("import.product.import")),
+) -> dict:
+    try:
+        return await import_service.commit_other_prices_batch(db, batch_id, current)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @router.get("/{batch_id}/preview")

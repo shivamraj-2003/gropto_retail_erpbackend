@@ -26,7 +26,7 @@ async def store_sku_drilldown(
             text(
                 """
                 select p.sku, p.name, sum(si.quantity) qty, sum(si.line_total) revenue,
-                       sum(si.line_total) - sum(si.quantity * p.purchase_price) est_margin
+                       sum(si.line_total) - sum(si.quantity * coalesce(si.cost_snapshot, p.purchase_price)) est_margin
                 from sale_items si
                 join sales s on s.id = si.sale_id
                 join products p on p.id = si.product_id

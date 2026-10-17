@@ -269,7 +269,7 @@ async def ceo_command_center(
                     -- Point 3 audit fix: true COGS-based gross margin — previously
                     -- this was revenue minus operating expenses, not a real
                     -- cost-of-goods figure (no join to product cost existed).
-                    coalesce(sum(si.quantity * p.purchase_price), 0) as cogs_mtd,
+                    coalesce(sum(si.quantity * coalesce(si.cost_snapshot, p.purchase_price)), 0) as cogs_mtd,
                     coalesce((select sum(amount) from expenses where status = 'approved'
                         and date_trunc('month', created_at) = date_trunc('month', now())), 0) as expenses_mtd,
                     coalesce(sum(s.discount_total), 0) as discounts_mtd
@@ -291,14 +291,14 @@ async def ceo_command_center(
                 """
                 select coalesce(c.name, 'Uncategorized') as category,
                        coalesce(sum(si.quantity * si.unit_price - si.line_discount), 0) as revenue,
-                       coalesce(sum(si.quantity * p.purchase_price), 0) as cogs
+                       coalesce(sum(si.quantity * coalesce(si.cost_snapshot, p.purchase_price)), 0) as cogs
                 from sale_items si
                 join sales s on s.id = si.sale_id
                 join products p on p.id = si.product_id
                 left join categories c on c.id = p.category_id
                 where s.status = 'completed' and date_trunc('month', s.billed_at) = date_trunc('month', now())
                 group by c.name
-                order by (sum(si.quantity * si.unit_price - si.line_discount) - sum(si.quantity * p.purchase_price)) desc
+                order by (sum(si.quantity * si.unit_price - si.line_discount) - sum(si.quantity * coalesce(si.cost_snapshot, p.purchase_price))) desc
                 """
             )
         )
@@ -320,7 +320,7 @@ async def ceo_command_center(
                        st.target_revenue_monthly,
                        coalesce(sum(s.grand_total), 0) revenue,
                        count(s.id) bills,
-                       coalesce(sum(si.quantity * p.purchase_price), 0) as cogs,
+                       coalesce(sum(si.quantity * coalesce(si.cost_snapshot, p.purchase_price)), 0) as cogs,
                        ff.footfall
                 from stores st
                 left join sales s on s.store_id = st.id and date_trunc('month', s.billed_at) = date_trunc('month', now()) and s.status = 'completed'

@@ -44,6 +44,26 @@ async def _find_customer(db: AsyncSession, phone: str | None) -> Customer | None
     return (await db.execute(select(Customer).where(Customer.phone == phone))).scalar_one_or_none()
 
 
+async def _batch_costs(db: AsyncSession, sale_in: SaleIn) -> list[float | None]:
+    """Per sale line: the cost of the old-price batch it was sold from, when that batch has its own cost; else None."""
+    from app.models.models import ProductPriceVariant
+    from app.services.price_stock import match_variant
+
+    product_ids = list({i.product_id for i in sale_in.items})
+    rows = (
+        await db.execute(select(ProductPriceVariant).where(ProductPriceVariant.product_id.in_(product_ids), ProductPriceVariant.is_active.is_(True)))
+    ).scalars().all()
+    by_product: dict[uuid.UUID, list[dict]] = {}
+    cost_of: dict[str, float | None] = {}
+    for v in rows:
+        by_product.setdefault(v.product_id, []).append({"id": v.id, "mrp": float(v.mrp), "selling_price": float(v.selling_price)})
+        cost_of[str(v.id)] = float(v.purchase_price) if v.purchase_price is not None else None
+    return [
+        cost_of.get(match_variant(by_product.get(i.product_id, []), i.mrp_snapshot, i.unit_price) or "")
+        for i in sale_in.items
+    ]
+
+
 async def _use_up_price_stock(db: AsyncSession, sale_in: SaleIn) -> None:
     """A line sold at an extra (old) price lowers that price's share of the store's stock. The store total is moved
     separately, for every line; this only keeps the split by price right."""
@@ -287,6 +307,7 @@ async def process_sale(db: AsyncSession, sale_in: SaleIn) -> SyncItemVerdict:
                 reason=override_reason,
             )
 
+        batch_costs = await _batch_costs(db, sale_in)
         for idx, item in enumerate(sale_in.items):
             line_taxable, cgst, sgst, igst = line_tax_breakdown[idx]
             db.add(
@@ -305,6 +326,7 @@ async def process_sale(db: AsyncSession, sale_in: SaleIn) -> SyncItemVerdict:
                     sgst_amount=sgst,
                     igst_amount=igst,
                     mrp_snapshot=item.mrp_snapshot,
+                    cost_snapshot=batch_costs[idx],
                 )
             )
 

@@ -1,0 +1,4 @@
+sku,mrp,selling_price,purchase_price,label
+EXAMPLE-001,250,240,200,Old stock
+EXAMPLE-001,245,235,195,Batch B2409
+EXAMPLE-002,25,22,,Old stock

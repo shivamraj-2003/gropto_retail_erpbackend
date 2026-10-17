@@ -323,6 +323,7 @@ async def _handle_price_variant_add(db: AsyncSession, request: ApprovalRequest) 
         product_id=product.id,
         mrp=value["mrp"],
         selling_price=value["selling_price"],
+        purchase_price=value.get("purchase_price"),
         label=(value.get("label") or "Other price").strip()[:40] or "Other price",
     )
     db.add(variant)

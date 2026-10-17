@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser, require_permission, require_store_access
 from app.core.database import get_db
-from app.models.models import InventoryBalance, PriceVariantStock, Product, ProductBarcode, Store
+from app.models.models import InventoryBalance, PriceVariantStock, Product, ProductBarcode, ProductPriceVariant, Store
 from app.models.models_phase2 import Warehouse, WarehouseBalance
 from app.schemas.schemas import ProductCreate, ProductOut, ProductPriceChangeRequest, ProductPullResponse, ProductUpdate
 from app.services.approvals import submit_or_apply
@@ -98,8 +98,16 @@ def _price_split(product: Product, total: float, shares: dict) -> list[dict]:
     """The units this store holds at each price of a product: the extra prices first, the current price with the rest."""
     active = [v for v in product.price_variants if v.is_active]
     current, per_variant = split_stock(total, [(str(v.id), shares.get(v.id, 0.0)) for v in active])
-    out = [{"key": "", "label": "Current price", "mrp": float(product.mrp), "selling_price": float(product.selling_price), "quantity": current}]
-    out += [{"key": str(v.id), "label": v.label, "mrp": float(v.mrp), "selling_price": float(v.selling_price), "quantity": per_variant[str(v.id)]} for v in active]
+    out = [{"key": "", "label": "Current price", "mrp": float(product.mrp), "selling_price": float(product.selling_price),
+            "purchase_price": float(product.purchase_price or 0), "quantity": current}]
+    out += [
+        {
+            "key": str(v.id), "label": v.label, "mrp": float(v.mrp), "selling_price": float(v.selling_price),
+            "purchase_price": float(v.purchase_price if v.purchase_price is not None else (product.purchase_price or 0)),
+            "quantity": per_variant[str(v.id)],
+        }
+        for v in active
+    ]
     return out
 
 
@@ -270,7 +278,7 @@ async def create_product(
     db: AsyncSession = Depends(get_db),
     current: CurrentUser = Depends(require_permission("catalog.product.create")),
 ) -> Product:
-    data = payload.model_dump(exclude={"extra_barcodes"})
+    data = payload.model_dump(exclude={"extra_barcodes", "other_prices"})
     data["sku"] = data["sku"].strip()
     data["name"] = data["name"].strip()
     data["barcode"], extras = clean_barcodes(data["barcode"], payload.extra_barcodes)
@@ -282,8 +290,22 @@ async def create_product(
     elif data["mrp"] < data["selling_price"]:
         raise HTTPException(status_code=400, detail="MRP cannot be lower than the selling price")
     await _assert_unique(db, sku=data["sku"], barcodes=([data["barcode"]] if data["barcode"] else []) + extras)
+    seen_prices = {(float(data["mrp"]), float(data["selling_price"]))}
+    variants: list[ProductPriceVariant] = []
+    for extra in payload.other_prices:
+        if extra.mrp <= 0 or extra.selling_price <= 0:
+            raise HTTPException(status_code=400, detail="Another price needs an MRP and a selling price above 0")
+        if extra.selling_price > extra.mrp:
+            raise HTTPException(status_code=400, detail="The selling price cannot be above the MRP")
+        if (extra.mrp, extra.selling_price) in seen_prices:
+            raise HTTPException(status_code=409, detail=f"The price {extra.selling_price} (MRP {extra.mrp}) is listed twice")
+        seen_prices.add((extra.mrp, extra.selling_price))
+        if extra.purchase_price is not None and extra.purchase_price < 0:
+            raise HTTPException(status_code=400, detail="Cost price cannot be negative")
+        variants.append(ProductPriceVariant(mrp=extra.mrp, selling_price=extra.selling_price, purchase_price=extra.purchase_price, label=extra.label.strip()[:40] or "Old stock"))
     product = Product(**data)
     product.alt_barcodes = [ProductBarcode(barcode=code) for code in extras]
+    product.price_variants = variants
     db.add(product)
     await db.flush()
     await write_audit(
@@ -461,6 +483,7 @@ async def request_price_change(
 class PriceVariantRequest(BaseModel):
     mrp: float = Field(gt=0)
     selling_price: float = Field(gt=0)
+    purchase_price: float | None = Field(default=None, ge=0)
     label: str = "Old stock"
     reason: str | None = None
     # How many units a store holds at this price (optional; can be set later too).
@@ -498,6 +521,7 @@ async def add_other_price(
         new_value={
             "mrp": payload.mrp,
             "selling_price": payload.selling_price,
+            **({"purchase_price": payload.purchase_price} if payload.purchase_price is not None else {}),
             "label": payload.label.strip()[:40] or "Old stock",
             **({"store_id": str(payload.store_id), "quantity": payload.quantity} if payload.store_id and payload.quantity > 0 else {}),
         },

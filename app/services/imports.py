@@ -43,6 +43,10 @@ PRODUCT_COLUMNS = ["sku", "name", "barcode", "uom", "purchase_price", "selling_p
 OPENING_STOCK_COLUMNS = ["sku", "quantity", "batch_number", "mfg_date", "expiry_date"]
 
 
+def _blank_cell(raw) -> bool:
+    return raw is None or str(raw).strip() == ""
+
+
 def _parse_date(raw) -> date | None:
     """Excel gives real dates; typed cells arrive as text — accept ISO and DD-MM-YYYY / DD/MM/YYYY."""
     if raw is None or str(raw).strip() == "":
@@ -70,8 +74,15 @@ async def get_batch_with_rows(db: AsyncSession, batch_id: uuid.UUID) -> ImportBa
 
 
 def _rows_of(file_bytes: bytes) -> tuple[list[str], list[tuple]]:
-    wb = openpyxl.load_workbook(io_bytes(file_bytes), read_only=True)
-    rows = list(wb.active.iter_rows(values_only=True))
+    if file_bytes[:2] == b"PK":  # an .xlsx file is a zip; anything else is read as CSV
+        wb = openpyxl.load_workbook(io_bytes(file_bytes), read_only=True)
+        rows = list(wb.active.iter_rows(values_only=True))
+    else:
+        import csv
+        import io
+
+        text_value = file_bytes.decode("utf-8-sig", errors="replace")
+        rows = [tuple(r) for r in csv.reader(io.StringIO(text_value))]
     if not rows:
         raise ValueError("The file is empty")
     header = [header_key(h) for h in rows[0]]
@@ -95,7 +106,8 @@ async def stage_products_file(db: AsyncSession, *, file_bytes: bytes, filename: 
     except Exception as exc:  # noqa: BLE001 — a corrupt/non-Excel upload should read as a plain message
         raise ValueError("Could not read this file — upload an .xlsx Excel file") from exc
     if "sku" not in header:
-        raise ValueError("The first row must have a column called sku")
+        found = ", ".join(h for h in header if h) or "none"
+        raise ValueError(f"The first row must have a column called sku (this file has: {found})")
 
     batch = ImportBatch(import_type="products", uploaded_by=uploaded_by, file_name=filename, file_bytes=file_bytes, status="staged")
     db.add(batch)
@@ -165,6 +177,9 @@ async def preview_batch(db: AsyncSession, batch_id: uuid.UUID) -> dict:
             detail = describe_changes(v.get("_changes") or {})
         elif row.computed_action == "skip":
             detail = ["Already up to date"]
+        elif row.computed_action == "create" and batch.import_type == "other_prices":
+            cost = f", cost {v['purchase_price']}" if v.get("purchase_price") is not None else ""
+            detail = [f"Add price {v.get('selling_price')} (MRP {v.get('mrp')}{cost}) - {v.get('label')}"]
         label = v.get("name") or v.get("sku")
         rows.append({"line": row.line_number, "sku": v.get("sku"), "label": label, "action": row.computed_action, "detail": detail})
     return {"batch_id": str(batch_id), "counts": counts, "total_rows": len(batch.rows), "rows": rows[:300]}
@@ -280,7 +295,8 @@ async def stage_opening_stock_file(
     except Exception as exc:  # noqa: BLE001
         raise ValueError("Could not read this file — upload an .xlsx Excel file") from exc
     if "sku" not in header or "quantity" not in header:
-        raise ValueError("The first row must have the columns sku and quantity")
+        found = ", ".join(h for h in header if h) or "none"
+        raise ValueError(f"The first row must have the columns sku and quantity (this file has: {found}). Prices go in the Other Prices card.")
 
     batch = ImportBatch(
         import_type="opening_stock", store_id=store_id, uploaded_by=uploaded_by, file_name=filename,
@@ -422,6 +438,137 @@ async def commit_opening_stock_batch(db: AsyncSession, batch_id: uuid.UUID, curr
     )
     await db.commit()
     return {"rows_applied": applied, "expiry_batches_created": batches_created}
+
+
+async def stage_other_prices_file(db: AsyncSession, *, file_bytes: bytes, filename: str, uploaded_by: uuid.UUID) -> ImportBatch:
+    """Extra prices (another batch / old stock) for products that already exist, matched by SKU.
+    One row = one extra price; the same SKU can appear on several rows (one per price)."""
+    try:
+        header, data_rows = _rows_of(file_bytes)
+    except ValueError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise ValueError("Could not read this file - upload an .xlsx or .csv file") from exc
+    if not {"sku", "mrp", "selling_price"} <= set(header):
+        found = ", ".join(h for h in header if h) or "none"
+        raise ValueError(f"The first row must have the columns sku, mrp and selling_price (this file has: {found})")
+
+    batch = ImportBatch(import_type="other_prices", uploaded_by=uploaded_by, file_name=filename, file_bytes=file_bytes, status="staged")
+    db.add(batch)
+    await db.flush()
+
+    products = {p.sku: p for p in (await db.execute(select(Product))).scalars().all()}
+    seen: set[tuple[str, float, float]] = set()
+
+    for i, row in enumerate(data_rows, start=2):
+        values = dict(zip(header, row, strict=False))
+        messages: list[str] = []
+        sku = clean_text(values.get("sku")) or ""
+        product = products.get(sku)
+        if not sku:
+            messages.append("SKU is missing")
+        elif product is None:
+            messages.append(f"Unknown SKU {sku} - add the product first")
+        numbers: dict[str, float] = {}
+        for field in ("mrp", "selling_price"):
+            try:
+                number = float(values.get(field))
+                if number <= 0:
+                    messages.append(f"{field} must be more than 0")
+                numbers[field] = round(number, 2)
+            except (TypeError, ValueError):
+                messages.append(f"{field} is not a number")
+        mrp, selling = numbers.get("mrp"), numbers.get("selling_price")
+        if mrp is not None and selling is not None:
+            if selling > mrp:
+                messages.append("The selling price cannot be above the MRP")
+            key = (sku, mrp, selling)
+            if key in seen:
+                messages.append("This price appears twice for this SKU in the file")
+            seen.add(key)
+            if product is not None:
+                if abs(float(product.mrp) - mrp) < 0.005 and abs(float(product.selling_price) - selling) < 0.005:
+                    messages.append("This is already the product's current price")
+                elif any(v.is_active and abs(float(v.mrp) - mrp) < 0.005 and abs(float(v.selling_price) - selling) < 0.005 for v in product.price_variants):
+                    messages.append("The product already has this price")
+        label = (clean_text(values.get("label")) or "Old stock")[:40]
+        cost = None
+        if not _blank_cell(values.get("purchase_price")):
+            try:
+                cost = round(float(values.get("purchase_price")), 2)
+                if cost < 0:
+                    messages.append("purchase_price cannot be negative")
+            except (TypeError, ValueError):
+                messages.append("purchase_price is not a number")
+
+        db.add(
+            ImportStagingRow(
+                batch_id=batch.id,
+                line_number=i,
+                parsed_values={
+                    "sku": sku,
+                    "name": product.name if product else None,
+                    "product_id": str(product.id) if product else None,
+                    "mrp": mrp,
+                    "selling_price": selling,
+                    "purchase_price": cost,
+                    "label": label,
+                },
+                computed_action="create" if not messages else "error",
+                validation_messages=messages,
+            )
+        )
+    await db.commit()
+    return batch
+
+
+async def commit_other_prices_batch(db: AsyncSession, batch_id: uuid.UUID, current: CurrentUser) -> dict:
+    """Each row is an ordinary 'add another price' request: a Super Admin's apply at once, others wait for approval."""
+    batch = await get_batch_with_rows(db, batch_id)
+    if batch is None or batch.status != "staged" or batch.import_type != "other_prices":
+        raise ValueError("Batch not found or already applied")
+
+    added, pending = 0, 0
+    for row in batch.rows:
+        if row.computed_action != "create" or row.validation_messages:
+            continue
+        v = row.parsed_values
+        product = await db.get(Product, uuid.UUID(v["product_id"]))
+        if product is None:
+            continue
+        request = await submit_or_apply(
+            db,
+            current=current,
+            request_type="price_variant_add",
+            entity_type="product",
+            entity_id=product.id,
+            old_value={"selling_price": float(product.selling_price), "mrp": float(product.mrp)},
+            new_value={
+                "mrp": v["mrp"], "selling_price": v["selling_price"], "label": v["label"],
+                **({"purchase_price": v["purchase_price"]} if v.get("purchase_price") is not None else {}),
+            },
+            reason=f"Other price from import {batch.file_name}",
+            store_id=None,
+        )
+        if request.status == "approved":
+            added += 1
+        else:
+            pending += 1
+
+    batch.status = "applied"
+    await write_audit(
+        db,
+        user_id=current.user_id,
+        role_code=current.role_code,
+        store_id=None,
+        device_id=current.device_id,
+        action="import.committed",
+        entity_type="import_batch",
+        entity_id=batch.id,
+        new_value={"prices_added": added, "pending_approval": pending},
+    )
+    await db.commit()
+    return {"prices_added": added, "prices_pending_approval": pending}
 
 
 def io_bytes(data: bytes):
