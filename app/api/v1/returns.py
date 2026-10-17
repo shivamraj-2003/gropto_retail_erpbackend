@@ -1,4 +1,5 @@
 import uuid
+from datetime import date
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
@@ -109,6 +110,63 @@ async def find_bill(
         )
         for sale, name, phone in rows
     ]
+
+
+@router.get("/browse-bills")
+async def browse_bills(
+    store_id: uuid.UUID | None = None,
+    date_from: date | None = None,
+    date_to: date | None = None,
+    q: str = "",
+    limit: int = 20,
+    offset: int = 0,
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(require_permission("pos.return.refund")),
+) -> dict:
+    """Past bills, newest first, one page at a time, for any date range (India calendar days). `q` is optional and matches
+    bill number, mobile, name or an item bought. For looking through bills before choosing one to return."""
+    limit = min(max(limit, 1), 50)
+    offset = max(offset, 0)
+    stmt = (
+        select(Sale, Customer.name, Customer.phone)
+        .outerjoin(Customer, Customer.id == Sale.customer_id)
+        .where(Sale.status == "completed")
+    )
+    if not current.sees_all_stores():
+        stmt = stmt.where(Sale.store_id.in_(current.store_ids))
+    if store_id:
+        require_store_access(store_id, current)
+        stmt = stmt.where(Sale.store_id == store_id)
+    day = func.date(func.timezone("Asia/Kolkata", Sale.billed_at))
+    if date_from:
+        stmt = stmt.where(day >= date_from)
+    if date_to:
+        stmt = stmt.where(day <= date_to)
+    text = q.strip()
+    if len(text) >= 2:
+        like = f"%{text}%"
+        bought = exists().where(SaleItem.sale_id == Sale.id, SaleItem.product_name_snapshot.ilike(like))
+        stmt = stmt.where(or_(Sale.bill_number.ilike(like), Customer.phone.ilike(like), Customer.name.ilike(like), bought))
+    total = (await db.execute(select(func.count()).select_from(stmt.subquery()))).scalar_one()
+    rows = (await db.execute(stmt.order_by(Sale.billed_at.desc(), Sale.id).limit(limit).offset(offset))).all()
+    return {
+        "total": int(total),
+        "limit": limit,
+        "offset": offset,
+        "items": [
+            FoundBill(
+                id=sale.id,
+                store_id=sale.store_id,
+                bill_number=sale.bill_number,
+                billed_at=sale.billed_at.isoformat(),
+                grand_total=float(sale.grand_total),
+                customer_name=name,
+                customer_phone=phone,
+                items=[i.product_name_snapshot for i in sale.items][:4],
+            ).model_dump(mode="json")
+            for sale, name, phone in rows
+        ],
+    }
 
 
 @router.get("/bill/{sale_id}", response_model=BillOut)
