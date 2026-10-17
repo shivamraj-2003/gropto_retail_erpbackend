@@ -28,12 +28,17 @@ def _engine_kwargs(pool_size: int, max_overflow: int) -> dict:
         "pool_timeout": settings.db_pool_timeout,
         "pool_recycle": settings.db_pool_recycle,
     }
+    # a connection that cannot be opened within 10 s fails (and is retried by the next request) instead of hanging
+    connect_args: dict = {"timeout": 10}
     if _is_transaction_pooler(settings.database_url):
-        kwargs["connect_args"] = {
-            "statement_cache_size": 0,
-            "prepared_statement_cache_size": 0,
-            "prepared_statement_name_func": lambda: f"__asyncpg_{uuid.uuid4()}__",
-        }
+        connect_args.update(
+            {
+                "statement_cache_size": 0,
+                "prepared_statement_cache_size": 0,
+                "prepared_statement_name_func": lambda: f"__asyncpg_{uuid.uuid4()}__",
+            }
+        )
+    kwargs["connect_args"] = connect_args
     return kwargs
 
 
