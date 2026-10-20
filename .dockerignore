@@ -5,3 +5,6 @@ __pycache__
 .pytest_cache
 backups
 tests/__pycache__
+.git
+.github
+deploy

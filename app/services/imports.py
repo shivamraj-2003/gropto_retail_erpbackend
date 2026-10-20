@@ -20,7 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.api.deps import CurrentUser
-from app.models.models import ImportBatch, ImportStagingRow, InventoryBalance, Product, ProductBarcode
+from app.models.models import Category, Customer, ImportBatch, ImportStagingRow, InventoryBalance, Product, ProductBarcode, Vendor
 from app.models.models_phase2 import WarehouseBalance
 from app.models.models_phase4 import InventoryBatch
 from app.services.approvals import submit_or_apply
@@ -28,7 +28,10 @@ from app.services.audit import write_audit
 from app.services.catalog import bump_revision
 from app.services.inventory import adjust_warehouse_balance, apply_movement
 from app.services.product_import_rules import (
+    CUSTOMER_ALIASES,
     PRICE_FIELDS,
+    PRODUCT_ALIASES,
+    VENDOR_ALIASES,
     clean_text,
     describe_changes,
     diff_product,
@@ -36,7 +39,7 @@ from app.services.product_import_rules import (
     parse_product_row,
 )
 
-PRODUCT_COLUMNS = ["sku", "name", "barcode", "uom", "purchase_price", "selling_price", "mrp", "tax_rate", "hsn_code"]
+PRODUCT_COLUMNS = ["sku", "name", "barcode", "uom", "purchase_price", "selling_price", "mrp", "tax_rate", "hsn_code", "brand", "pack_size", "category"]
 # batch_number, mfg_date and expiry_date are optional; when any is given the
 # opening quantity is also recorded as an inventory batch so expiry tracking works.
 # The location (store or warehouse) is picked on screen, not read from the sheet.
@@ -73,7 +76,7 @@ async def get_batch_with_rows(db: AsyncSession, batch_id: uuid.UUID) -> ImportBa
     return (await db.execute(stmt)).scalar_one_or_none()
 
 
-def _rows_of(file_bytes: bytes) -> tuple[list[str], list[tuple]]:
+def _rows_of(file_bytes: bytes, aliases: dict | None = None) -> tuple[list[str], list[tuple]]:
     if file_bytes[:2] == b"PK":  # an .xlsx file is a zip; anything else is read as CSV
         wb = openpyxl.load_workbook(io_bytes(file_bytes), read_only=True)
         rows = list(wb.active.iter_rows(values_only=True))
@@ -85,12 +88,14 @@ def _rows_of(file_bytes: bytes) -> tuple[list[str], list[tuple]]:
         rows = [tuple(r) for r in csv.reader(io.StringIO(text_value))]
     if not rows:
         raise ValueError("The file is empty")
-    header = [header_key(h) for h in rows[0]]
+    header = [header_key(h, PRODUCT_ALIASES if aliases is None else aliases) for h in rows[0]]
     return header, [r for r in rows[1:] if any(c is not None and str(c).strip() != "" for c in r)]
 
 
-def _product_snapshot(p: Product) -> dict:
+def _product_snapshot(p: Product, category_names: dict | None = None) -> dict:
     return {
+        "brand": p.brand, "pack_size": float(p.pack_size or 1),
+        "category": (category_names or {}).get(p.category_id),
         "other_barcodes": [b.barcode for b in p.alt_barcodes],
         "name": p.name, "barcode": p.barcode, "uom": p.uom, "hsn_code": p.hsn_code,
         "purchase_price": float(p.purchase_price or 0), "selling_price": float(p.selling_price or 0),
@@ -114,6 +119,7 @@ async def stage_products_file(db: AsyncSession, *, file_bytes: bytes, filename: 
     await db.flush()
 
     all_products = list((await db.execute(select(Product))).scalars().all())
+    category_names = {c.id: c.name for c in (await db.execute(select(Category))).scalars().all()}
     by_sku = {p.sku: p for p in all_products}
     barcode_owner = {p.barcode: p.sku for p in all_products if p.barcode}
     for p in all_products:
@@ -147,7 +153,7 @@ async def stage_products_file(db: AsyncSession, *, file_bytes: bytes, filename: 
         elif existing is None:
             action = "create"
         else:
-            changes = diff_product(_product_snapshot(existing), provided)
+            changes = diff_product(_product_snapshot(existing, category_names), provided)
             action = "update" if changes else "skip"
 
         db.add(
@@ -193,6 +199,19 @@ async def commit_products_batch(db: AsyncSession, batch_id: uuid.UUID, current: 
     created, updated = 0, 0
     price_changes: list[dict] = []
     by_sku = {p.sku: p for p in (await db.execute(select(Product))).scalars().all()}
+    categories = {c.name.strip().lower(): c for c in (await db.execute(select(Category))).scalars().all()}
+
+    async def category_id(name: str | None):
+        """The id of the category with this name (any capitals), made on the spot when it is new."""
+        if not name:
+            return None
+        found = categories.get(name.strip().lower())
+        if found is None:
+            found = Category(name=name.strip())
+            db.add(found)
+            await db.flush()
+            categories[name.strip().lower()] = found
+        return found.id
 
     for row in batch.rows:
         if row.computed_action not in ("create", "update") or row.validation_messages:
@@ -204,6 +223,7 @@ async def commit_products_batch(db: AsyncSession, batch_id: uuid.UUID, current: 
                 sku=v["sku"], name=v["name"], barcode=v.get("barcode"), uom=v.get("uom") or "EA",
                 selling_price=v["selling_price"], mrp=v.get("mrp") or v["selling_price"],
                 tax_rate=v.get("tax_rate", 0), hsn_code=v.get("hsn_code"), purchase_price=v.get("purchase_price", 0),
+                brand=v.get("brand"), pack_size=v.get("pack_size", 1), category_id=await category_id(v.get("category")),
             )
             product.alt_barcodes = [ProductBarcode(barcode=c) for c in v.get("other_barcodes", []) if c != product.barcode]
             db.add(product)
@@ -224,7 +244,10 @@ async def commit_products_batch(db: AsyncSession, batch_id: uuid.UUID, current: 
                         product.alt_barcodes.append(ProductBarcode(barcode=code))
                 touched = True
                 continue
-            setattr(product, field, change["new"])
+            if field == "category":
+                product.category_id = await category_id(change["new"])
+            else:
+                setattr(product, field, change["new"])
             touched = True
         if touched:
             await bump_revision(db, product)
@@ -569,6 +592,230 @@ async def commit_other_prices_batch(db: AsyncSession, batch_id: uuid.UUID, curre
     )
     await db.commit()
     return {"prices_added": added, "prices_pending_approval": pending}
+
+
+# ---------------------------------------------------------------------------
+# Customers and vendors: simple masters, matched on a key, blank cell = leave as is
+# ---------------------------------------------------------------------------
+
+import re as _re
+
+_PHONE_DIGITS = _re.compile(r"\D+")
+
+
+def _clean_phone(raw) -> str | None:
+    """Excel hands phone numbers back as 9876543210.0 or with spaces / +91; keep the last 10 digits of an Indian mobile."""
+    text_value = clean_text(raw)
+    if text_value is None:
+        return None
+    digits = _PHONE_DIGITS.sub("", text_value)
+    if len(digits) > 10 and digits.startswith("91"):
+        digits = digits[-10:]
+    return digits or None
+
+
+VENDOR_TEXT = ("name", "gst_number", "phone", "email", "category", "service_area", "contact_person", "alt_phone", "legal_name",
+               "pan_number", "address_line1", "address_line2", "city", "state", "pincode", "bank_name", "bank_account_name",
+               "bank_account_number", "bank_ifsc")
+
+
+def _diff_fields(obj, provided: dict) -> dict:
+    changes = {}
+    for field, new in provided.items():
+        old = getattr(obj, field, None)
+        if (old or None) != new:
+            changes[field] = {"old": old, "new": new}
+    return changes
+
+
+async def stage_customers_file(db: AsyncSession, *, file_bytes: bytes, filename: str, uploaded_by: uuid.UUID) -> ImportBatch:
+    """Customers by mobile number: new numbers are added, known ones get the name / email that the sheet fills in."""
+    try:
+        header, data_rows = _rows_of(file_bytes, CUSTOMER_ALIASES)
+    except ValueError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise ValueError("Could not read this file - upload an .xlsx or .csv file") from exc
+    if "phone" not in header:
+        found = ", ".join(h for h in header if h) or "none"
+        raise ValueError(f"The first row must have a phone (or mobile) column (this file has: {found})")
+
+    batch = ImportBatch(import_type="customers", uploaded_by=uploaded_by, file_name=filename, file_bytes=file_bytes, status="staged")
+    db.add(batch)
+    await db.flush()
+    by_phone = {c.phone: c for c in (await db.execute(select(Customer))).scalars().all()}
+    seen: set[str] = set()
+
+    for i, row in enumerate(data_rows, start=2):
+        values = dict(zip(header, row, strict=False))
+        messages: list[str] = []
+        phone = _clean_phone(values.get("phone"))
+        provided: dict = {}
+        if not phone:
+            messages.append("Phone number is missing")
+        elif len(phone) != 10:
+            messages.append(f"Phone {phone} is not a 10-digit mobile number")
+        elif phone in seen:
+            messages.append("This phone number appears twice in the file")
+        seen.add(phone or "")
+        for field in ("name", "email"):
+            value = clean_text(values.get(field))
+            if value is not None:
+                if field == "email" and "@" not in value:
+                    messages.append(f"Email {value} is not valid")
+                    continue
+                provided[field] = value
+        existing = by_phone.get(phone or "")
+        changes: dict = {}
+        if messages:
+            action = "error"
+        elif existing is None:
+            action = "create"
+        else:
+            changes = _diff_fields(existing, provided)
+            action = "update" if changes else "skip"
+        db.add(
+            ImportStagingRow(
+                batch_id=batch.id, line_number=i,
+                parsed_values={"sku": phone, "phone": phone, "label": provided.get("name") or existing.name if existing else provided.get("name"), **provided, "_changes": changes},
+                computed_action=action, validation_messages=messages,
+            )
+        )
+    await db.commit()
+    return batch
+
+
+async def commit_customers_batch(db: AsyncSession, batch_id: uuid.UUID, current: CurrentUser) -> dict:
+    batch = await get_batch_with_rows(db, batch_id)
+    if batch is None or batch.status != "staged" or batch.import_type != "customers":
+        raise ValueError("Batch not found or already applied")
+    by_phone = {c.phone: c for c in (await db.execute(select(Customer))).scalars().all()}
+    created = updated = 0
+    for row in batch.rows:
+        if row.computed_action not in ("create", "update") or row.validation_messages:
+            continue
+        v = row.parsed_values
+        existing = by_phone.get(v["phone"])
+        if existing is None:
+            customer = Customer(phone=v["phone"], name=v.get("name"), email=v.get("email"))
+            db.add(customer)
+            by_phone[v["phone"]] = customer
+            created += 1
+        else:
+            for field, change in (v.get("_changes") or {}).items():
+                setattr(existing, field, change["new"])
+            updated += 1
+    batch.status = "applied"
+    await write_audit(
+        db, user_id=current.user_id, role_code=current.role_code, store_id=None, device_id=current.device_id,
+        action="import.committed", entity_type="import_batch", entity_id=batch.id, new_value={"created": created, "updated": updated},
+    )
+    await db.commit()
+    return {"created": created, "updated": updated}
+
+
+async def stage_vendors_file(db: AsyncSession, *, file_bytes: bytes, filename: str, uploaded_by: uuid.UUID) -> ImportBatch:
+    """Vendors matched by GST number, else by name (any capitals). Blank cells leave a vendor's details alone."""
+    try:
+        header, data_rows = _rows_of(file_bytes, VENDOR_ALIASES)
+    except ValueError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise ValueError("Could not read this file - upload an .xlsx or .csv file") from exc
+    if "name" not in header and "gst_number" not in header:
+        found = ", ".join(h for h in header if h) or "none"
+        raise ValueError(f"The first row must have a name (or gst_number) column (this file has: {found})")
+
+    batch = ImportBatch(import_type="vendors", uploaded_by=uploaded_by, file_name=filename, file_bytes=file_bytes, status="staged")
+    db.add(batch)
+    await db.flush()
+    vendors = list((await db.execute(select(Vendor))).scalars().all())
+    by_gst = {v.gst_number.upper(): v for v in vendors if v.gst_number}
+    by_name = {v.name.strip().lower(): v for v in vendors}
+    seen: set[str] = set()
+
+    for i, row in enumerate(data_rows, start=2):
+        values = dict(zip(header, row, strict=False))
+        messages: list[str] = []
+        provided: dict = {}
+        for field in VENDOR_TEXT:
+            if field in ("phone", "alt_phone"):
+                value = _clean_phone(values.get(field))
+            else:
+                value = clean_text(values.get(field))
+            if value is not None:
+                provided[field] = value.upper() if field in ("gst_number", "pan_number", "bank_ifsc") else value
+        if not _blank_cell(values.get("credit_days")):
+            try:
+                days = int(float(str(values.get("credit_days")).lower().replace("days", "").strip()))
+                if days < 0:
+                    raise ValueError
+                provided["credit_days"] = days
+            except ValueError:
+                messages.append("credit_days must be a whole number of days")
+        gst = provided.get("gst_number")
+        if gst and len(gst) != 15:
+            messages.append(f"GST number {gst} should have 15 characters")
+        existing = by_gst.get(gst) if gst else None
+        if existing is None and provided.get("name"):
+            existing = by_name.get(provided["name"].strip().lower())
+        if existing is None and not provided.get("name"):
+            messages.append("Name is required for a new vendor")
+        key = (gst or provided.get("name", "")).lower()
+        if key in seen:
+            messages.append("This vendor appears twice in the file")
+        seen.add(key)
+        if gst and existing is None and gst in by_gst:
+            messages.append(f"GST number {gst} already belongs to another vendor")
+        changes: dict = {}
+        if messages:
+            action = "error"
+        elif existing is None:
+            action = "create"
+        else:
+            changes = _diff_fields(existing, provided)
+            action = "update" if changes else "skip"
+        db.add(
+            ImportStagingRow(
+                batch_id=batch.id, line_number=i,
+                parsed_values={
+                    "sku": gst or provided.get("phone"), "label": provided.get("name") or (existing.name if existing else None),
+                    "vendor_id": str(existing.id) if existing else None, **provided, "_changes": changes,
+                },
+                computed_action=action, validation_messages=messages,
+            )
+        )
+    await db.commit()
+    return batch
+
+
+async def commit_vendors_batch(db: AsyncSession, batch_id: uuid.UUID, current: CurrentUser) -> dict:
+    batch = await get_batch_with_rows(db, batch_id)
+    if batch is None or batch.status != "staged" or batch.import_type != "vendors":
+        raise ValueError("Batch not found or already applied")
+    created = updated = 0
+    for row in batch.rows:
+        if row.computed_action not in ("create", "update") or row.validation_messages:
+            continue
+        v = row.parsed_values
+        if row.computed_action == "create":
+            fields = {k: val for k, val in v.items() if k in VENDOR_TEXT or k == "credit_days"}
+            db.add(Vendor(**fields))
+            created += 1
+        else:
+            vendor = await db.get(Vendor, uuid.UUID(v["vendor_id"]))
+            if vendor is None:
+                continue
+            for field, change in (v.get("_changes") or {}).items():
+                setattr(vendor, field, change["new"])
+            updated += 1
+    batch.status = "applied"
+    await write_audit(
+        db, user_id=current.user_id, role_code=current.role_code, store_id=None, device_id=current.device_id,
+        action="import.committed", entity_type="import_batch", entity_id=batch.id, new_value={"created": created, "updated": updated},
+    )
+    await db.commit()
+    return {"created": created, "updated": updated}
 
 
 def io_bytes(data: bytes):

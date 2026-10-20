@@ -19,10 +19,10 @@ TEMPLATES = {
         "permission": "import.product.import",
         "sheet": "Products",
         "file": "product-import-template.xlsx",
-        "columns": ["sku", "name", "barcode", "uom", "purchase_price", "selling_price", "mrp", "tax_rate", "hsn_code", "other_barcodes"],
+        "columns": ["sku", "name", "barcode", "uom", "purchase_price", "selling_price", "mrp", "tax_rate", "hsn_code", "brand", "category", "pack_size", "other_barcodes"],
         "examples": [
-            ["EXAMPLE-001", "Cadbury Bournvita 500g (example - delete this row)", "8901233012345", "EA", 215, 240, 250, 18, "1806", "8901233099999, 8901233088888"],
-            ["EXAMPLE-002", "Tata Salt 1kg (example - delete this row)", "8901000000002", "EA", 18, 22, 25, 5, "2501", ""],
+            ["EXAMPLE-001", "Cadbury Bournvita 500g (example - delete this row)", "8901233012345", "EA", 215, 240, 250, 18, "1806", "Cadbury", "Health drinks", 500, "8901233099999, 8901233088888"],
+            ["EXAMPLE-002", "Tata Salt 1kg (example - delete this row)", "8901000000002", "EA", 18, 22, 25, 5, "2501", "Tata", "Staples", 1000, ""],
         ],
         "help": [
             ("sku", "Yes", "Your own unique code for the product. This is how the file finds an existing product.", "BOURN-500"),
@@ -34,10 +34,14 @@ TEMPLATES = {
             ("mrp", "No", "The printed price. Cannot be lower than the selling price. Empty = same as selling price.", "250"),
             ("tax_rate", "No", "GST percentage: 0, 5, 12, 18 or 28.", "18"),
             ("hsn_code", "No", "HSN code for GST invoices.", "1806"),
+            ("brand", "No", "The brand name.", "Cadbury"),
+            ("category", "No", "The category. A new name is created for you; a known one is matched ignoring capitals.", "Health drinks"),
+            ("pack_size", "No", "Size of one pack, in the unit's own measure (e.g. 500 for a 500 g pack). Must be more than 0.", "500"),
             ("other_barcodes", "No", "More barcodes of the same product, separated by commas. Scanning any of them finds the product. Only added, never removed.", "8901233099999, 8901233088888"),
         ],
         "notes": [
             "A blank cell never changes anything: only the cells you fill in are updated.",
+            "Column names are flexible: Item Name, MRP, Cost, GST %, HSN, Brand, Category... are all understood. Any column the importer does not know is ignored.",
             "Delete the two EXAMPLE rows before you upload.",
             "You will see a row-by-row preview first. Nothing is saved until you press Save.",
         ],
@@ -64,6 +68,48 @@ TEMPLATES = {
             "Set how many units are at each price afterwards, on the product's Price screen.",
             "A .csv file with the same columns works too.",
             "Delete the two EXAMPLE rows before you upload.",
+        ],
+    },
+    "customers": {
+        "permission": "import.product.import",
+        "sheet": "Customers",
+        "file": "customers-import-template.xlsx",
+        "columns": ["phone", "name", "email"],
+        "examples": [["9876543210", "Asha Verma (example - delete this row)", "asha@example.com"], ["9123456780", "Ravi Kumar (example - delete this row)", ""]],
+        "help": [
+            ("phone", "Yes", "10-digit mobile number. This is how the file finds an existing customer. +91 and spaces are removed for you.", "9876543210"),
+            ("name", "No", "Customer name.", "Asha Verma"),
+            ("email", "No", "Email address.", "asha@example.com"),
+        ],
+        "notes": [
+            "A new mobile number adds a customer; a known one gets the name or email you fill in. A blank cell changes nothing.",
+            "Column names are flexible: Mobile, Customer Name, Email ID... are understood. Other columns are ignored.",
+            "Delete the two EXAMPLE rows before you upload.",
+        ],
+    },
+    "vendors": {
+        "permission": "import.product.import",
+        "sheet": "Vendors",
+        "file": "vendors-import-template.xlsx",
+        "columns": ["name", "gst_number", "phone", "email", "contact_person", "credit_days", "category", "address_line1", "city", "state", "pincode", "pan_number"],
+        "examples": [
+            ["ABC Distributors (example - delete this row)", "29ABCDE1234F1Z5", "9876501234", "sales@abc.example", "Mr Rao", 30, "FMCG", "12 Market Road", "Bengaluru", "Karnataka", "560001", "ABCDE1234F"],
+        ],
+        "help": [
+            ("name", "New vendors", "Vendor name. Also used to find an existing vendor when there is no GST number.", "ABC Distributors"),
+            ("gst_number", "No", "15-character GSTIN. The best way to find an existing vendor.", "29ABCDE1234F1Z5"),
+            ("phone", "No", "Mobile or phone number.", "9876501234"),
+            ("email", "No", "Email address.", "sales@abc.example"),
+            ("contact_person", "No", "Who you deal with.", "Mr Rao"),
+            ("credit_days", "No", "Days of credit the vendor gives you.", "30"),
+            ("category", "No", "What they supply.", "FMCG"),
+            ("address_line1", "No", "Address, plus city, state, pincode in their own columns.", "12 Market Road"),
+            ("pan_number", "No", "PAN, for purchase bills.", "ABCDE1234F"),
+        ],
+        "notes": [
+            "Also understood: address_line2, legal_name, alt_phone, service_area, bank_name, bank_account_name, bank_account_number, bank_ifsc.",
+            "Column names are flexible: Supplier, GSTIN, Mobile, Credit Period... are understood. Other columns are ignored.",
+            "A blank cell changes nothing. Delete the EXAMPLE row before you upload.",
         ],
     },
     "opening-stock": {
@@ -183,6 +229,58 @@ async def commit_other_prices(
 ) -> dict:
     try:
         return await import_service.commit_other_prices_batch(db, batch_id, current)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.post("/customers/stage")
+async def stage_customers(
+    file: UploadFile,
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(require_permission("import.product.import")),
+) -> dict:
+    content = await file.read()
+    try:
+        batch = await import_service.stage_customers_file(db, file_bytes=content, filename=file.filename, uploaded_by=current.user_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return await import_service.preview_batch(db, batch.id)
+
+
+@router.post("/customers/{batch_id}/commit")
+async def commit_customers(
+    batch_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(require_permission("import.product.import")),
+) -> dict:
+    try:
+        return await import_service.commit_customers_batch(db, batch_id, current)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.post("/vendors/stage")
+async def stage_vendors(
+    file: UploadFile,
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(require_permission("import.product.import")),
+) -> dict:
+    content = await file.read()
+    try:
+        batch = await import_service.stage_vendors_file(db, file_bytes=content, filename=file.filename, uploaded_by=current.user_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return await import_service.preview_batch(db, batch.id)
+
+
+@router.post("/vendors/{batch_id}/commit")
+async def commit_vendors(
+    batch_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(require_permission("import.product.import")),
+) -> dict:
+    try:
+        return await import_service.commit_vendors_batch(db, batch_id, current)
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 

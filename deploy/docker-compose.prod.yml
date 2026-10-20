@@ -1,0 +1,60 @@
+# Production stack on the VPS (copied to /opt/gropto by the deploy workflow).
+# The API image comes from GitHub Container Registry; Postgres (Supabase) and Redis (Upstash) are managed services,
+# so only the API, the Celery worker and the Caddy TLS proxy run here. Configuration is /opt/gropto/.env.
+#
+# IMAGE is set by remote-deploy.sh, e.g. ghcr.io/<owner>/<repo>:<commit sha>.
+services:
+  api:
+    image: ${IMAGE:?set IMAGE}
+    env_file: .env
+    environment:
+      WEB_CONCURRENCY: ${WEB_CONCURRENCY:-1}
+    expose:
+      - "8000"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/health/ready"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  worker:
+    image: ${IMAGE:?set IMAGE}
+    env_file: .env
+    command: ["celery", "-A", "app.worker.celery_app", "worker", "--loglevel=info", "--concurrency=4", "-Q", "notifications"]
+    restart: unless-stopped
+
+  migrate:
+    image: ${IMAGE:?set IMAGE}
+    env_file: .env
+    command: ["python", "-m", "alembic", "upgrade", "head"]
+    profiles: ["tools"]
+
+  backup:
+    image: ${IMAGE:?set IMAGE}
+    env_file: .env
+    command: ["python", "-m", "scripts.backup_db", "--dir", "/backups", "--keep-days", "14"]
+    volumes:
+      - ./backups:/backups
+    profiles: ["tools"]
+
+  caddy:
+    image: caddy:2
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      # A domain name (HTTPS is automatic) or ":80" for plain HTTP on the server's IP until a domain is ready.
+      SITE_ADDRESS: ${SITE_ADDRESS:-:80}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - api
+    restart: unless-stopped
+
+volumes:
+  caddy_data:
+  caddy_config:

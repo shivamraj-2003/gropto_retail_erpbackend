@@ -44,11 +44,13 @@ def test_the_split_shown_on_the_product_list():
 
     va, vb = uuid.uuid4(), uuid.uuid4()
     product = SimpleNamespace(
-        mrp=110, selling_price=105,
+        mrp=110, selling_price=105, purchase_price=80,
         price_variants=[
-            SimpleNamespace(id=va, is_active=True, label="Old stock", mrp=100, selling_price=95),
-            SimpleNamespace(id=vb, is_active=False, label="Gone", mrp=90, selling_price=85),
+            SimpleNamespace(id=va, is_active=True, label="Old stock", mrp=100, selling_price=95, purchase_price=None),
+            SimpleNamespace(id=vb, is_active=False, label="Gone", mrp=90, selling_price=85, purchase_price=70),
         ],
     )
     rows = _price_split(product, 30, {va: 18, vb: 5})
     assert [(r["label"], r["quantity"]) for r in rows] == [("Current price", 12), ("Old stock", 18)]
+    # an old price with no cost of its own uses the product's cost
+    assert [r["purchase_price"] for r in rows] == [80, 80]

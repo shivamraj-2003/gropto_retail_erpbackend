@@ -68,3 +68,31 @@ def test_other_barcodes_are_split_and_diffed():
     assert describe_changes(changes) == ["Other barcodes: add 222"]
     # the main barcode listed again among the others is not a change
     assert diff_product(existing, {"other_barcodes": ["8901233012345"]}) == {}
+
+
+def test_common_column_names_are_understood():
+    from app.services.product_import_rules import CUSTOMER_ALIASES, PRODUCT_ALIASES, VENDOR_ALIASES
+
+    assert header_key("Item Name", PRODUCT_ALIASES) == "name"
+    assert header_key("GST %", PRODUCT_ALIASES) == "tax_rate"
+    assert header_key("Cost", PRODUCT_ALIASES) == "purchase_price"
+    assert header_key("Exp. Date", PRODUCT_ALIASES) == "expiry_date"
+    assert header_key("Mobile No", CUSTOMER_ALIASES) == "phone"
+    assert header_key("GSTIN", VENDOR_ALIASES) == "gst_number"
+    assert header_key("Some Random Column", PRODUCT_ALIASES) == "some_random_column"
+
+
+def test_brand_category_and_pack_size_are_read():
+    fields, msgs = parse_product_row({"name": "Tea", "selling_price": 50, "brand": "Tata", "category": "Staples", "pack_size": 250}, is_new=True)
+    assert not msgs and fields["brand"] == "Tata" and fields["category"] == "Staples" and fields["pack_size"] == 250.0
+    _, msgs = parse_product_row({"name": "Tea", "selling_price": 50, "pack_size": 0}, is_new=True)
+    assert "Pack size must be more than 0" in msgs
+    assert diff_product({"category": "Staples", "pack_size": 1.0}, {"category": "Snacks"}) == {"category": {"old": "Staples", "new": "Snacks"}}
+
+
+def test_phone_numbers_are_cleaned():
+    from app.services.imports import _clean_phone
+
+    assert _clean_phone(9876543210.0) == "9876543210"
+    assert _clean_phone("+91 98765-43210") == "9876543210"
+    assert _clean_phone("") is None

@@ -6,8 +6,10 @@ A blank cell never changes anything: on an existing product only the columns
 the sheet actually fills in are compared and updated.
 """
 
-TEXT_FIELDS = ("name", "barcode", "uom", "hsn_code")
-NUMBER_FIELDS = ("purchase_price", "selling_price", "mrp", "tax_rate")
+import re
+
+TEXT_FIELDS = ("name", "barcode", "uom", "hsn_code", "brand", "category")
+NUMBER_FIELDS = ("purchase_price", "selling_price", "mrp", "tax_rate", "pack_size")
 # Customer-facing prices: changing them goes through approval (one request for the whole file).
 PRICE_FIELDS = ("selling_price", "mrp")
 LABELS = {
@@ -19,6 +21,9 @@ LABELS = {
     "selling_price": "Selling price",
     "mrp": "MRP",
     "tax_rate": "GST %",
+    "brand": "Brand",
+    "category": "Category",
+    "pack_size": "Pack size",
     "other_barcodes": "Other barcodes",
 }
 
@@ -52,8 +57,60 @@ def split_codes(raw) -> list[str]:
     return out
 
 
-def header_key(raw) -> str:
-    return str(raw or "").strip().lower().replace(" ", "_")
+# Column names people actually use, mapped to the ones the importer understands, so a sheet exported from another
+# billing tool or typed by hand works without renaming its headings. Unknown columns are ignored.
+PRODUCT_ALIASES = {
+    "sku": ("item_code", "product_code", "code", "sku_code", "item_sku", "article_no", "article_code"),
+    "name": ("item_name", "product_name", "product", "item", "description", "item_description"),
+    "barcode": ("bar_code", "ean", "upc", "barcode_no", "primary_barcode", "main_barcode"),
+    "other_barcodes": ("alt_barcodes", "additional_barcodes", "extra_barcodes", "other_barcode", "alternate_barcodes"),
+    "uom": ("unit", "units", "unit_of_measure", "uom_code"),
+    "purchase_price": ("cost", "cost_price", "purchase_rate", "buying_price", "purchase_cost", "cp"),
+    "selling_price": ("sale_price", "selling_rate", "sp", "price", "rate", "sales_price", "retail_price"),
+    "mrp": ("max_retail_price", "mrp_price"),
+    "tax_rate": ("gst", "gst_rate", "tax", "gst_percent", "tax_percent", "gst_pct", "tax_pct"),
+    "hsn_code": ("hsn", "hsn_sac", "hsn_no"),
+    "brand": ("brand_name", "company", "manufacturer"),
+    "category": ("category_name", "group", "department", "item_group"),
+    "pack_size": ("pack", "pack_qty", "pack_weight"),
+    "quantity": ("qty", "stock", "opening_stock", "stock_qty", "closing_stock", "on_hand"),
+    "batch_number": ("batch", "batch_no", "batch_num"),
+    "mfg_date": ("mfg", "manufacturing_date", "manufactured_on", "mfd"),
+    "expiry_date": ("expiry", "exp_date", "exp", "expiry_on", "expires_on"),
+    "label": ("price_name", "batch_name"),
+}
+CUSTOMER_ALIASES = {
+    "phone": ("mobile", "mobile_no", "mobile_number", "phone_number", "contact_no", "contact_number", "whatsapp", "phone_no"),
+    "name": ("customer_name", "full_name", "customer"),
+    "email": ("email_id", "e_mail", "mail", "email_address"),
+}
+VENDOR_ALIASES = {
+    "name": ("vendor_name", "supplier", "supplier_name", "vendor", "company_name"),
+    "gst_number": ("gstin", "gst_no", "gst", "gst_number", "gst_id"),
+    "phone": ("mobile", "mobile_no", "phone_number", "contact_no", "contact_number", "phone_no"),
+    "email": ("email_id", "e_mail", "mail", "email_address"),
+    "contact_person": ("contact_name", "contact", "person"),
+    "credit_days": ("credit_period", "payment_terms", "credit_term", "credit"),
+    "address_line1": ("address", "address1", "address_1", "street"),
+    "address_line2": ("address2", "address_2"),
+    "pan_number": ("pan", "pan_no"),
+    "pincode": ("pin", "pin_code", "zip", "postal_code"),
+    "legal_name": ("registered_name",),
+    "bank_account_number": ("account_number", "account_no", "bank_account"),
+    "bank_ifsc": ("ifsc", "ifsc_code"),
+    "bank_name": ("bank",),
+    "alt_phone": ("alternate_phone", "alt_mobile"),
+}
+
+
+def header_key(raw, aliases: dict | None = None) -> str:
+    """'Selling Price', 'selling-price' and 'SELLING_PRICE' are the same column; with `aliases`, so are 'MRP price',
+    'Cost' (purchase_price) and the other common names."""
+    key = re.sub(r"[^a-z0-9]+", "_", str(raw or "").strip().lower()).strip("_")
+    for canonical, names in (aliases or {}).items():
+        if key == canonical or key in names:
+            return canonical
+    return key
 
 
 def parse_product_row(values: dict, *, is_new: bool) -> tuple[dict, list[str]]:
@@ -77,6 +134,9 @@ def parse_product_row(values: dict, *, is_new: bool) -> tuple[dict, list[str]]:
             continue
         if number < 0:
             messages.append(f"{LABELS[field]} cannot be negative")
+            continue
+        if field == "pack_size" and number <= 0:
+            messages.append("Pack size must be more than 0")
             continue
         if field == "tax_rate" and number > 100:
             messages.append("GST % must be between 0 and 100")
@@ -121,5 +181,5 @@ def describe_changes(changes: dict[str, dict]) -> list[str]:
         if f == "other_barcodes":
             out.append(f"Other barcodes: add {', '.join(c['new'])}")
         else:
-            out.append(f"{LABELS[f]}: {c['old'] if c['old'] is not None else '—'} → {c['new']}")
+            out.append(f"{LABELS.get(f, f.replace('_', ' ').capitalize())}: {c['old'] if c['old'] not in (None, '') else '—'} → {c['new']}")
     return out
