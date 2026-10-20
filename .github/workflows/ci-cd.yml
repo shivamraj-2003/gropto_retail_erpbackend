@@ -11,6 +11,11 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      run_migrations:
+        description: "Also apply database migrations to production (normally off: the database is already set up)"
+        type: boolean
+        default: false
 
 concurrency:
   group: ci-cd-${{ github.ref }}
@@ -132,9 +137,6 @@ jobs:
           case "$db" in postgresql+asyncpg://*|"") ;; *) fail="$fail\n- DATABASE_URL must start with postgresql+asyncpg:// (the app uses asyncpg)";; esac
           [ -n "$(get JWT_SECRET)" ] || fail="$fail\n- JWT_SECRET is missing from PROD_ENV"
           case "$db$mig" in *"localhost"*|*"127.0.0.1"*) fail="$fail\n- the database URL points at localhost, not Supabase";; esac
-          case "$db" in
-            *:6543/*) [ -n "$mig" ] || fail="$fail\n- DATABASE_URL uses the Supabase transaction pooler (port 6543); also set MIGRATION_DATABASE_URL to the session pooler (port 5432) so migrations run safely";;
-          esac
           if [ -n "$fail" ]; then
             printf "::error::PROD_ENV problems:%b\n" "$fail"
             exit 1
@@ -175,8 +177,9 @@ jobs:
         if: steps.configured.outputs.ready == 'true'
         env:
           IMAGE: ${{ needs.image.outputs.image }}:${{ github.sha }}
+          RUN_MIGRATIONS: ${{ inputs.run_migrations && 'true' || 'false' }}
           REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REGISTRY_USER: ${{ github.actor }}
         run: |
           printf '%s' "$REGISTRY_TOKEN" | ssh gropto-server "docker login ghcr.io -u '$REGISTRY_USER' --password-stdin"
-          ssh gropto-server "bash /opt/gropto/remote-deploy.sh '$IMAGE'"
+          ssh gropto-server "RUN_MIGRATIONS='$RUN_MIGRATIONS' bash /opt/gropto/remote-deploy.sh '$IMAGE'"

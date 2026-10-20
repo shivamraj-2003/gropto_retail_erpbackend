@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Runs ON THE SERVER (called over SSH by the deploy workflow): applies migrations, switches to the new image, waits for
-# it to be healthy, and goes back to the previous image if it is not.
+# Runs ON THE SERVER (called over SSH by the deploy workflow): switches to the new image, waits for it to be healthy,
+# and goes back to the previous image if it is not. Migrations only when RUN_MIGRATIONS=true.
 #   usage: remote-deploy.sh ghcr.io/<owner>/<repo>:<sha>
 set -euo pipefail
 
@@ -12,16 +12,20 @@ PREVIOUS_IMAGE="$(cat .current_image 2>/dev/null || true)"
 echo "==> Pulling $NEW_IMAGE"
 docker pull "$NEW_IMAGE"
 
-# A dump of the Supabase database before the schema changes. Best effort: a failed dump (for example a pg_dump older than
-# the Supabase server) is reported but does not stop the deploy, because Supabase keeps its own backups too.
-echo "==> Backing up the database before migrating"
-mkdir -p backups && chown 10001 backups 2>/dev/null || true
-if ! IMAGE="$NEW_IMAGE" "${COMPOSE[@]}" run --rm backup; then
-  echo "!! Backup did not complete - continuing; check the Supabase dashboard backups (Project Settings -> Database -> Backups)."
+# The database (Supabase) and Redis (Upstash) already exist and are not touched by a normal deploy. Migrations only run when
+# asked for: Actions -> CI/CD -> Run workflow -> "Also apply database migrations" (RUN_MIGRATIONS=true).
+if [ "${RUN_MIGRATIONS:-false}" = "true" ]; then
+  # A dump first. Best effort: a failed dump (for example a pg_dump older than the Supabase server) does not stop the deploy.
+  echo "==> Backing up the database before migrating"
+  mkdir -p backups && chown 10001 backups 2>/dev/null || true
+  if ! IMAGE="$NEW_IMAGE" "${COMPOSE[@]}" run --rm backup; then
+    echo "!! Backup did not complete - continuing; Supabase keeps its own backups."
+  fi
+  echo "==> Applying database migrations"
+  IMAGE="$NEW_IMAGE" "${COMPOSE[@]}" run --rm migrate
+else
+  echo "==> Skipping migrations (database already set up)"
 fi
-
-echo "==> Applying database migrations"
-IMAGE="$NEW_IMAGE" "${COMPOSE[@]}" run --rm migrate
 
 echo "==> Starting the new version"
 IMAGE="$NEW_IMAGE" "${COMPOSE[@]}" up -d --remove-orphans api worker caddy

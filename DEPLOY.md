@@ -49,7 +49,6 @@ and nothing breaks.
 
 ```
 DATABASE_URL=postgresql+asyncpg://...      # Supabase pooler connection string (see "Supabase" below)
-MIGRATION_DATABASE_URL=postgresql://...    # Supabase session pooler (port 5432), used for migrations and backups
 JWT_SECRET=<long random string>            # python -c "import secrets; print(secrets.token_urlsafe(48))"
 ENVIRONMENT=production
 CORS_ORIGINS=app://.,https://your-domain
@@ -64,33 +63,32 @@ payment, WhatsApp, SMS and email keys when you use them.
 
 Then check it: `curl https://<your-domain>/health/ready`
 
-## Supabase
+## Supabase and Upstash (already set up)
 
-The database is a Supabase project, so no database runs on the server and CI never touches it (CI proves the migrations on
-a throwaway Postgres; only the deploy job applies them to Supabase).
+The database (Supabase) and Redis (Upstash) are already created and migrated, so a normal deploy **only ships the backend**:
+it does not run migrations and does not touch the database or Redis. CI never touches them either (it proves the migrations
+on a throwaway Postgres).
 
-- Copy the connection strings from the Supabase dashboard: **Connect** -> **Session pooler** (port 5432) or **Transaction
-  pooler** (port 6543). Use the **pooler** strings, not "Direct connection": the direct one needs IPv6, which many VPSs lack.
-- In `DATABASE_URL` the scheme must be `postgresql+asyncpg://`.
-- Session pooler caps at 15 connections, so keep `WEB_CONCURRENCY=1` (the default). With the transaction pooler (6543) more
-  workers are fine, but then `MIGRATION_DATABASE_URL` must be set to the session pooler (5432). The deploy job refuses to
-  run if it is missing.
-- Before each migration a `pg_dump` is saved to `/opt/gropto/backups` (14 days kept). It is best effort: if the dump
-  fails, for instance because the client is older than the Supabase server, the deploy continues. Keep Supabase's own
-  backups on (Project Settings -> Database -> Backups) and consider point-in-time recovery.
-- The deploy job also stops early with a clear message if `PROD_ENV` has no `DATABASE_URL` or `JWT_SECRET`, if the URL is
-  not `postgresql+asyncpg://`, or if it points at localhost.
+- `PROD_ENV` carries the **production** connection strings (the password there is the production one, not your local
+  `.env`'s): `DATABASE_URL` (`postgresql+asyncpg://...`, Supabase pooler) and `REDIS_URL` (`rediss://...`, Upstash).
+- Session pooler (port 5432) caps at 15 connections, so keep `WEB_CONCURRENCY=1`.
+- The deploy job stops early with a clear message if `PROD_ENV` has no `DATABASE_URL` or `JWT_SECRET`, if the URL is not
+  `postgresql+asyncpg://`, or if it points at localhost.
+- **When you add a migration later:** merge it, then run Actions -> CI/CD -> Run workflow and tick "Also apply database
+  migrations". That takes a best-effort `pg_dump` first, then runs `alembic upgrade head`, then deploys. For this,
+  `PROD_ENV` also needs `MIGRATION_DATABASE_URL` (session pooler, port 5432).
 
 ## How a deploy works
 
 1. Tests, and every migration applied to an empty Postgres.
 2. The image is built and tagged with the commit id.
-3. On the server: pull the image, back up the database, run `alembic upgrade head` on Supabase, start the new containers, wait up to two minutes for
-   `/health/ready`.
+3. On the server: pull the image, start the new containers, wait up to two minutes for `/health/ready`. (Migrations only
+   when you ask for them, see above.)
 4. If the new version is not healthy, the previous image is started again and the run fails.
 
-Migrations run before the switch, so write them so the previous version still works against the new schema (add columns
-before using them, drop them in a later release). A rollback goes back to the old code, not the old schema.
+When you do run migrations, they run before the switch, so write them so the previous version still works against the new
+schema (add columns before using them, drop them in a later release). A rollback goes back to the old code, not the old
+schema.
 
 ## Everyday tasks
 
