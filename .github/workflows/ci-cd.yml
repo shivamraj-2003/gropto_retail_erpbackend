@@ -140,6 +140,12 @@ jobs:
             exit 1
           fi
           [ "$(get ENVIRONMENT)" = "production" ] || echo "::warning::ENVIRONMENT is not 'production' in PROD_ENV"
+          case "$(get REDIS_URL)" in
+            rediss://*) ;;
+            "") echo "::warning::REDIS_URL is empty: rate limits and the notification worker fall back to single-process memory (Upstash is expected in production)";;
+            *) echo "::warning::REDIS_URL should be the Upstash TLS string starting with rediss://";;
+          esac
+          [ -n "$(get RAZORPAY_KEY_ID)" ] && [ -n "$(get RAZORPAY_KEY_SECRET)" ] || echo "::notice::Razorpay keys are not set: the POS stays on quick-tender buttons (cash/card/UPI without the gateway)"
 
       - name: Set up SSH
         if: steps.configured.outputs.ready == 'true'

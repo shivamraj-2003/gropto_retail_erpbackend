@@ -4,3 +4,5 @@ __pycache__/
 .env
 supabase/.temp/
 supabase/.branches/
+.env.*
+!.env.example
