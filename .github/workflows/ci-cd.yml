@@ -1,0 +1,155 @@
+# CI/CD for the Gropto backend.
+#   pull request  -> tests + migration check + Docker build (nothing is published or deployed)
+#   push to main  -> the same, then the image is pushed to GitHub Container Registry and deployed to the Hostinger VPS
+#
+# The deploy job stays dormant (it is skipped with a notice) until the Hostinger secrets exist, so this file is safe to
+# merge before the server is ready. See DEPLOY.md for the one-time server setup and the list of secrets.
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-cd-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: gropto_ci
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/gropto_ci
+      JWT_SECRET: ci-only-secret
+      ENVIRONMENT: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Migrations apply cleanly on an empty database
+        run: alembic upgrade head
+      - name: Migrations have a single head
+        run: test "$(alembic heads | wc -l)" -eq 1
+      - name: Unit tests (no database needed)
+        run: >-
+          pytest -q
+          tests/test_price_stock.py tests/test_transfer_math.py tests/test_vendor_ids.py tests/test_gst_unit.py
+          tests/test_kv_unit.py tests/test_rbac_unit.py tests/test_product_import_unit.py
+      - name: App starts
+        run: python -c "import app.main"
+
+  image:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: meta
+        name: Image name
+        run: echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        if: github.event_name != 'pull_request'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: |
+            ${{ steps.meta.outputs.image }}:${{ github.sha }}
+            ${{ steps.meta.outputs.image }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    needs: image
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: production
+    permissions:
+      contents: read
+    env:
+      HOST: ${{ secrets.HOSTINGER_HOST }}
+      SSH_USER: ${{ secrets.HOSTINGER_USER }}
+      SSH_KEY: ${{ secrets.HOSTINGER_SSH_KEY }}
+      SSH_PORT: ${{ secrets.HOSTINGER_PORT }}
+      PROD_ENV: ${{ secrets.PROD_ENV }}
+    steps:
+      - name: Check the deploy secrets exist
+        id: configured
+        run: |
+          missing=""
+          for v in HOST SSH_USER SSH_KEY PROD_ENV; do
+            [ -n "${!v}" ] || missing="$missing $v"
+          done
+          if [ -n "$missing" ]; then
+            echo "::notice::Deploy skipped - add these GitHub secrets first (see DEPLOY.md):$missing"
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.configured.outputs.ready == 'true'
+
+      - name: Set up SSH
+        if: steps.configured.outputs.ready == 'true'
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -p "${SSH_PORT:-22}" -H "$HOST" >> ~/.ssh/known_hosts 2>/dev/null
+          cat > ~/.ssh/config <<CONF
+          Host gropto-server
+            HostName $HOST
+            User $SSH_USER
+            Port ${SSH_PORT:-22}
+            IdentityFile ~/.ssh/deploy_key
+            IdentitiesOnly yes
+            ServerAliveInterval 30
+          CONF
+
+      - name: Upload deploy files and environment
+        if: steps.configured.outputs.ready == 'true'
+        run: |
+          ssh gropto-server 'mkdir -p /opt/gropto'
+          scp deploy/docker-compose.prod.yml deploy/Caddyfile deploy/remote-deploy.sh gropto-server:/opt/gropto/
+          printf '%s\n' "$PROD_ENV" | ssh gropto-server 'umask 077 && cat > /opt/gropto/.env'
+
+      - name: Deploy
+        if: steps.configured.outputs.ready == 'true'
+        env:
+          IMAGE: ${{ needs.image.outputs.image }}:${{ github.sha }}
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REGISTRY_USER: ${{ github.actor }}
+        run: |
+          printf '%s' "$REGISTRY_TOKEN" | ssh gropto-server "docker login ghcr.io -u '$REGISTRY_USER' --password-stdin"
+          ssh gropto-server "bash /opt/gropto/remote-deploy.sh '$IMAGE'"
