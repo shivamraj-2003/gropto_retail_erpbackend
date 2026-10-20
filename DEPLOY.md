@@ -48,7 +48,8 @@ and nothing breaks.
 **4. `PROD_ENV` contents.** Copy `.env.example` and fill it in. At least:
 
 ```
-DATABASE_URL=postgresql+asyncpg://...      # Supabase connection string
+DATABASE_URL=postgresql+asyncpg://...      # Supabase pooler connection string (see "Supabase" below)
+MIGRATION_DATABASE_URL=postgresql://...    # Supabase session pooler (port 5432), used for migrations and backups
 JWT_SECRET=<long random string>            # python -c "import secrets; print(secrets.token_urlsafe(48))"
 ENVIRONMENT=production
 CORS_ORIGINS=app://.,https://your-domain
@@ -63,11 +64,28 @@ payment, WhatsApp, SMS and email keys when you use them.
 
 Then check it: `curl https://<your-domain>/health/ready`
 
+## Supabase
+
+The database is a Supabase project, so no database runs on the server and CI never touches it (CI proves the migrations on
+a throwaway Postgres; only the deploy job applies them to Supabase).
+
+- Copy the connection strings from the Supabase dashboard: **Connect** -> **Session pooler** (port 5432) or **Transaction
+  pooler** (port 6543). Use the **pooler** strings, not "Direct connection": the direct one needs IPv6, which many VPSs lack.
+- In `DATABASE_URL` the scheme must be `postgresql+asyncpg://`.
+- Session pooler caps at 15 connections, so keep `WEB_CONCURRENCY=1` (the default). With the transaction pooler (6543) more
+  workers are fine, but then `MIGRATION_DATABASE_URL` must be set to the session pooler (5432). The deploy job refuses to
+  run if it is missing.
+- Before each migration a `pg_dump` is saved to `/opt/gropto/backups` (14 days kept). It is best effort: if the dump
+  fails, for instance because the client is older than the Supabase server, the deploy continues. Keep Supabase's own
+  backups on (Project Settings -> Database -> Backups) and consider point-in-time recovery.
+- The deploy job also stops early with a clear message if `PROD_ENV` has no `DATABASE_URL` or `JWT_SECRET`, if the URL is
+  not `postgresql+asyncpg://`, or if it points at localhost.
+
 ## How a deploy works
 
 1. Tests, and every migration applied to an empty Postgres.
 2. The image is built and tagged with the commit id.
-3. On the server: pull the image, run `alembic upgrade head`, start the new containers, wait up to two minutes for
+3. On the server: pull the image, back up the database, run `alembic upgrade head` on Supabase, start the new containers, wait up to two minutes for
    `/health/ready`.
 4. If the new version is not healthy, the previous image is started again and the run fails.
 

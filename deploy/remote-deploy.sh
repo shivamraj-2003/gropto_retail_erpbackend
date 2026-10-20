@@ -12,6 +12,14 @@ PREVIOUS_IMAGE="$(cat .current_image 2>/dev/null || true)"
 echo "==> Pulling $NEW_IMAGE"
 docker pull "$NEW_IMAGE"
 
+# A dump of the Supabase database before the schema changes. Best effort: a failed dump (for example a pg_dump older than
+# the Supabase server) is reported but does not stop the deploy, because Supabase keeps its own backups too.
+echo "==> Backing up the database before migrating"
+mkdir -p backups && chown 10001 backups 2>/dev/null || true
+if ! IMAGE="$NEW_IMAGE" "${COMPOSE[@]}" run --rm backup; then
+  echo "!! Backup did not complete - continuing; check the Supabase dashboard backups (Project Settings -> Database -> Backups)."
+fi
+
 echo "==> Applying database migrations"
 IMAGE="$NEW_IMAGE" "${COMPOSE[@]}" run --rm migrate
 

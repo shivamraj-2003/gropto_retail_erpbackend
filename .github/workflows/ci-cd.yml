@@ -23,6 +23,8 @@ jobs:
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # CI uses a throwaway Postgres container, never the Supabase project: the migrations are proven on an empty database
+    # here, and are only applied to Supabase by the deploy job (see DEPLOY.md).
     services:
       postgres:
         image: postgres:16
@@ -119,6 +121,25 @@ jobs:
 
       - uses: actions/checkout@v4
         if: steps.configured.outputs.ready == 'true'
+
+      - name: Check the production settings (Supabase)
+        if: steps.configured.outputs.ready == 'true'
+        run: |
+          get() { printf '%s\n' "$PROD_ENV" | grep -E "^$1=" | tail -1 | cut -d= -f2- | tr -d '"'"'"' '; }
+          db="$(get DATABASE_URL)"; mig="$(get MIGRATION_DATABASE_URL)"
+          fail=""
+          [ -n "$db" ] || fail="$fail\n- DATABASE_URL is missing from PROD_ENV"
+          case "$db" in postgresql+asyncpg://*|"") ;; *) fail="$fail\n- DATABASE_URL must start with postgresql+asyncpg:// (the app uses asyncpg)";; esac
+          [ -n "$(get JWT_SECRET)" ] || fail="$fail\n- JWT_SECRET is missing from PROD_ENV"
+          case "$db$mig" in *"localhost"*|*"127.0.0.1"*) fail="$fail\n- the database URL points at localhost, not Supabase";; esac
+          case "$db" in
+            *:6543/*) [ -n "$mig" ] || fail="$fail\n- DATABASE_URL uses the Supabase transaction pooler (port 6543); also set MIGRATION_DATABASE_URL to the session pooler (port 5432) so migrations run safely";;
+          esac
+          if [ -n "$fail" ]; then
+            printf "::error::PROD_ENV problems:%b\n" "$fail"
+            exit 1
+          fi
+          [ "$(get ENVIRONMENT)" = "production" ] || echo "::warning::ENVIRONMENT is not 'production' in PROD_ENV"
 
       - name: Set up SSH
         if: steps.configured.outputs.ready == 'true'

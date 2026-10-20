@@ -11,6 +11,7 @@ fi
 systemctl enable --now docker
 
 mkdir -p /opt/gropto/backups
+chown 10001 /opt/gropto/backups   # the container user writes the pre-deploy database dumps here
 chmod 755 /opt/gropto
 
 if [ -n "${DEPLOY_PUBKEY:-}" ]; then
