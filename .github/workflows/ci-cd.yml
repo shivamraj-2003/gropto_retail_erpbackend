@@ -156,7 +156,7 @@ jobs:
         if: steps.configured.outputs.ready == 'true'
         run: |
           install -m 700 -d ~/.ssh
-          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
+          printf '%s\n' "$SSH_KEY" | tr -d '\r' > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
           ssh-keyscan -p "${SSH_PORT:-22}" -H "$HOST" >> ~/.ssh/known_hosts 2>/dev/null
           cat > ~/.ssh/config <<CONF
