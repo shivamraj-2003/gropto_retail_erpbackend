@@ -116,6 +116,7 @@ async def _call_llm(payload: dict, question: str | None) -> str | None:
     prompt = (
         "You are a retail operations analyst. Given this store KPI snapshot as JSON, "
         "write a concise 3-4 sentence narrative highlighting what matters most. "
+        "All money is Indian rupees: write amounts with the ₹ sign and Indian digit grouping (₹1,616.50), never dollars. "
         f"{'Then answer this question: ' + question if question else ''}\n\n{json.dumps(payload, default=str)}"
     )
     try:
