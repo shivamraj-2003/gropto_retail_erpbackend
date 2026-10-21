@@ -123,7 +123,7 @@ async def _call_llm(payload: dict, question: str | None) -> str | None:
             resp = await client.post(
                 settings.ai_provider_base_url,
                 headers={"Authorization": f"Bearer {settings.ai_provider_api_key}"},
-                json={"messages": [{"role": "user", "content": prompt}], "max_tokens": 300},
+                json={**({"model": settings.ai_model} if settings.ai_model else {}), "messages": [{"role": "user", "content": prompt}], "max_tokens": 300},
             )
             resp.raise_for_status()
             data = resp.json()
@@ -145,6 +145,9 @@ async def get_insight(db: AsyncSession, *, store_id: uuid.UUID, question: str | 
     if await _under_daily_cap(db, store_id):
         narrative = await _call_llm(payload, question)
         await _increment_counter(db, store_id)
+
+    if narrative is None and settings.ai_provider_api_key:
+        return {"facts": payload, "narrative": None, "generated_at": now, "from_cache": False}  # a failed AI call is not cached
 
     entry = AiInsightCache(
         cache_key=key,
