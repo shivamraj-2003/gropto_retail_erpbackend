@@ -56,6 +56,16 @@ REDIS_URL=rediss://...                     # Upstash
 SITE_ADDRESS=api.your-domain.com           # leave empty to serve plain HTTP on the IP for now
 ```
 
+For the AI assistant add (the key is a secret: only in `PROD_ENV`, never in git):
+
+```
+AI_PROVIDER_KIND=openai
+AI_PROVIDER_BASE_URL=https://api.openai.com/v1/chat/completions
+AI_MODEL=gpt-4.1-mini                      # cheap and quick; gpt-4.1-nano is cheaper still
+AI_PROVIDER_API_KEY=sk-...
+AI_DAILY_CALL_CAP=200                      # stops a runaway bill
+```
+
 Point the domain's DNS `A` record at the server before setting `SITE_ADDRESS`, so Caddy can get the certificate. Add the
 payment, WhatsApp, SMS and email keys when you use them.
 
