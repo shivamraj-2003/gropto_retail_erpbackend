@@ -4,6 +4,7 @@ replay because of three layers of dedup: unique client_idempotency_key on sales,
 device-generated primary keys, and unique bill numbers per store+device.
 """
 
+import math
 import uuid
 
 from fastapi import HTTPException
@@ -139,7 +140,8 @@ async def process_sale(db: AsyncSession, sale_in: SaleIn) -> SyncItemVerdict:
         discount_total = sale_in.discount_total + line_discounts
         # Only the bill-level discount reduces the final total here — line
         # discounts are already netted into subtotal/tax_total above.
-        grand_total = subtotal + tax_total - sale_in.discount_total
+        # The till rounds the payable to the nearest rupee (10.45 -> 10, 10.55 -> 11) and the customer pays that, so the bill total is rounded the same way here.
+        grand_total = float(math.floor(subtotal + tax_total - sale_in.discount_total + 0.5))
 
         # Offers and coupons are business-configured, not a cashier's call, so
         # they don't count against the role discount limit — but only the share
@@ -237,7 +239,8 @@ async def process_sale(db: AsyncSession, sale_in: SaleIn) -> SyncItemVerdict:
 
         amount_due = round(float(grand_total) - redeemed_value, 2)
         tendered = round(sum(p.amount for p in sale_in.payments), 2)
-        if abs(tendered - amount_due) > 0.01:
+        unrounded_due = round(subtotal + tax_total - sale_in.discount_total - redeemed_value, 2)  # an older till pays the exact amount
+        if abs(tendered - amount_due) > 0.01 and abs(tendered - unrounded_due) > 0.01:
             raise ValueError(f"Payments total {tendered} does not match amount due {amount_due} (grand total {grand_total} less loyalty redemption {redeemed_value})")
 
         sale = Sale(
