@@ -35,6 +35,8 @@ def upgrade() -> None:
     op.execute('create extension if not exists "pgcrypto"')
     op.execute("create extension if not exists pg_trgm")
     op.execute("create sequence if not exists global_revision_seq")
+    # column defaults in the models call nextval() on this one, so it must exist before the tables are created
+    op.execute("create sequence if not exists transfer_no_seq")
 
     Base.metadata.create_all(bind=bind)
 
