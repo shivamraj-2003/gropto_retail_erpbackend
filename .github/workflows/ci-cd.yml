@@ -159,7 +159,10 @@ jobs:
           install -m 700 -d ~/.ssh
           printf '%s\n' "$SSH_KEY" | tr -d '\r' > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
-          ssh-keyscan -p "${SSH_PORT:-22}" -H "$HOST" >> ~/.ssh/known_hosts 2>/dev/null
+          # Only ask for the normal host key types: a newer ssh-keyscan also probes hardware-key types, the server
+          # refuses those, and the command then exits 1 even though it got the keys it needed.
+          ssh-keyscan -t ed25519,ecdsa,rsa -p "${SSH_PORT:-22}" -H "$HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
+          test -s ~/.ssh/known_hosts || { echo "::error::Could not read the server's host key from $HOST:${SSH_PORT:-22}. Is SSH reachable?"; exit 1; }
           cat > ~/.ssh/config <<CONF
           Host gropto-server
             HostName $HOST
