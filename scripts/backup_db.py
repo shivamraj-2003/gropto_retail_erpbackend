@@ -9,6 +9,7 @@ from Windows Task Scheduler / cron, and copy the backup folder off this
 machine (cloud drive, second disk) — a backup on the same disk as nothing
 else is still one failure away from gone.
 
+
 This complements, not replaces, the hosting provider's own backups: check
 that the Supabase project has daily backups / point-in-time recovery enabled
 (Project Settings -> Database -> Backups).
