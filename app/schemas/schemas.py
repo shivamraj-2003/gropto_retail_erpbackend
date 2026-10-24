@@ -374,27 +374,10 @@ class PaymentIn(BaseModel):
     reference: str | None = None
 
 
-class RazorpayOrderRequest(BaseModel):
-    amount: float
-    receipt: str
-
-
-class RazorpayOrderOut(BaseModel):
-    order_id: str
-    amount: int
-    currency: str
-    key_id: str
-
-
-class RazorpayVerifyRequest(BaseModel):
-    razorpay_order_id: str
-    razorpay_payment_id: str
-    razorpay_signature: str
-
-
 class PaymentConfigOut(BaseModel):
     enabled: bool
-    key_id: str | None = None
+    provider: str = "paytm_pos"
+    environment: str | None = None
 
 
 class SaleIn(BaseModel):

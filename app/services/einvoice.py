@@ -9,7 +9,7 @@ What's intentionally NOT real: an actual network call to an IRP. That
 requires a live GSP (GST Suvidha Provider) account — real credentials, a
 registered API consumer, and (for production use) a digital signature
 certificate — none of which exist in this environment. `is_configured()`
-gates it exactly like services/payments.py gates Razorpay: when unset,
+gates it exactly like services/paytm_pos.py gates Paytm: when unset,
 submission is refused with a clear, auditable "not configured" outcome
 instead of a fabricated IRN. Dropping in a real GSP client later only means
 replacing `_call_irp()`'s body — every surrounding piece (applicability,

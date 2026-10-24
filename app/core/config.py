@@ -23,11 +23,17 @@ class Settings(BaseSettings):
     ai_max_tokens: int = 600
     ai_timeout_seconds: int = 30
 
-    # Razorpay — left blank in dev; when unset the payments API reports the
-    # gateway as unconfigured and the POS falls back to quick-tender buttons.
-    razorpay_key_id: str = ""
-    razorpay_key_secret: str = ""
-    razorpay_webhook_secret: str = ""
+    # Paytm Wireless POS (card machine beside the till). Left blank in dev: with no merchant key the payments API
+    # reports the machine as not configured and the till keeps its plain tender buttons. The merchant key and the
+    # channel id come from Paytm (never from the browser). MID/TID/serial of each machine live in the paytm_terminals
+    # table, one row per store machine; the three values below are only used by scripts/seed_paytm_terminal.py.
+    paytm_environment: str = "staging"  # staging | production
+    paytm_merchant_key: str = ""
+    paytm_channel_id: str = ""
+    paytm_base_url: str = ""  # override; empty = the host for paytm_environment (production host must be set from Paytm's activation mail)
+    paytm_mid: str = ""
+    paytm_tid: str = ""
+    paytm_device_serial: str = ""
 
     # WhatsApp Business Cloud API (Meta) — left blank in dev; campaign sending
     # reports "not configured" and refuses to send until these are set.
@@ -56,7 +62,7 @@ class Settings(BaseSettings):
     # Suvidha Provider) — left blank in dev; when unset, e-invoice submission
     # reports "not configured" and the invoice sits in `pending` status for
     # manual/later submission rather than fabricating an IRN. Same pattern as
-    # razorpay_key_id above.
+    # the Paytm settings above.
     gsp_api_base_url: str = ""
     gsp_client_id: str = ""
     gsp_client_secret: str = ""

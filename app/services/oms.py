@@ -32,7 +32,6 @@ from app.schemas.schemas_phase3 import (
     OrderPickRequest,
     OrderReturnCreate,
 )
-from app.services import payments as payments_service
 from app.services import sms as sms_service
 from app.services.audit import write_audit
 from app.services.coupons import validate_and_apply_coupon
@@ -494,27 +493,11 @@ async def initiate_refund(
         order.payment_status = "refunded"
         return refund
 
-    if not payments_service.is_configured():
-        refund = OrderRefund(order_id=order.id, amount=amount, method="manual", status="initiated", reason=reason, created_by=current.user_id)
-        db.add(refund)
-        order.payment_status = "refund_initiated"
-        return refund
-
-    try:
-        result = payments_service.refund_payment(order.payment_reference, amount)
-        refund = OrderRefund(
-            order_id=order.id,
-            amount=amount,
-            method="razorpay",
-            gateway_refund_id=result.get("id"),
-            status="completed",
-            reason=reason,
-            created_by=current.user_id,
-        )
-        order.payment_status = "refunded"
-    except Exception as exc:  # noqa: BLE001 — gateway failures must not crash the cancellation/return flow
-        refund = OrderRefund(order_id=order.id, amount=amount, method="razorpay", status="failed", reason=f"{reason or ''} | gateway error: {exc}", created_by=current.user_id)
-        order.payment_status = "refund_initiated"
+    # The money was collected by the customer's own payment channel and this app has no gateway to push it back through
+    # (Paytm POS is a card-present machine). The refund is recorded as initiated, to be paid out by the store and
+    # closed by hand. Older refunds recorded with method "razorpay" stay as they are.
+    refund = OrderRefund(order_id=order.id, amount=amount, method="manual", status="initiated", reason=reason, created_by=current.user_id)
+    order.payment_status = "refund_initiated"
     db.add(refund)
     await write_audit(
         db,

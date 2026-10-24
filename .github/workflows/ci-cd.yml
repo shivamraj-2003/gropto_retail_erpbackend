@@ -62,7 +62,7 @@ jobs:
         run: >-
           pytest -q
           tests/test_price_stock.py tests/test_purchase_bill.py tests/test_transfer_math.py tests/test_vendor_ids.py tests/test_gst_unit.py
-          tests/test_kv_unit.py tests/test_rbac_unit.py tests/test_product_import_unit.py
+          tests/test_kv_unit.py tests/test_rbac_unit.py tests/test_product_import_unit.py tests/test_paytm_pos.py
       - name: App starts
         run: python -c "import app.main"
 
@@ -150,7 +150,8 @@ jobs:
             "") echo "::warning::REDIS_URL is empty: rate limits and the notification worker fall back to single-process memory (Upstash is expected in production)";;
             *) echo "::warning::REDIS_URL should be the Upstash TLS string starting with rediss://";;
           esac
-          [ -n "$(get RAZORPAY_KEY_ID)" ] && [ -n "$(get RAZORPAY_KEY_SECRET)" ] || echo "::notice::Razorpay keys are not set: the POS stays on quick-tender buttons (cash/card/UPI without the gateway)"
+          [ -n "$(get PAYTM_MERCHANT_KEY)" ] && [ -n "$(get PAYTM_CHANNEL_ID)" ] || echo "::notice::Paytm POS keys are not set: the POS stays on quick-tender buttons (card/UPI recorded by hand)"
+          [ "$(get ENVIRONMENT)" = "production" ] && [ "$(get PAYTM_ENVIRONMENT)" = "production" ] && [ -z "$(get PAYTM_BASE_URL)" ] && echo "::warning::PAYTM_ENVIRONMENT=production needs PAYTM_BASE_URL (the production host Paytm gives you)" || true
 
       - name: Set up SSH
         if: steps.configured.outputs.ready == 'true'

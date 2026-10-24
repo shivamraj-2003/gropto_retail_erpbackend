@@ -314,7 +314,7 @@ class EInvoice(Base):
     determination, payload generation, and a status machine are all real;
     the actual IRP submission call is intentionally stubbed behind
     services/einvoice.py::is_configured() (same pattern as
-    services/payments.py's Razorpay gate) because it requires real GSP
+    the Paytm gate in services/paytm_pos.py) because it requires real GSP
     (GST Suvidha Provider) credentials this environment doesn't have. Faking
     a working submission would misrepresent compliance status, which is
     exactly the failure mode this table exists to make visible instead of

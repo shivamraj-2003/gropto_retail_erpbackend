@@ -1,7 +1,7 @@
 """SMS via Twilio (Point 11 audit fix). Previously a hardcoded stub that
 always returned "not configured" with no real client behind it at all. Same
 is_configured()-gate pattern as every other provider in this codebase
-(Razorpay, WhatsApp, Resend, GSP e-invoice) — left unconfigured in dev, in
+(Paytm, WhatsApp, Resend, GSP e-invoice) — left unconfigured in dev, in
 which case campaign sends report a real per-recipient failure instead of
 fabricating a delivery."""
 

@@ -13,11 +13,13 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.models import Customer, Device, Payment, Role, Sale, SaleItem, Store, SyncFailure, User
+from app.models.models_paytm import PaytmPosPayment
 from app.models.models_phase2 import GiftVoucher
 from app.schemas.schemas import SaleIn, SyncItemVerdict
 from app.models.models_phase4 import CouponRedemption
 from app.services.audit import write_audit
 from app.services.coupons import check_coupon
+from app.services.paytm_flow import settle_error as paytm_settle_error
 from app.services.gst import determine_place_of_supply, split_tax
 from app.services.inventory import DuplicateMovement, apply_movement, get_balance as get_stock_balance
 from app.services.promotion_engine import build_lines, evaluate_and_log, evaluate_preview
@@ -243,6 +245,20 @@ async def process_sale(db: AsyncSession, sale_in: SaleIn) -> SyncItemVerdict:
         if abs(tendered - amount_due) > 0.01 and abs(tendered - unrounded_due) > 0.01:
             raise ValueError(f"Payments total {tendered} does not match amount due {amount_due} (grand total {grand_total} less loyalty redemption {redeemed_value})")
 
+        # A card/UPI tender taken on the Paytm machine carries our own reference (GPPTM...). It must be a payment this
+        # server saw Paytm confirm, for this store and this amount, and not already used by another bill.
+        paytm_rows: dict[str, PaytmPosPayment] = {}
+        for payment in sale_in.payments:
+            ref = payment.reference or ""
+            if ref.startswith("GPPTM"):
+                row = await db.scalar(select(PaytmPosPayment).where(PaytmPosPayment.merchant_transaction_id == ref).with_for_update())
+                if row is None:
+                    raise ValueError(f"Unknown Paytm payment reference {ref}")
+                problem = paytm_settle_error(row, store_id=sale_in.store_id, amount=payment.amount, sale_id=sale_in.id)
+                if problem:
+                    raise ValueError(problem)
+                paytm_rows[ref] = row
+
         sale = Sale(
             id=sale_in.id,
             store_id=sale_in.store_id,
@@ -374,6 +390,8 @@ async def process_sale(db: AsyncSession, sale_in: SaleIn) -> SyncItemVerdict:
 
         for payment in sale_in.payments:
             db.add(Payment(sale_id=sale.id, mode=payment.mode, amount=payment.amount, reference=payment.reference))
+            if payment.reference in paytm_rows:
+                paytm_rows[payment.reference].sale_id = sale.id
 
             # Point 4 audit fix: wallet and gift_voucher were listed as payment
             # modes but nothing actually debited the underlying balance — a

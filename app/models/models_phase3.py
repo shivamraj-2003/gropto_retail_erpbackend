@@ -91,7 +91,7 @@ class OrderRefund(Base):
     id: Mapped[uuid.UUID] = uuid_pk()
     order_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("orders.id"), nullable=False)
     amount: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False)
-    method: Mapped[str] = mapped_column(String, nullable=False)  # razorpay, manual, not_required (cod never collected)
+    method: Mapped[str] = mapped_column(String, nullable=False)  # manual, not_required (cod never collected); older rows may say razorpay
     gateway_refund_id: Mapped[str | None] = mapped_column(String)
     status: Mapped[str] = mapped_column(String, default="initiated")  # initiated, completed, failed
     reason: Mapped[str | None] = mapped_column(Text)
