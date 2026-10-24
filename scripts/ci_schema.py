@@ -6,6 +6,7 @@ Why not `alembic upgrade head` from scratch? The first migration creates every t
 production database was built migration by migration and is already current, so CI proves the models build and then
 stamps the database at head; the migrations themselves are checked for a single head.
 """
+
 import os
 import sys
 
