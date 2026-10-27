@@ -13,6 +13,7 @@ from app.services.rate_limit import is_request_rate_limited
 from app.services.scheduler import start_scheduler, stop_scheduler
 
 
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     start_scheduler()
