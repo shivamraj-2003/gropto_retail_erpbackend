@@ -220,3 +220,63 @@ def test_a_bill_settles_only_with_a_confirmed_payment_of_its_own_store_and_amoun
     used = _p(status=paytm.SUCCESS, store_id=store, amount=Decimal("2500.00"), sale_id=uuid.uuid4())
     assert flow.settle_error(used, store_id=store, amount=2500.0, sale_id=sale)  # already used by another bill
     assert flow.settle_error(used, store_id=store, amount=2500.0, sale_id=used.sale_id) is None  # the same bill replayed is fine
+
+
+# ---- each store has its own Paytm account
+
+def _terminal(**kw):
+    base = dict(mid="MID1", tid="TID1", merchant_key_enc=None, channel_id=None, environment=None, base_url=None)
+    base.update(kw)
+    return SimpleNamespace(**base)
+
+
+def test_a_saved_merchant_key_is_encrypted_and_reads_back():
+    from app.core import secrets_box
+
+    token = secrets_box.encrypt(KEY)
+    assert token != KEY and KEY not in token
+    assert secrets_box.decrypt(token) == KEY
+    assert secrets_box.decrypt(None) is None
+    assert secrets_box.decrypt("not-a-token") is None
+
+
+def test_a_store_uses_its_own_account_and_falls_back_to_the_defaults(monkeypatch):
+    from app.core import secrets_box
+
+    monkeypatch.setattr(paytm.settings, "paytm_merchant_key", "DEFAULTKEY123456")
+    monkeypatch.setattr(paytm.settings, "paytm_channel_id", "DEFCH")
+    monkeypatch.setattr(paytm.settings, "paytm_environment", "staging")
+    monkeypatch.setattr(paytm.settings, "paytm_base_url", "")
+
+    plain = paytm.resolve_creds(_terminal())  # nothing of its own: the server-wide defaults
+    assert plain.merchant_key == "DEFAULTKEY123456" and plain.channel_id == "DEFCH" and plain.base_url == paytm.STAGING_HOST and plain.ready
+
+    own = paytm.resolve_creds(
+        _terminal(merchant_key_enc=secrets_box.encrypt("STOREKEY12345678"), channel_id="STORECH", environment="production", base_url="https://host.example/")
+    )
+    assert own.merchant_key == "STOREKEY12345678" and own.channel_id == "STORECH" and own.base_url == "https://host.example" and own.ready
+
+
+def test_two_stores_sign_with_their_own_keys():
+    body = '{"paytmMid":"M"}'
+    a, b = paytm.PaytmCreds("M1", "T1", "AAAAAAAAAAAAAAAA", "CH1", "https://a.example"), paytm.PaytmCreds("M2", "T2", "BBBBBBBBBBBBBBBB", "CH2", "https://b.example")
+    sig_a = paytm.generate_signature(body, a.merchant_key)
+    assert paytm.verify_signature(body, a.merchant_key, sig_a)
+    assert not paytm.verify_signature(body, b.merchant_key, sig_a)  # store B's key cannot open store A's signature
+
+
+def test_production_without_a_host_is_not_ready_and_says_why(monkeypatch):
+    monkeypatch.setattr(paytm.settings, "paytm_merchant_key", "")
+    monkeypatch.setattr(paytm.settings, "paytm_channel_id", "")
+    monkeypatch.setattr(paytm.settings, "paytm_base_url", "")
+    creds = paytm.resolve_creds(_terminal(environment="production"))
+    assert not creds.ready
+    assert set(creds.missing()) == {"merchant key", "channel id", "server address"}
+
+
+def test_the_production_default_never_falls_back_to_staging(monkeypatch):
+    monkeypatch.setattr(paytm.settings, "paytm_base_url", "")
+    assert paytm.host_for("production", None) == ""
+    assert paytm.host_for("staging", None) == paytm.STAGING_HOST
+    assert paytm.host_for(None, None) == paytm.STAGING_HOST
+    assert paytm.host_for("production", "https://x.example/") == "https://x.example"

@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, Numeric, String, UniqueConstraint, func
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, Numeric, String, Text, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -22,6 +22,11 @@ class PaytmTerminal(Base):
     device_serial: Mapped[str | None] = mapped_column(String)
     label: Mapped[str | None] = mapped_column(String)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    # This store's own Paytm account details. Empty = use the server-wide defaults from the environment.
+    channel_id: Mapped[str | None] = mapped_column(String)
+    merchant_key_enc: Mapped[str | None] = mapped_column(Text)  # encrypted (app/core/secrets_box.py); never sent to the browser
+    environment: Mapped[str | None] = mapped_column(String)  # staging | production
+    base_url: Mapped[str | None] = mapped_column(String)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 

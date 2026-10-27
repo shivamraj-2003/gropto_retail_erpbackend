@@ -17,6 +17,7 @@ import json
 import secrets
 import string
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal
 
@@ -24,6 +25,7 @@ import httpx
 from cryptography.hazmat.primitives import padding
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
+from app.core import secrets_box
 from app.core.config import settings
 
 # Staging host from Paytm's Sale / Status / Void pages. Production is deliberately not defaulted.
@@ -58,14 +60,42 @@ class PaytmError(Exception):
         self.retryable = retryable
 
 
-def is_configured() -> bool:
-    return bool(settings.paytm_merchant_key and settings.paytm_channel_id and base_url())
+@dataclass(frozen=True)
+class PaytmCreds:
+    """Everything needed to talk to Paytm for ONE store's machine."""
+
+    mid: str
+    tid: str
+    merchant_key: str
+    channel_id: str
+    base_url: str
+
+    @property
+    def ready(self) -> bool:
+        return bool(self.mid and self.tid and self.merchant_key and self.channel_id and self.base_url)
+
+    def missing(self) -> list[str]:
+        names = {"merchant key": self.merchant_key, "channel id": self.channel_id, "server address": self.base_url}
+        return [n for n, v in names.items() if not v]
 
 
-def base_url() -> str:
-    if settings.paytm_base_url:
-        return settings.paytm_base_url.rstrip("/")
-    return STAGING_HOST if settings.paytm_environment != "production" else ""
+def host_for(environment: str | None, override: str | None) -> str:
+    """An explicit address wins. Otherwise staging has Paytm's staging host; production has none until it is set."""
+    if override:
+        return override.rstrip("/")
+    return STAGING_HOST if (environment or "staging") != "production" else ""
+
+
+def resolve_creds(terminal) -> PaytmCreds:
+    """A machine's own settings first; whatever it leaves empty comes from the server-wide defaults (PAYTM_* in the environment)."""
+    environment = terminal.environment or settings.paytm_environment
+    return PaytmCreds(
+        mid=terminal.mid,
+        tid=terminal.tid,
+        merchant_key=secrets_box.decrypt(terminal.merchant_key_enc) or settings.paytm_merchant_key,
+        channel_id=terminal.channel_id or settings.paytm_channel_id,
+        base_url=host_for(environment, terminal.base_url or settings.paytm_base_url),
+    )
 
 
 # --------------------------------------------------------------------------- checksum
@@ -225,13 +255,12 @@ def amount_matches(response: dict, amount_rupees: Decimal | float) -> bool:
 
 # --------------------------------------------------------------------------- calls
 
-async def _post(path: str, text: str) -> dict:
-    url = base_url()
-    if not url:
-        raise PaytmError("Paytm production host is not set (PAYTM_BASE_URL)")
+async def _post(base: str, path: str, text: str) -> dict:
+    if not base:
+        raise PaytmError("The Paytm server address for this store is not set (production needs the host Paytm gave you)")
     try:
         async with httpx.AsyncClient(timeout=20) as client:
-            resp = await client.post(url + path, content=text.encode("utf-8"), headers={"Content-Type": "application/json"})
+            resp = await client.post(base + path, content=text.encode("utf-8"), headers={"Content-Type": "application/json"})
     except httpx.HTTPError as exc:
         raise PaytmError("Could not reach Paytm", retryable=True) from exc
     try:
@@ -243,17 +272,17 @@ async def _post(path: str, text: str) -> dict:
     return data
 
 
-def _signed(body: dict) -> str:
-    return build_request(body, key=settings.paytm_merchant_key, channel_id=settings.paytm_channel_id)
+def _signed(creds: PaytmCreds, body: dict) -> str:
+    return build_request(body, key=creds.merchant_key, channel_id=creds.channel_id)
 
 
-async def send_sale(body: dict) -> dict:
-    return await _post(SALE_PATH, _signed(body))
+async def send_sale(creds: PaytmCreds, body: dict) -> dict:
+    return await _post(creds.base_url, SALE_PATH, _signed(creds, body))
 
 
-async def enquire(body: dict) -> dict:
-    return await _post(STATUS_PATH, _signed(body))
+async def enquire(creds: PaytmCreds, body: dict) -> dict:
+    return await _post(creds.base_url, STATUS_PATH, _signed(creds, body))
 
 
-async def send_void(body: dict) -> dict:
-    return await _post(VOID_PATH, _signed(body))
+async def send_void(creds: PaytmCreds, body: dict) -> dict:
+    return await _post(creds.base_url, VOID_PATH, _signed(creds, body))

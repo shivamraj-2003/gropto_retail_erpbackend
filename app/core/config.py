@@ -7,6 +7,8 @@ class Settings(BaseSettings):
 
     database_url: str
     jwt_secret: str
+    # Encrypts secrets saved in the database (store Paytm keys). Empty = derived from jwt_secret. Set once, never change.
+    secrets_key: str = ""
     jwt_algorithm: str = "HS256"
     access_token_expire_minutes: int = 60
     refresh_token_expire_days: int = 30
@@ -27,6 +29,8 @@ class Settings(BaseSettings):
     # reports the machine as not configured and the till keeps its plain tender buttons. The merchant key and the
     # channel id come from Paytm (never from the browser). MID/TID/serial of each machine live in the paytm_terminals
     # table, one row per store machine; the three values below are only used by scripts/seed_paytm_terminal.py.
+    # These are only the DEFAULTS. Each store's machine can carry its own key, channel id, environment and host (saved on its
+    # terminal row, key encrypted); anything a terminal leaves empty falls back to these.
     paytm_environment: str = "staging"  # staging | production
     paytm_merchant_key: str = ""
     paytm_channel_id: str = ""

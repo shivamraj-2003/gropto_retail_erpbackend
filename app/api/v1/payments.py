@@ -8,6 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser, require_permission, require_store_access
+from app.core import secrets_box
 from app.core.database import get_db
 from app.models.models_paytm import PaytmPosPayment, PaytmTerminal
 from app.schemas.schemas import PaymentConfigOut
@@ -24,17 +25,15 @@ async def payment_config(
     db: AsyncSession = Depends(get_db),
     current: CurrentUser = Depends(require_permission("pos.payment.view")),
 ):
-    """Is the Paytm machine available for this store? When not, the till keeps its plain tender buttons."""
-    if not paytm.is_configured():
+    """Is a Paytm machine ready for this store? When not, the till keeps its plain tender buttons."""
+    if store_id is None:
         return PaymentConfigOut(enabled=False)
-    if store_id is not None:
-        require_store_access(store_id, current)
-        found = await db.scalar(
-            select(PaytmTerminal.id).where(PaytmTerminal.store_id == store_id, PaytmTerminal.is_active.is_(True)).limit(1)
-        )
-        if found is None:
-            return PaymentConfigOut(enabled=False)
-    return PaymentConfigOut(enabled=True, environment=paytm.settings.paytm_environment)
+    require_store_access(store_id, current)
+    rows = (await db.scalars(select(PaytmTerminal).where(PaytmTerminal.store_id == store_id, PaytmTerminal.is_active.is_(True)))).all()
+    ready = [t for t in rows if paytm.resolve_creds(t).ready]
+    if not ready:
+        return PaymentConfigOut(enabled=False)
+    return PaymentConfigOut(enabled=True, environment=ready[0].environment or paytm.settings.paytm_environment)
 
 
 # --------------------------------------------------------------------------- terminals
@@ -46,6 +45,12 @@ class TerminalIn(BaseModel):
     device_serial: str | None = Field(default=None, max_length=64)
     label: str | None = Field(default=None, max_length=80)
     is_active: bool = True
+    # This store's own Paytm account. Leave empty to use the server-wide defaults.
+    channel_id: str | None = Field(default=None, max_length=64)
+    merchant_key: str | None = Field(default=None, max_length=128)  # write-only: empty keeps the saved key
+    clear_merchant_key: bool = False
+    environment: str | None = Field(default=None, pattern="^(staging|production)$")
+    base_url: str | None = Field(default=None, max_length=200)
 
 
 class TerminalOut(BaseModel):
@@ -56,10 +61,21 @@ class TerminalOut(BaseModel):
     device_serial: str | None
     label: str | None
     is_active: bool
+    channel_id: str | None
+    environment: str | None
+    base_url: str | None
+    has_own_merchant_key: bool  # the key itself is never sent out
+    ready: bool  # everything needed to take a payment is in place (own settings or the defaults)
+    missing: list[str] = []
 
 
 def _terminal_out(t: PaytmTerminal) -> TerminalOut:
-    return TerminalOut(id=t.id, store_id=t.store_id, mid=t.mid, tid=t.tid, device_serial=t.device_serial, label=t.label, is_active=t.is_active)
+    creds = paytm.resolve_creds(t)
+    return TerminalOut(
+        id=t.id, store_id=t.store_id, mid=t.mid, tid=t.tid, device_serial=t.device_serial, label=t.label, is_active=t.is_active,
+        channel_id=t.channel_id, environment=t.environment, base_url=t.base_url, has_own_merchant_key=bool(t.merchant_key_enc),
+        ready=creds.ready, missing=creds.missing(),
+    )
 
 
 @router.get("/paytm-pos/terminals", response_model=list[TerminalOut])
@@ -79,8 +95,12 @@ async def save_terminal(
     db: AsyncSession = Depends(get_db),
     current: CurrentUser = Depends(require_permission("device.terminal.create")),
 ):
-    """Map a Paytm machine (MID + TID) to a store, or change/switch off an existing mapping."""
+    """Add or change one store's Paytm machine and its own account details. The merchant key is encrypted and never returned."""
     require_store_access(body.store_id, current)
+    if body.base_url and not body.base_url.lower().startswith("https://"):
+        raise HTTPException(status_code=422, detail="The Paytm server address must start with https://")
+    if body.merchant_key and len(body.merchant_key.strip().encode("utf-8")) not in (16, 24, 32):
+        raise HTTPException(status_code=422, detail="That does not look like a Paytm merchant key (expected 16 characters)")
     existing = await db.scalar(select(PaytmTerminal).where(PaytmTerminal.mid == body.mid, PaytmTerminal.tid == body.tid))
     if existing is not None and existing.store_id != body.store_id:
         raise HTTPException(status_code=409, detail="That machine is already set up for another store")
@@ -89,15 +109,32 @@ async def save_terminal(
         existing = PaytmTerminal(store_id=body.store_id, mid=body.mid, tid=body.tid)
         db.add(existing)
     else:
-        old = {"label": existing.label, "device_serial": existing.device_serial, "is_active": existing.is_active}
+        old = {
+            "label": existing.label, "device_serial": existing.device_serial, "is_active": existing.is_active,
+            "channel_id": existing.channel_id, "environment": existing.environment, "base_url": existing.base_url,
+            "has_own_merchant_key": bool(existing.merchant_key_enc),
+        }
     existing.device_serial = body.device_serial
     existing.label = body.label
     existing.is_active = body.is_active
+    existing.channel_id = (body.channel_id or "").strip() or None
+    existing.environment = body.environment
+    existing.base_url = (body.base_url or "").strip().rstrip("/") or None
+    key_changed = False
+    if body.clear_merchant_key:
+        existing.merchant_key_enc = None
+        key_changed = True
+    elif body.merchant_key:
+        existing.merchant_key_enc = secrets_box.encrypt(body.merchant_key.strip())
+        key_changed = True
     await db.flush()
     await write_audit(
         db, user_id=current.user_id, role_code=current.role_code, store_id=body.store_id, device_id=current.device_id,
-        action="paytm.terminal_saved", entity_type="paytm_terminal", entity_id=existing.id,
-        old_value=old, new_value={"mid": body.mid, "tid": body.tid, "label": body.label, "is_active": body.is_active},
+        action="paytm.terminal_saved", entity_type="paytm_terminal", entity_id=existing.id, old_value=old,
+        new_value={  # the key itself is never written to the log, only that it changed
+            "mid": body.mid, "tid": body.tid, "label": body.label, "is_active": body.is_active, "channel_id": existing.channel_id,
+            "environment": existing.environment, "base_url": existing.base_url, "merchant_key_changed": key_changed,
+        },
     )
     await db.commit()
     return _terminal_out(existing)
@@ -176,14 +213,15 @@ async def initiate(
         if again.store_id != body.store_id or paytm.to_paise(again.amount) != paytm.to_paise(body.amount):
             raise HTTPException(status_code=409, detail="That request key was already used for a different payment")
         return await _out(db, again)
-    if not paytm.is_configured():
-        raise HTTPException(status_code=409, detail="Paytm POS is not set up on the server (merchant key or channel id missing)")
     try:
         amount = flow.check_amount(body.amount)
         terminals = (await db.scalars(select(PaytmTerminal).where(PaytmTerminal.store_id == body.store_id))).all()
         terminal = flow.choose_terminal(list(terminals), body.terminal_id)
     except flow.FlowError as exc:
         raise _as_http(exc) from exc
+    creds = paytm.resolve_creds(terminal)
+    if not creds.ready:
+        raise HTTPException(status_code=409, detail=f"Paytm is not set up for this store's machine (missing: {', '.join(creds.missing())})")
 
     # One request at a time per machine: lock the machine row so two tills pressing together cannot both pass the check
     await db.scalar(select(PaytmTerminal.id).where(PaytmTerminal.id == terminal.id).with_for_update())
@@ -215,7 +253,7 @@ async def initiate(
         reference=body.receipt_label, when=paytm.now_ist(),
     )
     try:
-        answer = await paytm.send_sale(request)
+        answer = await paytm.send_sale(creds, request)
     except paytm.PaytmError as exc:
         # We do not know whether the request got through, so it is UNKNOWN (checked with Paytm before anything new is sent)
         await _move(db, p, current, paytm.UNKNOWN, f"{exc}. Checking with Paytm")
@@ -255,6 +293,11 @@ async def status(
         await db.rollback()
         return await _out(db, p)
     terminal = await db.get(PaytmTerminal, p.terminal_id)
+    creds = paytm.resolve_creds(terminal)
+    if not creds.ready:
+        p.status_message = f"Paytm settings for this store are incomplete (missing: {', '.join(creds.missing())})"[:250]
+        await db.commit()
+        return await _out(db, p)
     void = p.status == paytm.CANCEL_REQUESTED
     request = paytm.lookup_body(
         mid=terminal.mid, tid=terminal.tid, merchant_txn_id=p.merchant_transaction_id, when=_ist(p.created_at), void=void
@@ -262,7 +305,7 @@ async def status(
     p.last_enquiry_at = now
     p.enquiry_count = (p.enquiry_count or 0) + 1
     try:
-        answer = await paytm.enquire(request)
+        answer = await paytm.enquire(creds, request)
     except paytm.PaytmError as exc:
         p.status_message = f"{exc}. Still checking"[:250]
         await db.commit()
@@ -296,9 +339,12 @@ async def cancel(
     if p.status in (paytm.FAILED, paytm.CANCELLED):
         return await _out(db, p)
     terminal = await db.get(PaytmTerminal, p.terminal_id)
+    creds = paytm.resolve_creds(terminal)
+    if not creds.ready:
+        raise HTTPException(status_code=409, detail=f"Paytm settings for this store are incomplete (missing: {', '.join(creds.missing())})")
     request = paytm.lookup_body(mid=terminal.mid, tid=terminal.tid, merchant_txn_id=p.merchant_transaction_id, when=_ist(p.created_at))
     try:
-        answer = await paytm.send_void(request)
+        answer = await paytm.send_void(creds, request)
     except paytm.PaytmError as exc:
         raise HTTPException(status_code=502, detail=f"{exc}. The payment was not cancelled") from exc
     state, message = paytm.read_sale_answer(answer)

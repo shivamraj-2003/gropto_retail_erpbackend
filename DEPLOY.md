@@ -128,13 +128,12 @@ asks Paytm whether it was paid. The bill is settled only when Paytm confirms it;
 - For production: the **production API host** from Paytm's activation mail. It is not guessed here: set it as `PAYTM_BASE_URL`.
   Staging uses `https://securegw-stage.paytmpayments.in`.
 
-### Setting it up
-1. Add to `PROD_ENV`: `PAYTM_ENVIRONMENT=staging`, `PAYTM_MERCHANT_KEY=...`, `PAYTM_CHANNEL_ID=...` (and `PAYTM_BASE_URL` for production).
-2. Run the workflow with "Run database migrations" ticked once (adds the `paytm_terminals` and `paytm_pos_payments` tables).
-3. Map the machine to its store. On the server, with `PAYTM_MID`, `PAYTM_TID` and `PAYTM_DEVICE_SERIAL` in the environment:
-   `docker compose -f docker-compose.prod.yml run --rm api python -m scripts.seed_paytm_terminal --store-code ST001 --label "Counter 1"`
-   (or an admin can call `PUT /api/v1/payments/paytm-pos/terminals`). One row per machine; each store has its own.
-4. `GET /api/v1/payments/config?store_id=<store>` should now say `"enabled": true`.
+### Setting it up (each store has its own Paytm account)
+1. Run the workflow with "Run database migrations" ticked once (adds `paytm_terminals`, `paytm_pos_payments` and the per-store account columns).
+2. Add `SECRETS_KEY=<a long random string>` to `PROD_ENV` once, and never change it afterwards. It encrypts each store's merchant key in the database (if empty, `JWT_SECRET` is used, and changing `JWT_SECRET` would make saved keys unreadable).
+3. For each store, an admin opens **Tills & Devices > Paytm card machines**, picks the store and presses **Add machine**: name, MID, TID, serial, channel id, merchant key, environment (staging or production) and, for production, the server address Paytm gave. The key is stored encrypted and is never shown again. Anything left empty falls back to the server-wide `PAYTM_*` defaults in `PROD_ENV`.
+4. The machine then shows "Ready to take payments". `GET /api/v1/payments/config?store_id=<store>` says `"enabled": true`, and only that store's till uses that machine and that account.
+   (Command line alternative for the first machine: `python -m scripts.seed_paytm_terminal --store-code ST001 --label "Counter 1"`, which maps the `PAYTM_MID` / `PAYTM_TID` / `PAYTM_DEVICE_SERIAL` machine to a store and uses the defaults for the rest.)
 
 ### Testing on the real machine (staging first)
 1. Open Billing, add an item, press **Card (F5)** or **UPI (F6)**. A "Paytm POS" window shows the amount and the machine's TID.
