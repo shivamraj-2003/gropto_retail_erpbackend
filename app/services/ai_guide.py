@@ -174,7 +174,7 @@ The top shows vendor fill rate, lead time and rejection rate and the purchase or
 Top: choose the Vendor (or add a New vendor), type the Vendor bill no. and the Bill date. The grid has one row per bill line with the
 columns Item Code, Description, Bill Serial, MRP, Batch No., HSN Code, Quantity (Stock = what the store holds now, Receipt, Free, Reject,
 H.L. = breakage or leakage, Total), Unit, Rate (the vendor's rate before GST), Rate Unit, Amount, Discount, GST (Code, Amount, Add. Cess),
-Surcharge (Rate, Amount), Net Amount and Ware H. (pick STORE, or a warehouse to receive that line into the warehouse).
+Surcharge (Rate, Amount), Net Amount and Warehouse (pick STORE, or a warehouse to receive that line into the warehouse).
 Steps: 1. In the empty bottom row type or scan an item code or name and press Enter. 2. The cursor goes to Receipt; type the quantity and press Enter
 to move along the row (Enter or the arrow keys move between cells). Fill Free, Reject, H.L., Rate, Discount, GST code, cess and surcharge as on the bill.
 3. Repeat for each line (the same item can appear on two lines, for example two batches). 4. Check the totals at the bottom and press Record & add to stock
