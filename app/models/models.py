@@ -610,8 +610,24 @@ class PurchaseItem(Base):
     id: Mapped[uuid.UUID] = uuid_pk()
     purchase_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("purchases.id", ondelete="CASCADE"))
     product_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("products.id"), nullable=False)
-    quantity: Mapped[float] = mapped_column(Numeric(12, 3), nullable=False)
-    unit_cost: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False)
+    quantity: Mapped[float] = mapped_column(Numeric(12, 3), nullable=False)  # the quantity on the vendor's bill (the "Receipt" column)
+    unit_cost: Mapped[float] = mapped_column(Numeric(12, 4), nullable=False)  # vendor's rate before GST; vendors quote 3-4 decimals
+    # Details of the vendor's bill line. Every one is optional so rows made before these existed read exactly as before.
+    bill_serial: Mapped[str | None] = mapped_column(String)
+    mrp: Mapped[float | None] = mapped_column(Numeric(12, 2))
+    batch_no: Mapped[str | None] = mapped_column(String)
+    hsn_code: Mapped[str | None] = mapped_column(String)
+    free_qty: Mapped[float] = mapped_column(Numeric(12, 3), default=0)  # given free; goes into stock, costs nothing
+    reject_qty: Mapped[float] = mapped_column(Numeric(12, 3), default=0)  # arrived but refused; never enters stock
+    hl_qty: Mapped[float] = mapped_column(Numeric(12, 3), default=0)  # breakage / leakage; never enters stock
+    rate_unit: Mapped[str | None] = mapped_column(String)
+    discount_amount: Mapped[float] = mapped_column(Numeric(12, 2), default=0)
+    gst_rate: Mapped[float | None] = mapped_column(Numeric(5, 2))  # the GST code on this line (None = the product's rate)
+    gst_amount: Mapped[float | None] = mapped_column(Numeric(12, 2))
+    cess_amount: Mapped[float] = mapped_column(Numeric(12, 2), default=0)
+    surcharge_rate: Mapped[float] = mapped_column(Numeric(5, 2), default=0)
+    surcharge_amount: Mapped[float] = mapped_column(Numeric(12, 2), default=0)
+    net_amount: Mapped[float | None] = mapped_column(Numeric(12, 2))  # amount - discount + GST + cess + surcharge
 
 
 class SyncFailure(Base):

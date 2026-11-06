@@ -169,10 +169,20 @@ The top shows vendor fill rate, lead time and rejection rate and the purchase or
     ),
     (
         "Purchase Entry",
-        "purchase entry bill vendor invoice stock in cost update inward new vendor view bill",
-        """Purchase Entry records a vendor's bill and puts the stock in. 1. Scan or type products and press Enter to add the first match.
-2. Check quantities and cost (and MRP, GST) per line. 3. Choose the vendor (or add a New vendor) and enter the vendor's invoice number,
-then record. Past entries can be opened with View bill and printed. Recording raises stock and updates the cost price.""",
+        "purchase entry bill vendor invoice stock in cost update inward new vendor view bill grid batch free reject breakage leakage discount gst cess surcharge net amount serial hsn mrp rate",
+        """Purchase Entry records a vendor's bill line by line, like the vendor's own bill, and puts the stock in.
+Top: choose the Vendor (or add a New vendor), type the Vendor bill no. and the Bill date. The grid has one row per bill line with the
+columns Item Code, Description, Bill Serial, MRP, Batch No., HSN Code, Quantity (Stock = what the store holds now, Receipt, Free, Reject,
+H.L. = breakage or leakage, Total), Unit, Rate (the vendor's rate before GST), Rate Unit, Amount, Discount, GST (Code, Amount, Add. Cess),
+Surcharge (Rate, Amount), Net Amount and Ware H. (STORE).
+Steps: 1. In the empty bottom row type or scan an item code or name and press Enter. 2. The cursor goes to Receipt; type the quantity and press Enter
+to move along the row (Enter or the arrow keys move between cells). Fill Free, Reject, H.L., Rate, Discount, GST code, cess and surcharge as on the bill.
+3. Repeat for each line (the same item can appear on two lines, for example two batches). 4. Check the totals at the bottom and press Record & add to stock
+(or Ctrl+S).
+How it counts: Amount = Receipt x Rate. GST = (Amount - Discount) x the GST code %. Net Amount = Amount - Discount + GST + cess + surcharge.
+Stock goes up by Receipt + Free - Reject - H.L.; free goods cost nothing, rejected and broken goods never enter stock. A Batch No. also puts the lot
+into Check Stock's batch ledger. A yellow MRP cell means the MRP differs from the product's MRP (it is not split into a second price automatically).
+Past entries are listed below with View bill, which prints the vendor bill with the same columns.""",
     ),
     (
         "Sales (Insights)",

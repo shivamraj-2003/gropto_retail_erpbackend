@@ -539,8 +539,21 @@ class VendorUpdateIn(BaseModel):
 
 class PurchaseItemIn(BaseModel):
     product_id: uuid.UUID
-    quantity: float
-    unit_cost: float
+    quantity: float = Field(gt=0)  # the quantity on the vendor's bill (the "Receipt" column)
+    unit_cost: float = Field(ge=0)  # the vendor's rate before GST (up to 4 decimals)
+    # The rest of the vendor's bill line. All optional: leaving them out records the line the way it always was.
+    bill_serial: str | None = Field(default=None, max_length=30)
+    mrp: float | None = Field(default=None, ge=0)
+    batch_no: str | None = Field(default=None, max_length=40)
+    hsn_code: str | None = Field(default=None, max_length=12)
+    free_qty: float = Field(default=0, ge=0)
+    reject_qty: float = Field(default=0, ge=0)
+    hl_qty: float = Field(default=0, ge=0)  # breakage / leakage
+    rate_unit: str | None = Field(default=None, max_length=12)
+    discount_amount: float = Field(default=0, ge=0)
+    gst_rate: float | None = Field(default=None, ge=0, le=100)  # the GST code; None = the product's rate
+    cess_amount: float = Field(default=0, ge=0)
+    surcharge_rate: float = Field(default=0, ge=0, le=100)
 
 
 class PurchaseCreate(BaseModel):
@@ -558,7 +571,7 @@ class PurchaseOut(BaseModel):
     store_id: uuid.UUID
     invoice_number: str | None
     invoice_date: date | None
-    total_amount: float
+    total_amount: float  # what is owed the vendor: GST, cess and surcharge included (older entries: before GST)
 
 
 # ---------------------------------------------------------------------------
