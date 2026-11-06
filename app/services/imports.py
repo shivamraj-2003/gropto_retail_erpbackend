@@ -43,7 +43,7 @@ PRODUCT_COLUMNS = ["sku", "name", "barcode", "uom", "purchase_price", "selling_p
 # batch_number, mfg_date and expiry_date are optional; when any is given the
 # opening quantity is also recorded as an inventory batch so expiry tracking works.
 # The location (store or warehouse) is picked on screen, not read from the sheet.
-OPENING_STOCK_COLUMNS = ["sku", "quantity", "batch_number", "mfg_date", "expiry_date"]
+OPENING_STOCK_COLUMNS = ["sku", "quantity", "batch_number", "mfg_date", "expiry_date", "purchase_price"]
 
 
 def _blank_cell(raw) -> bool:
@@ -186,6 +186,15 @@ async def preview_batch(db: AsyncSession, batch_id: uuid.UUID) -> dict:
         elif row.computed_action == "create" and batch.import_type == "other_prices":
             cost = f", cost {v['purchase_price']}" if v.get("purchase_price") is not None else ""
             detail = [f"Add price {v.get('selling_price')} (MRP {v.get('mrp')}{cost}) - {v.get('label')}"]
+        elif row.computed_action == "create" and batch.import_type == "purchase_bill":
+            bits = [f"Receipt {v.get('receipt'):g} x rate {v.get('rate'):g}"]
+            if v.get("free"):
+                bits.append(f"free {v['free']:g}")
+            if v.get("reject") or v.get("hl"):
+                bits.append(f"reject/H.L. {(v.get('reject') or 0) + (v.get('hl') or 0):g}")
+            if v.get("batch_no"):
+                bits.append(f"batch {v['batch_no']}")
+            detail = [", ".join(bits) + f" - stock in {v.get('stock_in'):g}, net Rs {v.get('net'):,.2f}"]
         label = v.get("name") or v.get("sku")
         rows.append({"line": row.line_number, "sku": v.get("sku"), "label": label, "action": row.computed_action, "detail": detail})
     return {"batch_id": str(batch_id), "counts": counts, "total_rows": len(batch.rows), "rows": rows[:300]}
@@ -363,6 +372,14 @@ async def stage_opening_stock_file(
             quantity = 0
 
         batch_number = clean_text(values.get("batch_number"))
+        cost = None
+        if not _blank_cell(values.get("purchase_price")):
+            try:
+                cost = float(str(values.get("purchase_price")).strip().replace(",", ""))
+                if cost < 0:
+                    messages.append("purchase_price cannot be negative")
+            except ValueError:
+                messages.append(f"purchase_price '{values.get('purchase_price')}' is not a number")
         mfg_date = expiry_date = None
         for field in ("mfg_date", "expiry_date"):
             try:
@@ -392,6 +409,7 @@ async def stage_opening_stock_file(
                     "warehouse_id": str(warehouse_id) if warehouse_id else None,
                     "quantity": quantity,
                     "batch_number": batch_number,
+                    "purchase_price": cost,
                     "mfg_date": mfg_date.isoformat() if mfg_date else None,
                     "expiry_date": expiry_date.isoformat() if expiry_date else None,
                 },
@@ -430,7 +448,7 @@ async def commit_opening_stock_batch(db: AsyncSession, batch_id: uuid.UUID, curr
             )
         else:
             await adjust_warehouse_balance(db, product_id=product_id, warehouse_id=warehouse_id, delta=v["quantity"])
-        if v.get("expiry_date") or v.get("mfg_date") or v.get("batch_number"):
+        if v.get("expiry_date") or v.get("mfg_date") or v.get("batch_number") or v.get("purchase_price") is not None:
             product = await db.get(Product, product_id)
             db.add(
                 InventoryBatch(
@@ -441,7 +459,8 @@ async def commit_opening_stock_batch(db: AsyncSession, batch_id: uuid.UUID, curr
                     mfg_date=date.fromisoformat(v["mfg_date"]) if v.get("mfg_date") else None,
                     expiry_date=date.fromisoformat(v["expiry_date"]) if v.get("expiry_date") else None,
                     quantity=v["quantity"],
-                    purchase_cost=product.purchase_price or 0,
+                    # the rate in the file when there is one, else the product's current cost
+                    purchase_cost=v["purchase_price"] if v.get("purchase_price") is not None else (product.purchase_price or 0),
                 )
             )
             batches_created += 1
@@ -822,3 +841,179 @@ def io_bytes(data: bytes):
     import io
 
     return io.BytesIO(data)
+
+
+# ---------------------------------------------------------------------------
+# Purchase bill: one vendor bill, one line per row. The vendor, store, bill number and date are chosen on screen, not read
+# from the file. Unlike the master imports the bill is saved whole or not at all: a half-saved bill would not match the vendor's.
+# ---------------------------------------------------------------------------
+
+PURCHASE_BILL_COLUMNS = ["sku", "bill_serial", "mrp", "batch_no", "hsn_code", "receipt", "free", "reject", "hl", "rate", "discount", "gst", "cess", "surcharge_rate"]
+PURCHASE_BILL_ALIASES = {
+    "sku": ["item_code", "code", "item", "product_code"],
+    "bill_serial": ["serial", "bill_serial_no", "sl_no"],
+    "mrp": ["mrp_price"],
+    "batch_no": ["batch", "batch_number", "batchno"],
+    "hsn_code": ["hsn", "hsn_sac"],
+    "receipt": ["quantity", "qty", "receipt_qty", "received"],
+    "free": ["free_qty", "scheme_qty"],
+    "reject": ["reject_qty", "rejected"],
+    "hl": ["h_l", "breakage", "leakage", "hl_qty"],
+    "rate": ["purchase_price", "cost", "purchase_rate", "unit_cost"],
+    "discount": ["disc", "discount_amount"],
+    "gst": ["gst_rate", "gst_code", "tax_rate", "gst_percent", "gst_pct"],
+    "cess": ["add_cess", "additional_cess"],
+    "surcharge_rate": ["surcharge", "surcharge_percent"],
+}
+
+
+def _number(raw, name: str, messages: list[str], *, default: float | None = 0.0, minimum: float = 0.0) -> float | None:
+    """A cell as a number; blank gives `default`. Anything unreadable or below `minimum` is added to `messages`."""
+    if _blank_cell(raw):
+        return default
+    try:
+        value = float(str(raw).strip().replace(",", "").replace("%", ""))
+    except ValueError:
+        messages.append(f"{name} '{raw}' is not a number")
+        return default
+    if value < minimum:
+        messages.append(f"{name} cannot be below {minimum:g}")
+    return value
+
+
+async def stage_purchase_bill_file(
+    db: AsyncSession,
+    *,
+    file_bytes: bytes,
+    filename: str,
+    uploaded_by: uuid.UUID,
+    store_id: uuid.UUID,
+    vendor_id: uuid.UUID,
+    invoice_number: str | None,
+    invoice_date: date | None,
+) -> ImportBatch:
+    from app.services.purchase_bill import ALLOWED_GST_RATES, line_amounts, stock_in
+
+    vendor = await db.get(Vendor, vendor_id)
+    if vendor is None:
+        raise ValueError("Pick the vendor this bill is from")
+    try:
+        header, data_rows = _rows_of(file_bytes, PURCHASE_BILL_ALIASES)
+    except ValueError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise ValueError("Could not read this file - upload an .xlsx or .csv file") from exc
+    missing = [c for c in ("sku", "receipt", "rate") if c not in header]
+    if missing:
+        found = ", ".join(h for h in header if h) or "none"
+        raise ValueError(f"The first row must have the columns {', '.join(missing)} (this file has: {found}). Download the template to see them all.")
+
+    batch = ImportBatch(import_type="purchase_bill", store_id=store_id, uploaded_by=uploaded_by, file_name=filename, file_bytes=file_bytes, status="staged")
+    db.add(batch)
+    await db.flush()
+
+    by_sku = {p.sku.strip().lower(): p for p in (await db.execute(select(Product))).scalars().all()}
+    by_barcode = {p.barcode.strip().lower(): p for p in by_sku.values() if p.barcode}
+    bill = {"vendor_id": str(vendor_id), "invoice_number": invoice_number or None, "invoice_date": invoice_date.isoformat() if invoice_date else None}
+
+    for i, row in enumerate(data_rows, start=2):
+        values = dict(zip(header, row, strict=False))
+        messages: list[str] = []
+        code = (clean_text(values.get("sku")) or "").strip()
+        product = by_sku.get(code.lower()) or by_barcode.get(code.lower())
+        if not code:
+            messages.append("Item code is missing")
+        elif product is None:
+            messages.append(f"Unknown item code {code} - add the product first")
+        receipt = _number(values.get("receipt"), "receipt", messages, default=0.0)
+        if receipt is not None and receipt <= 0 and not any("receipt" in m for m in messages):
+            messages.append("receipt must be more than 0")
+        rate = _number(values.get("rate"), "rate", messages, default=None)
+        if rate is None:
+            messages.append("rate is missing")
+        free = _number(values.get("free"), "free", messages)
+        reject = _number(values.get("reject"), "reject", messages)
+        hl = _number(values.get("hl"), "H.L.", messages)
+        discount = _number(values.get("discount"), "discount", messages)
+        cess = _number(values.get("cess"), "cess", messages)
+        surcharge_rate = _number(values.get("surcharge_rate"), "surcharge rate", messages)
+        mrp = _number(values.get("mrp"), "MRP", messages, default=None)
+        gst = _number(values.get("gst"), "GST", messages, default=None)
+        if gst is None and product is not None:
+            gst = float(product.tax_rate)
+        if gst is not None and gst not in ALLOWED_GST_RATES:
+            messages.append(f"GST {gst:g}% is not a valid rate")
+
+        net = into_stock = amount = None
+        if not messages and product is not None:
+            into_stock = float(stock_in(receipt, free, reject, hl))
+            if into_stock < 0:
+                messages.append("reject + H.L. are more than was received")
+            amounts = line_amounts(receipt=receipt, rate=rate, discount=discount, gst_rate=gst, cess=cess, surcharge_rate=surcharge_rate)
+            if amounts["taxable"] < 0:
+                messages.append("the discount is more than the amount")
+            amount, net = float(amounts["amount"]), float(amounts["net"])
+
+        db.add(
+            ImportStagingRow(
+                batch_id=batch.id,
+                line_number=i,
+                parsed_values={
+                    "sku": product.sku if product else code,
+                    "name": product.name if product else None,
+                    "product_id": str(product.id) if product else None,
+                    "bill_serial": clean_text(values.get("bill_serial")),
+                    "mrp": mrp,
+                    "batch_no": clean_text(values.get("batch_no")),
+                    "hsn_code": clean_text(values.get("hsn_code")) or (product.hsn_code if product else None),
+                    "receipt": receipt, "free": free, "reject": reject, "hl": hl, "rate": rate, "discount": discount,
+                    "gst": gst, "cess": cess, "surcharge_rate": surcharge_rate,
+                    "amount": amount, "net": net, "stock_in": into_stock,
+                    "_bill": bill,
+                },
+                computed_action="create" if not messages else "error",
+                validation_messages=messages,
+            )
+        )
+    await db.commit()
+    return batch
+
+
+async def commit_purchase_bill_batch(db: AsyncSession, batch_id: uuid.UUID, current: CurrentUser) -> dict:
+    from app.schemas.schemas import PurchaseCreate, PurchaseItemIn
+    from app.services.purchases import record_purchase
+
+    batch = await get_batch_with_rows(db, batch_id)
+    if batch is None or batch.status != "staged" or batch.import_type != "purchase_bill":
+        raise ValueError("Batch not found or already applied")
+    if not batch.rows:
+        raise ValueError("The file has no lines")
+    if any(r.computed_action == "error" for r in batch.rows):
+        raise ValueError("Some lines have problems. A purchase bill is saved whole or not at all: fix those lines in the file and upload it again")
+
+    rows = sorted(batch.rows, key=lambda r: r.line_number)
+    bill = rows[0].parsed_values["_bill"]
+    payload = PurchaseCreate(
+        vendor_id=uuid.UUID(bill["vendor_id"]),
+        store_id=batch.store_id,
+        invoice_number=bill.get("invoice_number"),
+        invoice_date=date.fromisoformat(bill["invoice_date"]) if bill.get("invoice_date") else None,
+        items=[
+            PurchaseItemIn(
+                product_id=uuid.UUID(v["product_id"]), quantity=v["receipt"], unit_cost=v["rate"], bill_serial=v.get("bill_serial"),
+                mrp=v.get("mrp"), batch_no=v.get("batch_no"), hsn_code=v.get("hsn_code"), free_qty=v.get("free") or 0,
+                reject_qty=v.get("reject") or 0, hl_qty=v.get("hl") or 0, discount_amount=v.get("discount") or 0,
+                gst_rate=v.get("gst"), cess_amount=v.get("cess") or 0, surcharge_rate=v.get("surcharge_rate") or 0,
+            )
+            for v in (r.parsed_values for r in rows)
+        ],
+    )
+    purchase = await record_purchase(db, payload, current, source="import")
+    batch.status = "applied"
+    await write_audit(
+        db, user_id=current.user_id, role_code=current.role_code, store_id=batch.store_id, device_id=current.device_id,
+        action="import.committed", entity_type="import_batch", entity_id=batch.id,
+        new_value={"purchase_id": str(purchase.id), "lines": len(rows), "total_amount": float(purchase.total_amount)},
+    )
+    await db.commit()
+    return {"purchase_id": str(purchase.id), "lines": len(rows), "total_amount": float(purchase.total_amount)}

@@ -1,5 +1,6 @@
 import io
 import uuid
+from datetime import date
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
@@ -116,10 +117,10 @@ TEMPLATES = {
         "permission": "import.opening_stock.import",
         "sheet": "Opening stock",
         "file": "opening-stock-template.xlsx",
-        "columns": ["sku", "quantity", "batch_number", "mfg_date", "expiry_date"],
+        "columns": ["sku", "quantity", "batch_number", "mfg_date", "expiry_date", "purchase_price"],
         "examples": [
-            ["EXAMPLE-001", 120, "B2410", "2026-09-01", "2027-03-01"],
-            ["EXAMPLE-002", 300, "", "", ""],
+            ["EXAMPLE-001", 120, "B2410", "2026-09-01", "2027-03-01", 62.566],
+            ["EXAMPLE-002", 300, "", "", "", ""],
         ],
         "help": [
             ("sku", "Yes", "The SKU of a product that already exists (add it in Products first).", "BOURN-500"),
@@ -127,11 +128,44 @@ TEMPLATES = {
             ("batch_number", "No", "Batch number, for items that expire.", "B2410"),
             ("mfg_date", "No", "Manufacturing date: YYYY-MM-DD or DD-MM-YYYY.", "2026-09-01"),
             ("expiry_date", "No", "Expiry date. Fill batch and dates for perishables so expiry is tracked.", "2027-03-01"),
+            ("purchase_price", "No", "What one unit cost (before GST). It is recorded on the batch; blank uses the product's current cost.", "62.566"),
         ],
         "notes": [
             "Pick the store or warehouse on the Import Data screen - it is not a column in the file.",
             "Opening stock can be loaded once per product and place. After that use Purchases, Transfers or a stock count.",
             "Delete the two EXAMPLE rows before you upload.",
+        ],
+    },
+    "purchase-bill": {
+        "permission": "procurement.purchase.create",
+        "sheet": "Purchase bill",
+        "file": "purchase-bill-template.xlsx",
+        "columns": ["sku", "bill_serial", "mrp", "batch_no", "hsn_code", "receipt", "free", "reject", "hl", "rate", "discount", "gst", "cess", "surcharge_rate"],
+        "examples": [
+            ["EXAMPLE-001", 1, 10, "B2410", "0910", 10, "", "", "", 6.857, "", 5, "", ""],
+            ["EXAMPLE-002", 2, 78, "B2411", "0910", 5, 1, "", "", 54.88, 10, 5, "", ""],
+        ],
+        "help": [
+            ("sku", "Yes", "The item code (SKU) of a product that already exists. A barcode also works.", "BOURN-500"),
+            ("receipt", "Yes", "The quantity on the vendor's bill. Must be more than 0.", "10"),
+            ("rate", "Yes", "The vendor's rate per unit BEFORE GST. Up to 4 decimals.", "6.857"),
+            ("bill_serial", "No", "The line's serial number on the vendor's bill.", "1"),
+            ("mrp", "No", "MRP printed on the pack for this lot.", "10"),
+            ("batch_no", "No", "Batch number. It also puts the lot in Check Stock's batch list.", "B2410"),
+            ("hsn_code", "No", "HSN code. Blank uses the product's.", "0910"),
+            ("free", "No", "Units given free. They go into stock and cost nothing.", "1"),
+            ("reject", "No", "Units that arrived but were refused. They never enter stock.", "2"),
+            ("hl", "No", "Units broken or leaked (H.L.). They never enter stock.", "1"),
+            ("discount", "No", "Discount in rupees on this line, taken off before GST.", "10"),
+            ("gst", "No", "GST code in percent (0, 5, 12, 18, 28, 40). Blank uses the product's rate.", "5"),
+            ("cess", "No", "Additional cess in rupees on this line.", "0"),
+            ("surcharge_rate", "No", "Surcharge in percent of the amount after discount.", "0"),
+        ],
+        "notes": [
+            "Pick the store, the vendor, the vendor's bill number and the bill date on the Import Data screen. They are not columns in the file.",
+            "One file is one vendor bill. It is saved whole or not at all: if any line has a problem, fix the file and upload it again.",
+            "Amount = receipt x rate. GST = (amount - discount) x GST code. Net = amount - discount + GST + cess + surcharge. Stock in = receipt + free - reject - H.L.",
+            "Column names are flexible: Item Code, Qty, Batch, HSN, Disc, GST %, H.L. ... are understood. Delete the two EXAMPLE rows before you upload.",
         ],
     },
 }
@@ -302,6 +336,44 @@ async def commit_products(
 ) -> dict:
     try:
         return await import_service.commit_products_batch(db, batch_id, current)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.post("/purchase-bill/stage")
+async def stage_purchase_bill(
+    file: UploadFile,
+    store_id: uuid.UUID,
+    vendor_id: uuid.UUID,
+    invoice_number: str | None = None,
+    invoice_date: date | None = None,
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(require_permission("procurement.purchase.create")),
+) -> dict:
+    """One vendor bill from a file, shown as a preview first. Nothing is saved until the commit."""
+    require_store_access(store_id, current)
+    content = await file.read()
+    try:
+        batch = await import_service.stage_purchase_bill_file(
+            db, file_bytes=content, filename=file.filename, uploaded_by=current.user_id, store_id=store_id, vendor_id=vendor_id,
+            invoice_number=(invoice_number or "").strip() or None, invoice_date=invoice_date,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return await import_service.preview_batch(db, batch.id)
+
+
+@router.post("/purchase-bill/{batch_id}/commit")
+async def commit_purchase_bill(
+    batch_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(require_permission("procurement.purchase.create")),
+) -> dict:
+    batch = await db.get(ImportBatch, batch_id)
+    if batch is not None and batch.store_id is not None:
+        require_store_access(batch.store_id, current)
+    try:
+        return await import_service.commit_purchase_bill_batch(db, batch_id, current)
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 

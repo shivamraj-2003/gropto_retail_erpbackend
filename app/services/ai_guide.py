@@ -155,7 +155,7 @@ Slow Stock, Expiry (value at risk, forecast for the next 7 to 90 days), Sales Sp
     (
         "Import Data",
         "import csv excel upload bulk products opening stock customers vendors template other prices batches preview add update problem",
-        """Import Data: pick what to import: Product Master Catalog, Opening Stock Initialization, Other Prices (batches), Customers (by mobile
+        """Import Data: pick what to import: Product Master Catalog, Opening Stock Initialization (optional purchase_price column records what a batch cost), Other Prices (batches), Purchase Bill (a whole vendor bill from one file, saved whole or not at all), Customers (by mobile
 number) or Vendors (with GST and contact details). Download the template, fill it, and upload it. A preview sorts rows into Add, Update,
 No change and Problem; fix the problem rows, then confirm the import. Nothing is saved until you confirm.""",
     ),
@@ -174,15 +174,16 @@ The top shows vendor fill rate, lead time and rejection rate and the purchase or
 Top: choose the Vendor (or add a New vendor), type the Vendor bill no. and the Bill date. The grid has one row per bill line with the
 columns Item Code, Description, Bill Serial, MRP, Batch No., HSN Code, Quantity (Stock = what the store holds now, Receipt, Free, Reject,
 H.L. = breakage or leakage, Total), Unit, Rate (the vendor's rate before GST), Rate Unit, Amount, Discount, GST (Code, Amount, Add. Cess),
-Surcharge (Rate, Amount), Net Amount and Ware H. (STORE).
+Surcharge (Rate, Amount), Net Amount and Ware H. (pick STORE, or a warehouse to receive that line into the warehouse).
 Steps: 1. In the empty bottom row type or scan an item code or name and press Enter. 2. The cursor goes to Receipt; type the quantity and press Enter
 to move along the row (Enter or the arrow keys move between cells). Fill Free, Reject, H.L., Rate, Discount, GST code, cess and surcharge as on the bill.
 3. Repeat for each line (the same item can appear on two lines, for example two batches). 4. Check the totals at the bottom and press Record & add to stock
 (or Ctrl+S).
 How it counts: Amount = Receipt x Rate. GST = (Amount - Discount) x the GST code %. Net Amount = Amount - Discount + GST + cess + surcharge.
 Stock goes up by Receipt + Free - Reject - H.L.; free goods cost nothing, rejected and broken goods never enter stock. A Batch No. also puts the lot
-into Check Stock's batch ledger. A yellow MRP cell means the MRP differs from the product's MRP (it is not split into a second price automatically).
-Past entries are listed below with View bill, which prints the vendor bill with the same columns.""",
+into Check Stock's batch ledger. A yellow MRP cell means the MRP differs from the product's MRP: when you record, a window asks for each such line whether the new stock sets the price (units already held keep the old MRP as an other price), or only the units on this bill carry the new MRP, or prices stay as they are; you can edit the selling price. Price changes may wait for approval unless you are a Super Admin. The tick box 'Also update product cost prices' sets each product's cost price to what the bill cost per unit before GST, free goods counted in.
+Past entries are listed below with View bill, which prints the vendor bill with the same columns.
+For a long bill use Import Data > Purchase Bill: choose the vendor, bill number and date, pick an Excel or CSV file (sku, receipt, rate plus optional columns), check the preview and save; the bill is saved whole or not at all.""",
     ),
     (
         "Sales (Insights)",

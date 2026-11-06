@@ -8,12 +8,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import CurrentUser, require_permission, require_store_access
 from app.core.database import get_db
 from app.models.models import Product, Purchase, PurchaseItem, Store, User, Vendor
-from app.models.models_phase4 import InventoryBatch
 from app.schemas.schemas import PurchaseCreate, PurchaseOut, VendorCreate, VendorOut, VendorUpdateIn
 from app.services.audit import write_audit
-from app.services.purchase_bill import ALLOWED_GST_RATES, build_bill, line_amounts, stock_in
+from app.services.purchase_bill import build_bill
+from app.services.purchases import record_purchase
 from app.services.vendor_ids import check_pan_matches_gstin, clean_vendor_ids, gstin_state_code, pan_from_gstin
-from app.services.inventory import apply_movement
 
 router = APIRouter(tags=["vendors-purchases"])
 
@@ -161,106 +160,10 @@ async def create_purchase(
     db: AsyncSession = Depends(get_db),
     current: CurrentUser = Depends(require_permission("procurement.purchase.create")),
 ) -> Purchase:
-    """Direct purchase entry with immediate stock-in (online only, the back office has connectivity). Each line is the
-    vendor bill's own line: receipt, free, reject and breakage quantities, rate, discount, GST code, cess and surcharge.
-    The server works out every amount itself; the till/app only sends what was typed. Stock goes up by
-    receipt + free - reject - breakage."""
+    """Direct purchase entry with immediate stock-in (online only, the back office has connectivity). See services/purchases.py:
+    every line is the vendor bill's own line and the server works out each amount itself."""
     require_store_access(payload.store_id, current)
-    if not payload.items:
-        raise HTTPException(status_code=422, detail="Add at least one line")
-    products = {
-        p.id: p
-        for p in (await db.execute(select(Product).where(Product.id.in_({i.product_id for i in payload.items})))).scalars().all()
-    }
-
-    rows: list[tuple] = []  # (item, product, gst_rate, amounts, stock_in)
-    for n, item in enumerate(payload.items, start=1):
-        product = products.get(item.product_id)
-        if product is None:
-            raise HTTPException(status_code=404, detail=f"Line {n}: that product no longer exists")
-        gst_rate = float(item.gst_rate) if item.gst_rate is not None else float(product.tax_rate)
-        if gst_rate not in ALLOWED_GST_RATES:
-            raise HTTPException(status_code=422, detail=f"Line {n} ({product.name}): GST {gst_rate:g}% is not a valid rate")
-        into_stock = stock_in(item.quantity, item.free_qty, item.reject_qty, item.hl_qty)
-        if into_stock < 0:
-            raise HTTPException(status_code=422, detail=f"Line {n} ({product.name}): rejected + broken goods are more than was received")
-        amounts = line_amounts(
-            receipt=item.quantity, rate=item.unit_cost, discount=item.discount_amount, gst_rate=gst_rate,
-            cess=item.cess_amount, surcharge_rate=item.surcharge_rate,
-        )
-        if amounts["taxable"] < 0:
-            raise HTTPException(status_code=422, detail=f"Line {n} ({product.name}): the discount is more than the amount")
-        rows.append((item, product, gst_rate, amounts, into_stock))
-
-    total = sum((r[3]["net"] for r in rows), 0)
-    purchase = Purchase(
-        vendor_id=payload.vendor_id,
-        store_id=payload.store_id,
-        invoice_number=payload.invoice_number,
-        invoice_date=payload.invoice_date,
-        total_amount=total,
-        created_by=current.user_id,
-    )
-    db.add(purchase)
-    await db.flush()
-
-    stock_by_product: dict[uuid.UUID, float] = {}
-    for item, product, gst_rate, amounts, into_stock in rows:
-        db.add(
-            PurchaseItem(
-                purchase_id=purchase.id, product_id=item.product_id, quantity=item.quantity, unit_cost=item.unit_cost,
-                bill_serial=item.bill_serial, mrp=item.mrp, batch_no=(item.batch_no or "").strip() or None,
-                hsn_code=item.hsn_code or product.hsn_code, free_qty=item.free_qty, reject_qty=item.reject_qty, hl_qty=item.hl_qty,
-                rate_unit=item.rate_unit, discount_amount=item.discount_amount, gst_rate=gst_rate, gst_amount=amounts["gst"],
-                cess_amount=amounts["cess"], surcharge_rate=item.surcharge_rate, surcharge_amount=amounts["surcharge"],
-                net_amount=amounts["net"],
-            )
-        )
-        stock_by_product[item.product_id] = stock_by_product.get(item.product_id, 0) + float(into_stock)
-
-        # A batch number puts this lot in the store's batch ledger (Check Stock). Free goods lower the cost per unit.
-        batch_no = (item.batch_no or "").strip()
-        if batch_no and into_stock > 0:
-            unit_cost = float(amounts["taxable"] / into_stock)
-            batch = await db.scalar(
-                select(InventoryBatch).where(
-                    InventoryBatch.product_id == item.product_id, InventoryBatch.store_id == payload.store_id,
-                    InventoryBatch.warehouse_id.is_(None), InventoryBatch.batch_number == batch_no,
-                )
-            )
-            if batch is None:
-                db.add(InventoryBatch(product_id=item.product_id, store_id=payload.store_id, batch_number=batch_no, quantity=float(into_stock), purchase_cost=unit_cost))
-            else:
-                batch.quantity = float(batch.quantity) + float(into_stock)
-                batch.purchase_cost = unit_cost
-
-    # One stock movement per product per bill (the same product on two lines, for example two batches, is added together)
-    for product_id, qty in stock_by_product.items():
-        if qty == 0:
-            continue
-        await apply_movement(
-            db,
-            product_id=product_id,
-            store_id=payload.store_id,
-            delta=qty,
-            reason_code="purchase_receipt",
-            source_type="purchase_item",
-            source_id=purchase.id,
-            created_by=current.user_id,
-            device_id=current.device_id,
-        )
-
-    await write_audit(
-        db,
-        user_id=current.user_id,
-        role_code=current.role_code,
-        store_id=payload.store_id,
-        device_id=current.device_id,
-        action="purchase.created",
-        entity_type="purchase",
-        entity_id=purchase.id,
-        new_value={"total_amount": float(total), "vendor_id": str(payload.vendor_id), "lines": len(rows)},
-    )
+    purchase = await record_purchase(db, payload, current)
     await db.commit()
     await db.refresh(purchase)
     return purchase

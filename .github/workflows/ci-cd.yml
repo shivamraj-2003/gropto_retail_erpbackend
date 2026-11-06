@@ -62,7 +62,7 @@ jobs:
         run: >-
           pytest -q
           tests/test_price_stock.py tests/test_purchase_bill.py tests/test_transfer_math.py tests/test_vendor_ids.py tests/test_gst_unit.py
-          tests/test_kv_unit.py tests/test_rbac_unit.py tests/test_product_import_unit.py tests/test_paytm_pos.py
+          tests/test_kv_unit.py tests/test_rbac_unit.py tests/test_product_import_unit.py tests/test_paytm_pos.py tests/test_purchase_import_unit.py tests/test_purchase_prices_unit.py
       - name: App starts
         run: python -c "import app.main"
 

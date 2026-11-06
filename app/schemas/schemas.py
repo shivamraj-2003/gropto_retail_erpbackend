@@ -554,6 +554,10 @@ class PurchaseItemIn(BaseModel):
     gst_rate: float | None = Field(default=None, ge=0, le=100)  # the GST code; None = the product's rate
     cess_amount: float = Field(default=0, ge=0)
     surcharge_rate: float = Field(default=0, ge=0, le=100)
+    warehouse_id: uuid.UUID | None = None  # None = received into the store itself
+    # What to do when this line's MRP is not the product's MRP (see services/purchase_prices.py). "keep" changes no price.
+    mrp_action: Literal["keep", "new_price", "new_stock_price"] = "keep"
+    new_selling_price: float | None = Field(default=None, gt=0)  # for the new price; blank keeps the product's usual discount
 
 
 class PurchaseCreate(BaseModel):
@@ -561,6 +565,8 @@ class PurchaseCreate(BaseModel):
     store_id: uuid.UUID
     invoice_number: str | None = None
     invoice_date: date | None = None
+    # Also set each product's cost price to what this bill actually cost per unit (before GST, free goods counted in)
+    update_cost: bool = False
     items: list[PurchaseItemIn]
 
 
@@ -572,6 +578,7 @@ class PurchaseOut(BaseModel):
     invoice_number: str | None
     invoice_date: date | None
     total_amount: float  # what is owed the vendor: GST, cess and surcharge included (older entries: before GST)
+    notes: list[str] = []  # what else happened (price changes made or waiting for approval, cost prices updated)
 
 
 # ---------------------------------------------------------------------------

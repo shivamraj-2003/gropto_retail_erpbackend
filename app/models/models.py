@@ -628,6 +628,7 @@ class PurchaseItem(Base):
     surcharge_rate: Mapped[float] = mapped_column(Numeric(5, 2), default=0)
     surcharge_amount: Mapped[float] = mapped_column(Numeric(12, 2), default=0)
     net_amount: Mapped[float | None] = mapped_column(Numeric(12, 2))  # amount - discount + GST + cess + surcharge
+    warehouse_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("warehouses.id"))  # None = into the store
 
 
 class SyncFailure(Base):

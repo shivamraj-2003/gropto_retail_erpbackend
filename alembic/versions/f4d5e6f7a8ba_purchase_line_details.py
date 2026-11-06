@@ -9,6 +9,7 @@ Revises: f3c4d5e6a7b9
 """
 
 import sqlalchemy as sa
+from sqlalchemy.dialects import postgresql
 from alembic import op
 
 revision = "f4d5e6f7a8ba"
@@ -36,12 +37,14 @@ _NEW = [
 
 
 def upgrade() -> None:
+    op.add_column("purchase_items", sa.Column("warehouse_id", postgresql.UUID(as_uuid=True), sa.ForeignKey("warehouses.id")))
     op.alter_column("purchase_items", "unit_cost", existing_type=sa.Numeric(12, 2), type_=sa.Numeric(12, 4), existing_nullable=False)
     for name, kind, default in _NEW:
         op.add_column("purchase_items", sa.Column(name, kind, server_default=default))
 
 
 def downgrade() -> None:
+    op.drop_column("purchase_items", "warehouse_id")
     for name, _kind, _default in reversed(_NEW):
         op.drop_column("purchase_items", name)
     op.alter_column("purchase_items", "unit_cost", existing_type=sa.Numeric(12, 4), type_=sa.Numeric(12, 2), existing_nullable=False)
