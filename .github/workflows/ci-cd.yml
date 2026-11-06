@@ -147,7 +147,7 @@ jobs:
           [ -z "$(get AI_PROVIDER_API_KEY)" ] || [ -n "$(get AI_MODEL)" ] || echo "::warning::AI_PROVIDER_API_KEY is set but AI_MODEL is empty (use gpt-4.1-mini)"
           case "$(get REDIS_URL)" in
             rediss://*) ;;
-            "") echo "::warning::REDIS_URL is empty: rate limits and the notification worker fall back to single-process memory (Upstash is expected in production)";;
+            "") echo "::notice::REDIS_URL is empty: fine with one API process (rate limits are kept in memory) and no background worker. Needed for several API processes or SMS/WhatsApp sending";;
             *) echo "::warning::REDIS_URL should be the Upstash TLS string starting with rediss://";;
           esac
           [ -n "$(get PAYTM_MERCHANT_KEY)" ] && [ -n "$(get PAYTM_CHANNEL_ID)" ] || echo "::notice::Paytm POS keys are not set: the POS stays on quick-tender buttons (card/UPI recorded by hand)"

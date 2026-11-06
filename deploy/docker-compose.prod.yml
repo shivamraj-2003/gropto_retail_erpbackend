@@ -1,6 +1,8 @@
 # Production stack on the VPS (copied to /opt/gropto by the deploy workflow).
-# The API image comes from GitHub Container Registry; Postgres (Supabase) and Redis (Upstash) are managed services,
-# so only the API, the Celery worker and the Caddy TLS proxy run here. Configuration is /opt/gropto/.env.
+# The API image comes from GitHub Container Registry; Postgres is a managed service (Supabase). Here run the API, the Caddy TLS
+# proxy and, only when wanted, the Celery worker (profile "worker") and a Redis (profile "redis"). With one API process the app
+# needs no Redis at all: rate limits and lockouts are kept in memory, which is correct for a single process.
+# Configuration is /opt/gropto/.env.
 #
 # IMAGE is set by remote-deploy.sh, e.g. ghcr.io/<owner>/<repo>:<commit sha>.
 services:
@@ -19,10 +21,21 @@ services:
       retries: 3
       start_period: 20s
 
+  # Sends SMS / WhatsApp / email in the background. Not started unless REDIS_URL is set and CELERY_ENABLED is not false
+  # (remote-deploy.sh decides). It polls Redis all day, so leave it off until a message provider is set up.
   worker:
     image: ${IMAGE:?set IMAGE}
     env_file: .env
+    profiles: ["worker"]
     command: ["celery", "-A", "app.worker.celery_app", "worker", "--loglevel=info", "--concurrency=4", "-Q", "notifications"]
+    restart: unless-stopped
+
+  # A Redis on this server instead of Upstash: no request limit, no cost. To use it set REDIS_URL=redis://redis:6379/0 in .env and
+  # start it with:  docker compose -f docker-compose.prod.yml --profile redis up -d redis
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--maxmemory", "128mb", "--maxmemory-policy", "allkeys-lru", "--save", ""]
+    profiles: ["redis"]
     restart: unless-stopped
 
   migrate:

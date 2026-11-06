@@ -52,7 +52,7 @@ DATABASE_URL=postgresql+asyncpg://...      # Supabase pooler connection string (
 JWT_SECRET=<long random string>            # python -c "import secrets; print(secrets.token_urlsafe(48))"
 ENVIRONMENT=production
 CORS_ORIGINS=app://.,https://your-domain
-REDIS_URL=rediss://...                     # Upstash
+REDIS_URL=                                # leave EMPTY for one API process (no Redis needed); see "Redis" below
 SITE_ADDRESS=api.your-domain.com           # leave empty to serve plain HTTP on the IP for now
 ```
 
@@ -153,3 +153,16 @@ asks Paytm whether it was paid. The bill is settled only when Paytm confirms it;
 - There is no webhook: Paytm's Wireless POS pages describe status enquiry only.
 - Needs internet at the till. Offline, card and UPI are recorded by hand as before.
 - If the app closes after the customer paid but before the bill is saved, the payment is on the server (`paytm_pos_payments`) and on the machine, but the bill is not recreated automatically.
+
+
+## Redis (usually not needed)
+
+With one API process (`WEB_CONCURRENCY=1`) the app needs no Redis: rate limits, login lockouts and OTP limits are kept in memory,
+which is correct for a single process. Leave `REDIS_URL` empty and the background worker stays off (the deploy script starts it only
+when `REDIS_URL` is set and `CELERY_ENABLED` is not `false`). Notifications then send directly instead of through the worker.
+
+Add Redis when you run more than one API process, or when you want SMS / WhatsApp / email sent in the background:
+- **On this server (free, no request limit):** set `REDIS_URL=redis://redis:6379/0` in `PROD_ENV`, and on the server start it once with
+  `docker compose -f docker-compose.prod.yml --profile redis up -d redis`. The deploy then also starts the worker.
+- **Upstash:** the free plan allows 500,000 commands a month, and the worker alone polls enough to use that up. Use Pay as you go
+  with a budget cap if you choose it.

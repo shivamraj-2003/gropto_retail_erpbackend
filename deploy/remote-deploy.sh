@@ -27,8 +27,17 @@ else
   echo "==> Skipping migrations (database already set up)"
 fi
 
+# The background worker only runs when Redis is set up and notifications are not switched off: it polls Redis all day.
+SERVICES="api caddy"
+if grep -qE "^REDIS_URL=.+" .env 2>/dev/null && ! grep -qiE "^CELERY_ENABLED=false" .env 2>/dev/null; then
+  SERVICES="api caddy worker"
+else
+  echo "==> Worker is off (no REDIS_URL, or CELERY_ENABLED=false)"
+  "${COMPOSE[@]}" --profile worker rm -sf worker >/dev/null 2>&1 || true
+fi
+
 echo "==> Starting the new version"
-IMAGE="$NEW_IMAGE" "${COMPOSE[@]}" up -d --remove-orphans api worker caddy
+IMAGE="$NEW_IMAGE" "${COMPOSE[@]}" up -d --remove-orphans $SERVICES
 
 echo "==> Waiting for the API to be healthy"
 healthy=false
@@ -45,7 +54,7 @@ if [ "$healthy" != true ]; then
   IMAGE="$NEW_IMAGE" "${COMPOSE[@]}" logs --tail=60 api || true
   if [ -n "$PREVIOUS_IMAGE" ]; then
     echo "==> Rolling back to $PREVIOUS_IMAGE"
-    IMAGE="$PREVIOUS_IMAGE" "${COMPOSE[@]}" up -d --remove-orphans api worker caddy
+    IMAGE="$PREVIOUS_IMAGE" "${COMPOSE[@]}" up -d --remove-orphans $SERVICES
   fi
   exit 1
 fi
