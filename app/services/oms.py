@@ -29,17 +29,18 @@ from app.schemas.schemas_phase3 import (
     OrderCreate,
     OrderDeliverRequest,
     OrderDispatchRequest,
+    OrderEditIn,
     OrderPickRequest,
     OrderReturnCreate,
 )
 from app.services import sms as sms_service
 from app.services.audit import write_audit
-from app.services.coupons import validate_and_apply_coupon
+from app.services.coupons import check_coupon, validate_and_apply_coupon
 from app.services.catalog import product_has_barcode
 from app.services.inventory import adjust_damaged, adjust_reserved, apply_movement, get_available_to_promise
 from app.services.loyalty import DuplicateLedgerEntry, apply_ledger_entry, get_config, get_earn_multiplier
 from app.services.pricing import resolve_price
-from app.services.promotion_engine import build_lines, evaluate_and_log
+from app.services.promotion_engine import build_lines, evaluate_and_log, evaluate_preview
 
 DELIVERY_OTP_VALIDITY_HOURS = 24
 REFUND_APPROVAL_THRESHOLD = 1000.0  # mirrors services/returns.py's in-store equivalent
@@ -512,6 +513,84 @@ async def initiate_refund(
         reason=reason,
     )
     return refund
+
+
+EDITABLE_STATUSES = ("placed", "reserved", "allocated")
+
+
+async def edit_order(db: AsyncSession, *, current: CurrentUser, order: Order, payload: OrderEditIn) -> Order:
+    """Change what is on an order before anyone starts picking it: quantities, removed lines, added lines, the delivery address.
+    Prices are worked out again by the server (never taken from the screen), stock is reserved for the new lines and
+    released for the old ones, and the discount and total are recalculated. An order that is already being picked, packed
+    or sent cannot be edited (the goods are already moving), and neither can one that was paid in advance (the amount paid
+    would no longer match): cancel and place it again."""
+    if order.status not in EDITABLE_STATUSES:
+        raise HTTPException(status_code=409, detail=f"An order that is {order.status} can no longer be edited. Cancel it and place it again")
+    if order.payment_mode == "prepaid" and order.payment_status == "paid":
+        raise HTTPException(status_code=409, detail="This order was paid in advance, so changing it would change the amount paid. Cancel it (refund) and place it again")
+    if order.allocated_store_id is None:
+        raise HTTPException(status_code=409, detail="This order has no store yet")
+
+    wanted: dict[uuid.UUID, float] = {}
+    for line in payload.items:
+        wanted[line.product_id] = wanted.get(line.product_id, 0.0) + float(line.quantity)
+
+    products = {p.id: p for p in (await db.execute(select(Product).where(Product.id.in_(list(wanted))))).scalars().all()}
+    for product_id in wanted:
+        product = products.get(product_id)
+        if product is None or not product.is_active:
+            raise HTTPException(status_code=400, detail=f"Product {product_id} is not a valid active product")
+
+    old_total = float(order.grand_total)
+    old_lines = {i.product_id: float(i.quantity) for i in order.items}
+    # give back what this order was holding, then check the new quantities against what is free
+    for item in order.items:
+        await adjust_reserved(db, product_id=item.product_id, store_id=order.allocated_store_id, delta=-float(item.quantity))
+    for product_id, qty in wanted.items():
+        free = await get_available_to_promise(db, product_id=product_id, store_id=order.allocated_store_id)
+        if free < qty:
+            raise HTTPException(status_code=409, detail=f"{products[product_id].name}: only {free:g} available at this store, {qty:g} asked for")
+
+    resolved: list[dict] = []
+    for product_id, qty in wanted.items():
+        price, _mrp = await resolve_price(db, product=products[product_id], store_id=order.allocated_store_id)
+        resolved.append({"product_id": product_id, "quantity": qty, "unit_price": price})
+    subtotal = round(sum(i["quantity"] * i["unit_price"] for i in resolved), 2)
+
+    # discounts again: offers by the rules in force now, the coupon (if any) re-checked on the new subtotal
+    lines = await build_lines(db, items=resolved)
+    promo = round(sum(amount for _rule, amount in await evaluate_preview(db, lines=lines)), 2)
+    coupon_discount = 0.0
+    if order.coupon_code:
+        try:
+            _coupon, coupon_discount = await check_coupon(
+                db, code=order.coupon_code, customer_id=order.customer_id, cart_subtotal=subtotal - promo
+            )
+        except HTTPException:
+            coupon_discount = 0.0  # the coupon no longer fits this basket: it simply stops applying
+    discount_total = round(min(promo + coupon_discount, subtotal), 2)
+
+    for old in list(order.items):
+        await db.delete(old)
+    await db.flush()
+    for row in resolved:
+        db.add(OrderItem(order_id=order.id, product_id=row["product_id"], quantity=row["quantity"], unit_price=row["unit_price"]))
+        await adjust_reserved(db, product_id=row["product_id"], store_id=order.allocated_store_id, delta=row["quantity"])
+
+    order.subtotal = subtotal
+    order.discount_total = discount_total
+    order.grand_total = round(subtotal - discount_total + float(order.delivery_fee or 0), 2)
+    if payload.delivery_address is not None:
+        order.delivery_address = payload.delivery_address.strip() or None
+    await db.flush()
+    await db.refresh(order, attribute_names=["items"])
+    await write_audit(
+        db, user_id=current.user_id, role_code=current.role_code, store_id=order.allocated_store_id, device_id=None,
+        action="order.edited", entity_type="order", entity_id=order.id,
+        old_value={"grand_total": old_total, "lines": {str(k): v for k, v in old_lines.items()}},
+        new_value={"grand_total": float(order.grand_total), "lines": {str(k): v for k, v in wanted.items()}}, reason=payload.reason,
+    )
+    return order
 
 
 async def cancel_order(db: AsyncSession, *, current: CurrentUser, order: Order, reason: str | None) -> Order:

@@ -1,7 +1,7 @@
 import uuid
 from datetime import date, datetime
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 # ---------------------------------------------------------------------------
@@ -33,6 +33,19 @@ class OrderCreate(BaseModel):
     coupon_code: str | None = None
 
 
+class OrderEditItemIn(BaseModel):
+    product_id: uuid.UUID
+    quantity: float = Field(gt=0)
+
+
+class OrderEditIn(BaseModel):
+    """The whole order as it should now be: every line that stays (with its quantity), and nothing else."""
+
+    items: list[OrderEditItemIn] = Field(min_length=1)
+    delivery_address: str | None = None
+    reason: str = Field(min_length=3, max_length=200)
+
+
 class OrderOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: uuid.UUID
@@ -59,6 +72,8 @@ class OrderItemOut(BaseModel):
     unit_price: float
     substituted_product_id: uuid.UUID | None
     picked_qty: float | None
+    product_name: str | None = None  # so a screen can show the item, not an id
+    sku: str | None = None
 
 
 class OrderDetailOut(OrderOut):

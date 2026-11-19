@@ -567,6 +567,8 @@ class PurchaseCreate(BaseModel):
     invoice_date: date | None = None
     # Also set each product's cost price to what this bill actually cost per unit (before GST, free goods counted in)
     update_cost: bool = False
+    # A cash purchase with no tax invoice: no GST, cess or surcharge on any line, and not counted as a GST purchase
+    without_gst: bool = False
     items: list[PurchaseItemIn]
 
 
@@ -579,6 +581,7 @@ class PurchaseOut(BaseModel):
     invoice_date: date | None
     total_amount: float  # what is owed the vendor: GST, cess and surcharge included (older entries: before GST)
     notes: list[str] = []  # what else happened (price changes made or waiting for approval, cost prices updated)
+    without_gst: bool = False
 
 
 # ---------------------------------------------------------------------------

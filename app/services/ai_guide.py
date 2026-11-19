@@ -49,19 +49,19 @@ sparkle button in the top bar opens the AI chat where you can ask questions abou
    For cash, type the amount received and the change is shown. Split lets you pay part cash, part card/UPI/wallet/gift voucher.
    Hold (F4) parks the bill to serve another customer; Held bills are listed under Parked / Held Bills and can be resumed or discarded.
 6. A print dialog shows the bill preview; print it or Skip.
-Esc asks to clear the current bill. A manager override dialog appears when a cashier does something that needs approval
+Esc asks to clear the current bill with a small bar: Enter clears it, Esc keeps it. F9 opens Split payment, F10 opens the Held bills list (Up/Down choose, Enter resumes, Del discards, Esc closes), + and - change the quantity of the item added last. F2 opens a small customer panel: type the 10-digit mobile and press Enter. A manager override dialog appears when a cashier does something that needs approval
 (for example a big discount). The counter number identifies the till (device) that made the bill and is printed with the bill number.""",
     ),
     (
         "Past Bills",
         "past bills recent bills history reprint preview invoice search receipt",
-        """Past Bills lists earlier bills of the store. Search by bill number or date. Each row has a Preview button that opens the receipt
+        """Past Bills lists earlier bills of the store. A manager (shift-override permission) can fix how a finished bill was paid with the Payment mode button: choose the payment, what it becomes (cash, card or UPI), type a reason and press Enter. It is refused once that till's shift is closed, for a payment the Paytm machine confirmed, and for wallet or gift voucher payments. Search by bill number or date. Each row has a Preview button that opens the receipt
 exactly as it was printed, and you can print it again from there. Use Returns when a customer brings an item back.""",
     ),
     (
         "Returns",
         "return refund exchange credit note damaged scrap vendor saleable bill preview past bills",
-        """Returns. Step 1: find the original bill: search by mobile number, customer name, bill number or an item, or press
+        """Returns. If the customer lost the bill and every number on it, press Preview past bills and narrow it down by date, roughly how much it was (amount from and to), how it was paid (cash, card or UPI) and an item they remember; Up/Down choose a bill and Enter starts the return. Step 1: find the original bill: search by mobile number, customer name, bill number or an item, or press
 Preview past bills to browse and pick one. Step 2: choose the items and quantities coming back (not more than were sold),
 give a reason (for example damaged packaging or customer request), and choose where the stock goes: Back to Saleable Stock,
 Damaged / Scrap, or Return to Vendor. Step 3: confirm. The refund amount follows the price actually charged on the original bill.
@@ -73,7 +73,7 @@ Some returns may need a manager's approval.""",
         """Online Orders handles orders from the app, web or marketplaces. Create Omnichannel Order: choose the fulfilling store, add products,
 enter the customer's 10-digit mobile, optional address and coupon. An order moves through Reserved -> Allocated -> Picking ->
 Picked -> Packed -> Dispatched -> Delivered (or Cancelled). Assign a delivery rider (an employee) at dispatch. At delivery enter the
-customer's 4-digit OTP. Scan a barcode while picking to verify the item. The top cards show orders this month, fill rate,
+customer's 4-digit OTP. Scan a barcode while picking to verify the item. Before picking starts (status Reserved or Allocated) press Edit order (or the E key) in the order panel to change quantities, add or remove items and fix the address: type a reason, then Ctrl+Enter or Enter on the reason box saves; the server works out the prices, stock and discount again. An order already being picked, or paid in advance, cannot be edited: cancel it and place it again. Cancel Order asks for its reason in the same panel, no pop-up. The top cards show orders this month, fill rate,
 cancellations, items not found, average delivery time, pick and pack time and the dispatch SLA.""",
     ),
     (
@@ -83,7 +83,7 @@ cancellations, items not found, average delivery time, pick and pack time and th
 denomination counter), and at the end enter the Closing Cash Count; the Reconciliation Summary shows expected cash against counted cash
 and the difference; Confirm Shift Closure saves it. Cash in and out: record money put into or taken from the drawer, with a reason
 (for example vendor payment or tea/snacks petty expense). Day close: the store's business-day close with the day's checklist; Confirm
-Store Day Close locks the day.""",
+Store Day Close locks the day. On the Day close tab, Payment match shows one day: counter cash against the cash counted, card and UPI against what the Paytm machine confirmed (bills entered by hand show as not confirmed), and the online orders delivered (paid in advance, and cash on delivery that riders must hand in). Recent shifts (under the Shifts tab) lists the latest shifts; a closed shift can be opened again only in an emergency: press Reopen (emergency), type the reason in the row and press Enter. It needs the shift-override permission, is refused once the day is closed, and is kept in the Activity Log.""",
     ),
     (
         "Finance",
@@ -170,7 +170,7 @@ The top shows vendor fill rate, lead time and rejection rate and the purchase or
     (
         "Purchase Entry",
         "purchase entry bill vendor invoice stock in cost update inward new vendor view bill grid batch free reject breakage leakage discount gst cess surcharge net amount serial hsn mrp rate",
-        """Purchase Entry records a vendor's bill line by line, like the vendor's own bill, and puts the stock in.
+        """Purchase Entry records a vendor's bill line by line, like the vendor's own bill, and puts the stock in. For goods bought for cash with no tax invoice tick Without GST (cash purchase): stock goes in, every line is at 0% GST with no cess or surcharge, nothing is claimed as tax, and the entry is marked No GST.
 Top: choose the Vendor (or add a New vendor), type the Vendor bill no. and the Bill date. The grid has one row per bill line with the
 columns Item Code, Description, Bill Serial, MRP, Batch No., HSN Code, Quantity (Stock = what the store holds now, Receipt, Free, Reject,
 H.L. = breakage or leakage, Total), Unit, Rate (the vendor's rate before GST), Rate Unit, Amount, Discount, GST (Code, Amount, Add. Cess),

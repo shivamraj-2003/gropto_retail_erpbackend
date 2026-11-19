@@ -36,7 +36,7 @@ async def record_purchase(db: AsyncSession, payload: PurchaseCreate, current: Cu
         product = products.get(item.product_id)
         if product is None:
             raise HTTPException(status_code=404, detail=f"Line {n}: that product no longer exists")
-        gst_rate = float(item.gst_rate) if item.gst_rate is not None else float(product.tax_rate)
+        gst_rate = 0.0 if payload.without_gst else (float(item.gst_rate) if item.gst_rate is not None else float(product.tax_rate))
         if gst_rate not in ALLOWED_GST_RATES:
             raise HTTPException(status_code=422, detail=f"Line {n} ({product.name}): GST {gst_rate:g}% is not a valid rate")
         into_stock = stock_in(item.quantity, item.free_qty, item.reject_qty, item.hl_qty)
@@ -46,7 +46,7 @@ async def record_purchase(db: AsyncSession, payload: PurchaseCreate, current: Cu
             raise HTTPException(status_code=403, detail=f"Line {n} ({product.name}): you cannot receive into that warehouse")
         amounts = line_amounts(
             receipt=item.quantity, rate=item.unit_cost, discount=item.discount_amount, gst_rate=gst_rate,
-            cess=item.cess_amount, surcharge_rate=item.surcharge_rate,
+            cess=0 if payload.without_gst else item.cess_amount, surcharge_rate=0 if payload.without_gst else item.surcharge_rate,
         )
         if amounts["taxable"] < 0:
             raise HTTPException(status_code=422, detail=f"Line {n} ({product.name}): the discount is more than the amount")
@@ -71,6 +71,7 @@ async def record_purchase(db: AsyncSession, payload: PurchaseCreate, current: Cu
         store_id=payload.store_id,
         invoice_number=payload.invoice_number,
         invoice_date=payload.invoice_date,
+        without_gst=payload.without_gst,
         total_amount=total,
         created_by=current.user_id,
     )
@@ -90,7 +91,7 @@ async def record_purchase(db: AsyncSession, payload: PurchaseCreate, current: Cu
                 bill_serial=item.bill_serial, mrp=item.mrp, batch_no=batch_no or None, hsn_code=item.hsn_code or product.hsn_code,
                 free_qty=item.free_qty, reject_qty=item.reject_qty, hl_qty=item.hl_qty, rate_unit=item.rate_unit,
                 discount_amount=item.discount_amount, gst_rate=gst_rate, gst_amount=amounts["gst"], cess_amount=amounts["cess"],
-                surcharge_rate=item.surcharge_rate, surcharge_amount=amounts["surcharge"], net_amount=amounts["net"],
+                surcharge_rate=0 if payload.without_gst else item.surcharge_rate, surcharge_amount=amounts["surcharge"], net_amount=amounts["net"],
                 warehouse_id=item.warehouse_id,
             )
         )
@@ -146,7 +147,7 @@ async def record_purchase(db: AsyncSession, payload: PurchaseCreate, current: Cu
         action="purchase.created",
         entity_type="purchase",
         entity_id=purchase.id,
-        new_value={"total_amount": float(total), "vendor_id": str(payload.vendor_id), "lines": len(rows), "source": source},
+        new_value={"total_amount": float(total), "vendor_id": str(payload.vendor_id), "lines": len(rows), "source": source, "without_gst": payload.without_gst},
     )
     purchase.notes = notes  # shown to the person who entered it; not stored
     return purchase

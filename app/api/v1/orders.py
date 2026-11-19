@@ -17,6 +17,7 @@ from app.schemas.schemas_phase3 import (
     OrderDeliveryOtpOut,
     OrderDetailOut,
     OrderDispatchRequest,
+    OrderEditIn,
     OrderOut,
     OrderPickRequest,
     OrderRefundOut,
@@ -36,6 +37,20 @@ async def _get_order(db: AsyncSession, order_id: uuid.UUID) -> Order:
     order = (await db.execute(stmt)).scalar_one_or_none()
     if order is None:
         raise HTTPException(status_code=404, detail="Order not found")
+    return order
+
+
+async def _with_names(db: AsyncSession, order: Order) -> Order:
+    """Put each line's product name and SKU on it for the response (not stored)."""
+    ids = {i.product_id for i in order.items}
+    if ids:
+        from app.models.models import Product
+
+        names = {p.id: p for p in (await db.execute(select(Product).where(Product.id.in_(ids)))).scalars().all()}
+        for item in order.items:
+            p = names.get(item.product_id)
+            item.product_name = p.name if p else None
+            item.sku = p.sku if p else None
     return order
 
 
@@ -158,7 +173,7 @@ async def get_order(
     db: AsyncSession = Depends(get_db),
     current: CurrentUser = Depends(require_permission("oms.order.view")),
 ) -> Order:
-    return await _get_order_scoped(db, order_id, current)
+    return await _with_names(db, await _get_order_scoped(db, order_id, current))
 
 
 @router.get("/{order_id}/delivery-otp", response_model=OrderDeliveryOtpOut)
@@ -194,6 +209,21 @@ async def create_order(
     await db.commit()
     await db.refresh(order)
     return order
+
+
+@router.post("/{order_id}/edit", response_model=OrderDetailOut)
+async def edit_order(
+    order_id: uuid.UUID,
+    payload: OrderEditIn,
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(require_permission("oms.order.create")),
+) -> Order:
+    """Edit an order before picking starts (see services/oms.py edit_order). A reason is required and is kept in the audit log."""
+    order = await _get_order_scoped(db, order_id, current)
+    order = await oms.edit_order(db, current=current, order=order, payload=payload)
+    await db.commit()
+    await db.refresh(order)
+    return await _with_names(db, order)
 
 
 @router.post("/{order_id}/start-picking", response_model=OrderOut)

@@ -1,7 +1,7 @@
 import uuid
 from datetime import date, datetime
 
-from pydantic import BaseModel, ConfigDict, Field, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 # ---------------------------------------------------------------------------
@@ -244,6 +244,10 @@ class ShiftClose(BaseModel):
     # Point 10 audit fix: captured once the variance exceeds
     # cash.py::VARIANCE_TOLERANCE (not required below it).
     variance_reason: str | None = None
+
+
+class ShiftReopen(BaseModel):
+    reason: str = Field(min_length=8, max_length=300)  # why a closed shift has to be opened again; kept in the audit log
 
 
 class DayCloseRequest(BaseModel):

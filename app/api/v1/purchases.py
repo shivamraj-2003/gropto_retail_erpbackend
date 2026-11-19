@@ -244,6 +244,7 @@ async def purchase_bill(
         "recorded_at": purchase.created_at.isoformat() if purchase.created_at else None,
         "recorded_by": buyer.full_name if buyer else None,
         "inter_state": inter_state,
+        "without_gst": bool(purchase.without_gst),
         "vendor": VendorOut.model_validate(vendor).model_dump(mode="json") if vendor else None,
         "store": {"id": str(store.id), "name": store.name, "city": store.city, "state": store.state, "gstin": store.gstin} if store else None,
         "lines": bill["lines"],

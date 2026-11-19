@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser, require_permission, require_store_access
 from app.core.database import get_db
-from app.models.models import Customer, Sale, SaleItem
+from app.models.models import Customer, Payment, Sale, SaleItem
 from app.models.models_phase2 import Return, ReturnItem
 from app.schemas.schemas import Page
 from app.schemas.schemas_phase2 import ReturnCreate, ReturnLinkExchangeIn, ReturnOut
@@ -118,12 +118,17 @@ async def browse_bills(
     date_from: date | None = None,
     date_to: date | None = None,
     q: str = "",
+    amount_min: float | None = None,
+    amount_max: float | None = None,
+    mode: str | None = None,
     limit: int = 20,
     offset: int = 0,
     db: AsyncSession = Depends(get_db),
     current: CurrentUser = Depends(require_permission("pos.return.refund")),
 ) -> dict:
-    """Past bills, newest first, one page at a time, for any date range (India calendar days). `q` is optional and matches
+    """For a customer who has lost the bill and every number on it: narrow by day, roughly how much it was (`amount_min`,
+    `amount_max`), how it was paid (`mode`: cash, card or upi) and an item they remember.
+    Past bills, newest first, one page at a time, for any date range (India calendar days). `q` is optional and matches
     bill number, mobile, name or an item bought. For looking through bills before choosing one to return."""
     limit = min(max(limit, 1), 50)
     offset = max(offset, 0)
@@ -142,6 +147,12 @@ async def browse_bills(
         stmt = stmt.where(day >= date_from)
     if date_to:
         stmt = stmt.where(day <= date_to)
+    if amount_min is not None:
+        stmt = stmt.where(Sale.grand_total >= amount_min)
+    if amount_max is not None:
+        stmt = stmt.where(Sale.grand_total <= amount_max)
+    if mode in ("cash", "card", "upi"):
+        stmt = stmt.where(exists().where(Payment.sale_id == Sale.id, Payment.mode == mode))
     text = q.strip()
     if len(text) >= 2:
         like = f"%{text}%"

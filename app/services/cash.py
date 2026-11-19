@@ -221,6 +221,48 @@ async def close_shift(db: AsyncSession, *, current: CurrentUser, shift: CashierS
     return shift
 
 
+async def reopen_shift(db: AsyncSession, *, current: CurrentUser, shift: CashierShift, reason: str) -> CashierShift:
+    """EMERGENCY ONLY: open a closed shift again (a count that was entered wrongly, a till closed by mistake). It is not a normal
+    way to change a day's cash: it needs the shift-override permission and a reason, it is refused once the store's day has been
+    closed or while the till has another shift open, and what the shift had recorded at close is kept in the audit log."""
+    if shift.status != "closed":
+        raise HTTPException(status_code=409, detail="This shift is not closed")
+    closed_on = shift.closed_at.date() if shift.closed_at else None
+    if closed_on is not None:
+        day_closed = await db.scalar(
+            select(DayClose.id).where(DayClose.store_id == shift.store_id, DayClose.business_date == closed_on).limit(1)
+        )
+        if day_closed is not None:
+            raise HTTPException(status_code=409, detail=f"The store's day of {closed_on} is already closed. A shift of a closed day cannot be reopened")
+    other = await db.scalar(
+        select(CashierShift.id).where(CashierShift.device_id == shift.device_id, CashierShift.status == "open", CashierShift.id != shift.id).limit(1)
+    )
+    if other is not None:
+        raise HTTPException(status_code=409, detail="This till already has another shift open. Close it first")
+
+    before = {
+        "expected_cash": float(shift.expected_cash or 0), "counted_cash": float(shift.counted_cash or 0), "variance": float(shift.variance or 0),
+        "variance_status": shift.variance_status, "variance_reason": shift.variance_reason,
+        "denomination_breakdown": shift.denomination_breakdown, "tender_breakdown": shift.tender_breakdown,
+        "closed_at": shift.closed_at.isoformat() if shift.closed_at else None,
+    }
+    shift.status = "open"
+    shift.closed_at = None
+    shift.expected_cash = None
+    shift.counted_cash = None
+    shift.variance = None
+    shift.denomination_breakdown = None
+    shift.tender_breakdown = None
+    shift.variance_status = "within_tolerance"
+    shift.variance_reason = None
+    await write_audit(
+        db, user_id=current.user_id, role_code=current.role_code, store_id=shift.store_id, device_id=shift.device_id,
+        action="shift.reopened", entity_type="cashier_shift", entity_id=shift.id, old_value=before,
+        new_value={"status": "open"}, reason=reason,
+    )
+    return shift
+
+
 async def close_day(db: AsyncSession, *, current: CurrentUser, payload: DayCloseRequest) -> DayClose:
     # Point 16 audit fix: this previously silently excluded any still-open
     # cashier shift from the day's reconciliation instead of blocking the
