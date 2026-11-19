@@ -12,8 +12,8 @@ on:
   pull_request:
   workflow_dispatch:
     inputs:
-      run_migrations:
-        description: "Also apply database migrations to production (normally off: the database is already set up)"
+      skip_migrations:
+        description: "Do NOT apply database migrations (normally off: migrations that are pending are applied automatically, after a backup)"
         type: boolean
         default: false
 
@@ -184,7 +184,7 @@ jobs:
         if: steps.configured.outputs.ready == 'true'
         env:
           IMAGE: ${{ needs.image.outputs.image }}:${{ github.sha }}
-          RUN_MIGRATIONS: ${{ inputs.run_migrations && 'true' || 'false' }}
+          RUN_MIGRATIONS: ${{ inputs.skip_migrations && 'false' || 'auto' }}
           REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REGISTRY_USER: ${{ github.actor }}
         run: |

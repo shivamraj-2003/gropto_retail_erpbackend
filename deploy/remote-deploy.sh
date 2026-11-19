@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Runs ON THE SERVER (called over SSH by the deploy workflow): switches to the new image, waits for it to be healthy,
-# and goes back to the previous image if it is not. Migrations only when RUN_MIGRATIONS=true.
+# and goes back to the previous image if it is not. Database migrations run by themselves when the new version has any the
+# database does not have yet (RUN_MIGRATIONS: auto = only then, the default; true = always; false = never).
 #   usage: remote-deploy.sh ghcr.io/<owner>/<repo>:<sha>
 set -euo pipefail
 
@@ -12,9 +13,24 @@ PREVIOUS_IMAGE="$(cat .current_image 2>/dev/null || true)"
 echo "==> Pulling $NEW_IMAGE"
 docker pull "$NEW_IMAGE"
 
-# The database (Supabase) and Redis (Upstash) already exist and are not touched by a normal deploy. Migrations only run when
-# asked for: Actions -> CI/CD -> Run workflow -> "Also apply database migrations" (RUN_MIGRATIONS=true).
-if [ "${RUN_MIGRATIONS:-false}" = "true" ]; then
+# Migrations: by default they run on their own, and only when the database is behind this version (so an ordinary deploy with no
+# schema change does nothing here). They run BEFORE the new version starts, so they are written to be additive and the version
+# still running keeps working against the new schema. If a migration fails, the script stops here, nothing is switched, and the
+# current version keeps serving.
+need_migrations=false
+case "${RUN_MIGRATIONS:-auto}" in
+  true) need_migrations=true ;;
+  false) need_migrations=false ;;
+  *)
+    if IMAGE="$NEW_IMAGE" "${COMPOSE[@]}" run --rm migrate python -m alembic current --check-heads >/dev/null 2>&1; then
+      need_migrations=false
+    else
+      need_migrations=true  # behind the new version (or the database could not be read: the migration step then says why)
+    fi
+    ;;
+esac
+
+if [ "$need_migrations" = "true" ]; then
   # A dump first. Best effort: a failed dump (for example a pg_dump older than the Supabase server) does not stop the deploy.
   echo "==> Backing up the database before migrating"
   mkdir -p backups && chown 10001 backups 2>/dev/null || true
@@ -24,7 +40,7 @@ if [ "${RUN_MIGRATIONS:-false}" = "true" ]; then
   echo "==> Applying database migrations"
   IMAGE="$NEW_IMAGE" "${COMPOSE[@]}" run --rm migrate
 else
-  echo "==> Skipping migrations (database already set up)"
+  echo "==> No database migration needed (the database is already at this version)"
 fi
 
 # The background worker only runs when Redis is set up and notifications are not switched off: it polls Redis all day.

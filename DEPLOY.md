@@ -75,28 +75,30 @@ Then check it: `curl https://<your-domain>/health/ready`
 
 ## Supabase and Upstash (already set up)
 
-The database (Supabase) and Redis (Upstash) are already created and migrated, so a normal deploy **only ships the backend**:
-it does not run migrations and does not touch the database or Redis. CI never touches them either (it proves the migrations
-on a throwaway Postgres).
+The database (Supabase) is already created. A deploy ships the backend and **applies any database migration the new version
+has by itself** (after a backup); when there is none it does not touch the database. CI never touches it (it proves the
+migrations on a throwaway Postgres).
 
 - `PROD_ENV` carries the **production** connection strings (the password there is the production one, not your local
   `.env`'s): `DATABASE_URL` (`postgresql+asyncpg://...`, Supabase pooler) and `REDIS_URL` (`rediss://...`, Upstash).
 - Session pooler (port 5432) caps at 15 connections, so keep `WEB_CONCURRENCY=1`.
 - The deploy job stops early with a clear message if `PROD_ENV` has no `DATABASE_URL` or `JWT_SECRET`, if the URL is not
   `postgresql+asyncpg://`, or if it points at localhost.
-- **When you add a migration later:** merge it, then run Actions -> CI/CD -> Run workflow and tick "Also apply database
-  migrations". That takes a best-effort `pg_dump` first, then runs `alembic upgrade head`, then deploys. For this,
-  `PROD_ENV` also needs `MIGRATION_DATABASE_URL` (session pooler, port 5432).
+- **When you add a migration:** just merge it. The deploy checks whether the database is behind (`alembic current --check-heads`);
+  if it is, it takes a best-effort `pg_dump`, runs `alembic upgrade head`, and only then switches to the new version. Nothing to
+  tick. If the migration fails the deploy stops, nothing is switched, and the current version keeps serving. For this, `PROD_ENV`
+  also needs `MIGRATION_DATABASE_URL` (session pooler, port 5432). To deploy WITHOUT migrating (rare), run the workflow by hand
+  and tick "Do NOT apply database migrations".
 
 ## How a deploy works
 
 1. Tests, and every migration applied to an empty Postgres.
 2. The image is built and tagged with the commit id.
-3. On the server: pull the image, start the new containers, wait up to two minutes for `/health/ready`. (Migrations only
-   when you ask for them, see above.)
+3. On the server: pull the image, apply pending migrations (backup first), start the new containers, wait up to two minutes
+   for `/health/ready`.
 4. If the new version is not healthy, the previous image is started again and the run fails.
 
-When you do run migrations, they run before the switch, so write them so the previous version still works against the new
+Migrations run before the switch, so write them so the previous version still works against the new
 schema (add columns before using them, drop them in a later release). A rollback goes back to the old code, not the old
 schema.
 
@@ -129,7 +131,7 @@ asks Paytm whether it was paid. The bill is settled only when Paytm confirms it;
   Staging uses `https://securegw-stage.paytmpayments.in`.
 
 ### Setting it up (each store has its own Paytm account)
-1. Run the workflow with "Run database migrations" ticked once (adds `paytm_terminals`, `paytm_pos_payments` and the per-store account columns).
+1. Deploy as usual: the migrations that add `paytm_terminals`, `paytm_pos_payments` and the per-store account columns run by themselves.
 2. Add `SECRETS_KEY=<a long random string>` to `PROD_ENV` once, and never change it afterwards. It encrypts each store's merchant key in the database (if empty, `JWT_SECRET` is used, and changing `JWT_SECRET` would make saved keys unreadable).
 3. For each store, an admin opens **Tills & Devices > Paytm card machines**, picks the store and presses **Add machine**: name, MID, TID, serial, channel id, merchant key, environment (staging or production) and, for production, the server address Paytm gave. The key is stored encrypted and is never shown again. Anything left empty falls back to the server-wide `PAYTM_*` defaults in `PROD_ENV`.
 4. The machine then shows "Ready to take payments". `GET /api/v1/payments/config?store_id=<store>` says `"enabled": true`, and only that store's till uses that machine and that account.
