@@ -15,7 +15,7 @@ import uuid
 from datetime import date, datetime
 
 import openpyxl
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -44,6 +44,7 @@ PRODUCT_COLUMNS = ["sku", "name", "barcode", "uom", "purchase_price", "selling_p
 # opening quantity is also recorded as an inventory batch so expiry tracking works.
 # The location (store or warehouse) is picked on screen, not read from the sheet.
 OPENING_STOCK_COLUMNS = ["sku", "quantity", "batch_number", "mfg_date", "expiry_date", "purchase_price"]
+# plus, for a SKU that is not in Products yet: name, selling_price and the other product columns (the same row creates it)
 
 
 def _blank_cell(raw) -> bool:
@@ -348,16 +349,29 @@ async def stage_opening_stock_file(
             for b in (await db.execute(select(WarehouseBalance).where(WarehouseBalance.warehouse_id == warehouse_id))).scalars().all()
         }
     seen: set[str] = set()
+    barcode_owner = {p.barcode: p.sku for p in products.values() if p.barcode}
 
     for i, row in enumerate(data_rows, start=2):
         values = dict(zip(header, row, strict=False))
         messages: list[str] = []
         sku = clean_text(values.get("sku")) or ""
         product = products.get(sku)
+        new_product: dict | None = None
         if not sku:
             messages.append("SKU is missing")
         elif product is None:
-            messages.append(f"Unknown SKU {sku} — add the product first")
+            # one file for products AND stock: a SKU that does not exist yet is created from the same row when it has a name
+            # and a selling price. Without them, say what is missing.
+            new_product, product_problems = parse_product_row(values, is_new=True)
+            if "name" not in new_product and "selling_price" not in new_product:
+                messages.append(f"SKU {sku} is not in Products yet. Fill name and selling_price in this row to create it here")
+                new_product = None
+            else:
+                messages.extend(product_problems)
+                for code in ([new_product["barcode"]] if new_product.get("barcode") else []) + new_product.get("other_barcodes", []):
+                    owner = barcode_owner.get(code)
+                    if owner:
+                        messages.append(f"Barcode {code} already belongs to {owner}")
         elif product.id in already:
             messages.append("Opening stock was already loaded for this product here")
         if sku in seen:
@@ -404,8 +418,9 @@ async def stage_opening_stock_file(
                 line_number=i,
                 parsed_values={
                     "sku": sku,
-                    "name": product.name if product else None,
+                    "name": product.name if product else (new_product or {}).get("name"),
                     "product_id": str(product.id) if product else None,
+                    "new_product": new_product,
                     "warehouse_id": str(warehouse_id) if warehouse_id else None,
                     "quantity": quantity,
                     "batch_number": batch_number,
@@ -428,11 +443,33 @@ async def commit_opening_stock_batch(db: AsyncSession, batch_id: uuid.UUID, curr
 
     applied = 0
     batches_created = 0
+    products_created = 0
     for row in batch.rows:
         if row.computed_action != "create" or row.validation_messages:
             continue
         v = row.parsed_values
-        product_id = uuid.UUID(v["product_id"])
+        if v.get("product_id"):
+            product_id = uuid.UUID(v["product_id"])
+        else:
+            n = v["new_product"]
+            category = None
+            if n.get("category"):
+                category = (await db.execute(select(Category).where(func.lower(Category.name) == n["category"].strip().lower()))).scalars().first()
+                if category is None:
+                    category = Category(name=n["category"].strip())
+                    db.add(category)
+                    await db.flush()
+            created_product = Product(
+                sku=v["sku"], name=n["name"], barcode=n.get("barcode"), uom=n.get("uom") or "EA",
+                selling_price=n["selling_price"], mrp=n.get("mrp") or n["selling_price"], tax_rate=n.get("tax_rate", 0),
+                hsn_code=n.get("hsn_code"), purchase_price=n.get("purchase_price", v.get("purchase_price") or 0),
+                brand=n.get("brand"), pack_size=n.get("pack_size", 1), category_id=category.id if category else None,
+            )
+            created_product.alt_barcodes = [ProductBarcode(barcode=c) for c in n.get("other_barcodes", []) if c != created_product.barcode]
+            db.add(created_product)
+            await db.flush()
+            product_id = created_product.id
+            products_created += 1
         warehouse_id = uuid.UUID(v["warehouse_id"]) if v.get("warehouse_id") else None
         if warehouse_id is None:
             await apply_movement(
@@ -476,10 +513,10 @@ async def commit_opening_stock_batch(db: AsyncSession, batch_id: uuid.UUID, curr
         action="import.committed",
         entity_type="import_batch",
         entity_id=batch.id,
-        new_value={"rows_applied": applied, "expiry_batches_created": batches_created},
+        new_value={"rows_applied": applied, "expiry_batches_created": batches_created, "products_created": products_created},
     )
     await db.commit()
-    return {"rows_applied": applied, "expiry_batches_created": batches_created}
+    return {"rows_applied": applied, "expiry_batches_created": batches_created, "products_created": products_created}
 
 
 async def stage_other_prices_file(db: AsyncSession, *, file_bytes: bytes, filename: str, uploaded_by: uuid.UUID) -> ImportBatch:
