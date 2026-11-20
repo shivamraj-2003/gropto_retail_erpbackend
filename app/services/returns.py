@@ -37,11 +37,48 @@ async def notify_requester(db: AsyncSession, *, ret: Return, decision: str) -> N
     await email_service.send_email(
         requester.email,
         f"Return {decision}",
-        f"<p>Your return request for sale {ret.sale_id} (₹{float(ret.refund_total):.2f}) was {decision}.</p>",
+        f"<p>Your return request for sale {ret.sale_id or '(no bill)'} (₹{float(ret.refund_total):.2f}) was {decision}.</p>",
     )
 
 
+async def create_no_bill_return(db: AsyncSession, *, current: CurrentUser, payload: ReturnCreate) -> Return:
+    """The customer has no bill and nothing on record. The refund cannot be proved from a sale, so it is worked out from the
+    product instead: at most the product's current selling price per unit (never the MRP), whatever the till types is capped at that,
+    and it always goes for approval unless a Super Admin or a manager with the override is the one returning it."""
+    from app.models.models import Product
+
+    if not payload.items:
+        raise HTTPException(status_code=400, detail="Add the items being returned")
+    if not (payload.reason or "").strip():
+        raise HTTPException(status_code=400, detail="Say why there is no bill (for the record)")
+    refund_total = 0.0
+    for item in payload.items:
+        product = await db.get(Product, item.product_id)
+        if product is None:
+            raise HTTPException(status_code=404, detail="Product not found")
+        if item.quantity <= 0:
+            raise HTTPException(status_code=400, detail="Quantity must be more than zero")
+        cap = round(float(product.selling_price) * item.quantity, 2)
+        if item.refund_amount > cap + REFUND_TOLERANCE:
+            raise HTTPException(status_code=400, detail=f"{product.name}: with no bill the refund cannot be more than ₹{cap:.2f} (the current selling price)")
+        refund_total += item.refund_amount
+    ret = Return(sale_id=None, no_bill=True, store_id=payload.store_id, requested_by=current.user_id, reason=payload.reason, refund_total=refund_total, is_exchange=payload.is_exchange, status="pending")
+    db.add(ret)
+    await db.flush()
+    for item in payload.items:
+        db.add(ReturnItem(return_id=ret.id, sale_item_id=None, product_id=item.product_id, quantity=item.quantity, disposition=item.disposition, refund_amount=item.refund_amount))
+    await db.flush()
+    if current.is_super_admin or current.has_permission("pos.shift.override"):
+        await finalize_return(db, ret)
+        await write_audit(db, user_id=current.user_id, role_code=current.role_code, store_id=payload.store_id, device_id=current.device_id, action="return.completed_no_bill", entity_type="return", entity_id=ret.id, new_value={"refund_total": refund_total, "reason": payload.reason})
+    else:
+        await submit_or_apply(db, current=current, request_type="return_approval", entity_type="return", entity_id=ret.id, old_value=None, new_value={"refund_total": refund_total, "no_bill": True}, reason=payload.reason, store_id=payload.store_id)
+    return ret
+
+
 async def create_return(db: AsyncSession, *, current: CurrentUser, payload: ReturnCreate) -> Return:
+    if payload.sale_id is None:
+        return await create_no_bill_return(db, current=current, payload=payload)
     sale = await db.get(Sale, payload.sale_id)
     if sale is None:
         raise HTTPException(status_code=404, detail="Original sale not found")

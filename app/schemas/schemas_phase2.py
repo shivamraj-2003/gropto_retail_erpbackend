@@ -9,7 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field
 # ---------------------------------------------------------------------------
 
 class ReturnItemIn(BaseModel):
-    sale_item_id: uuid.UUID
+    sale_item_id: uuid.UUID | None = None  # none for a return with no bill
     product_id: uuid.UUID
     quantity: float
     disposition: str  # saleable, damaged, vendor_return
@@ -17,7 +17,7 @@ class ReturnItemIn(BaseModel):
 
 
 class ReturnCreate(BaseModel):
-    sale_id: uuid.UUID
+    sale_id: uuid.UUID | None = None  # none = the customer has no bill: refund at the current selling price, with approval
     store_id: uuid.UUID
     reason: str | None = None
     is_exchange: bool = False
@@ -27,7 +27,8 @@ class ReturnCreate(BaseModel):
 class ReturnOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: uuid.UUID
-    sale_id: uuid.UUID
+    sale_id: uuid.UUID | None = None
+    no_bill: bool = False
     store_id: uuid.UUID
     refund_total: float
     status: str
@@ -114,6 +115,8 @@ class CustomerLookupOut(BaseModel):
     loyalty_balance_points: float
     loyalty_redeemable_value: float
     wallet_balance: float
+    credit_owed: float = 0  # what this customer owes on credit (udhaar), all stores together
+    credit_limit: float | None = None
 
 
 # ---------------------------------------------------------------------------

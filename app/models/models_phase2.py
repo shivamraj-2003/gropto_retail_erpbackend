@@ -309,7 +309,9 @@ class DayClose(Base):
 class Return(Base):
     __tablename__ = "returns"
     id: Mapped[uuid.UUID] = uuid_pk()
-    sale_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("sales.id"), nullable=False)
+    # empty for a return with no bill (the customer has no slip and no record): refunded at the current selling price, with approval
+    sale_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("sales.id"), nullable=True)
+    no_bill: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
     store_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("stores.id"), nullable=False)
     requested_by: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
     reason: Mapped[str | None] = mapped_column(Text)
@@ -329,7 +331,7 @@ class ReturnItem(Base):
     __tablename__ = "return_items"
     id: Mapped[uuid.UUID] = uuid_pk()
     return_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("returns.id", ondelete="CASCADE"))
-    sale_item_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("sale_items.id"), nullable=False)
+    sale_item_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("sale_items.id"), nullable=True)
     product_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("products.id"), nullable=False)
     quantity: Mapped[float] = mapped_column(Numeric(12, 3), nullable=False)
     disposition: Mapped[str] = mapped_column(String, nullable=False)  # saleable, damaged, vendor_return

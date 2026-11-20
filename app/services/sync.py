@@ -13,6 +13,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.models import Customer, Device, Payment, Role, Sale, SaleItem, Store, SyncFailure, User
+from app.models.models_credit import CreditEntry
 from app.models.models_paytm import PaytmPosPayment
 from app.models.models_phase2 import GiftVoucher
 from app.schemas.schemas import SaleIn, SyncItemVerdict
@@ -396,7 +397,12 @@ async def process_sale(db: AsyncSession, sale_in: SaleIn) -> SyncItemVerdict:
             # Point 4 audit fix: wallet and gift_voucher were listed as payment
             # modes but nothing actually debited the underlying balance — a
             # "wallet" payment used to just be a string with no money moved.
-            if payment.mode == "wallet":
+            if payment.mode == "credit":
+                if customer is None:
+                    raise ValueError("A bill on credit needs a customer (their mobile number)")
+                db.add(CreditEntry(customer_id=customer.id, store_id=sale_in.store_id, kind="sale", amount=payment.amount, sale_id=sale.id,
+                                   note=f"Bill {sale_in.bill_number} on credit", created_by=sale_in.cashier_id))
+            elif payment.mode == "wallet":
                 if customer is None:
                     raise ValueError("Wallet payment requires a customer")
                 try:

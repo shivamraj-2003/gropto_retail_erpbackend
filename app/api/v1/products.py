@@ -484,7 +484,7 @@ class PriceVariantRequest(BaseModel):
     mrp: float = Field(gt=0)
     selling_price: float = Field(gt=0)
     purchase_price: float | None = Field(default=None, ge=0)
-    label: str = "Old stock"
+    label: str | None = None  # not needed: a price is named by its MRP
     reason: str | None = None
     # How many units a store holds at this price (optional; can be set later too).
     store_id: uuid.UUID | None = None
@@ -522,9 +522,52 @@ async def add_other_price(
             "mrp": payload.mrp,
             "selling_price": payload.selling_price,
             **({"purchase_price": payload.purchase_price} if payload.purchase_price is not None else {}),
-            "label": payload.label.strip()[:40] or "Old stock",
+            "label": (payload.label or "").strip()[:40] or f"MRP {payload.mrp:g}",
             **({"store_id": str(payload.store_id), "quantity": payload.quantity} if payload.store_id and payload.quantity > 0 else {}),
         },
+        reason=payload.reason,
+        store_id=None,
+    )
+    await db.commit()
+    return {"approval_request_id": str(request.id), "status": request.status}
+
+
+class PriceVariantUpdate(BaseModel):
+    mrp: float | None = Field(default=None, gt=0)
+    selling_price: float | None = Field(default=None, gt=0)
+    purchase_price: float | None = Field(default=None, ge=0)
+    reason: str | None = None
+
+
+@router.patch("/{product_id}/other-prices/{variant_id}")
+async def update_other_price(
+    product_id: uuid.UUID,
+    variant_id: uuid.UUID,
+    payload: PriceVariantUpdate,
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(require_permission("pricing.price.update")),
+) -> dict:
+    """Change the MRP, selling price or cost of one of the product's other prices. Like any price change it goes through approval
+    (a Super Admin's applies at once)."""
+    product = await db.get(Product, product_id)
+    variant = next((v for v in (product.price_variants if product else []) if v.id == variant_id and v.is_active), None)
+    if product is None or variant is None:
+        raise HTTPException(status_code=404, detail="That price was not found")
+    changes = {k: v for k, v in payload.model_dump(exclude={"reason"}).items() if v is not None}
+    if not changes:
+        raise HTTPException(status_code=400, detail="Provide something to change")
+    new_mrp = changes.get("mrp", float(variant.mrp))
+    new_sell = changes.get("selling_price", float(variant.selling_price))
+    if new_sell > new_mrp:
+        raise HTTPException(status_code=400, detail="The selling price cannot be above the MRP")
+    request = await submit_or_apply(
+        db,
+        current=current,
+        request_type="price_variant_update",
+        entity_type="product",
+        entity_id=product_id,
+        old_value={"mrp": float(variant.mrp), "selling_price": float(variant.selling_price), "purchase_price": float(variant.purchase_price) if variant.purchase_price is not None else None},
+        new_value={"variant_id": str(variant_id), **changes},
         reason=payload.reason,
         store_id=None,
     )

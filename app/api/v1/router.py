@@ -38,6 +38,7 @@ from app.api.v1 import (
     purchases,
     reports,
     returns,
+    credit,
     sale_edits,
     stock_count,
     stores,
@@ -73,6 +74,7 @@ api_router.include_router(users.router)
 
 # Phase 2
 api_router.include_router(returns.router)
+api_router.include_router(credit.router)
 api_router.include_router(sale_edits.router)
 api_router.include_router(transfers.router)
 api_router.include_router(cash.router)

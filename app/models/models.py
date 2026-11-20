@@ -382,6 +382,8 @@ class Customer(Base):
     # path reports "no device token on file" rather than silently skipping.
     email: Mapped[str | None] = mapped_column(String)
     push_token: Mapped[str | None] = mapped_column(String)
+    # The most this customer may owe on credit (udhaar). Empty = no limit set.
+    credit_limit: Mapped[float | None] = mapped_column(Numeric(12, 2))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 

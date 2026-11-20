@@ -337,6 +337,28 @@ async def _handle_price_variant_add(db: AsyncSession, request: ApprovalRequest) 
     await bump_revision(db, product)
 
 
+@register_handler("price_variant_update")
+async def _handle_price_variant_update(db: AsyncSession, request: ApprovalRequest) -> None:
+    from app.models.models import ProductPriceVariant
+
+    product = await db.get(Product, request.entity_id)
+    value = request.new_value or {}
+    variant = await db.get(ProductPriceVariant, uuid.UUID(value["variant_id"])) if value.get("variant_id") else None
+    if product is None or variant is None or variant.product_id != product.id or not variant.is_active:
+        request.status = "stale"
+        return
+    if "mrp" in value:
+        variant.mrp = value["mrp"]
+        variant.label = f"MRP {float(value['mrp']):g}"  # a price is named by its MRP
+    if "selling_price" in value:
+        variant.selling_price = value["selling_price"]
+    if "purchase_price" in value:
+        variant.purchase_price = value["purchase_price"]
+    await db.flush()
+    await db.refresh(product, attribute_names=["price_variants"])
+    await bump_revision(db, product)
+
+
 @register_handler("price_variant_remove")
 async def _handle_price_variant_remove(db: AsyncSession, request: ApprovalRequest) -> None:
     from app.models.models import ProductPriceVariant

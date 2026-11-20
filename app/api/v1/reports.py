@@ -2,13 +2,13 @@ import io
 import uuid
 from datetime import date
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from openpyxl import Workbook
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import CurrentUser, require_permission
+from app.api.deps import CurrentUser, require_permission, require_store_access
 from app.core.database import get_reporting_db
 from app.models.models import AuditLog, InventoryBalance, LoyaltyLedger, Product, Sale
 from app.schemas.schemas import Page
@@ -449,6 +449,117 @@ async def stock_ledger_report(
     )
     await db.commit()
     return _workbook_response(wb, "stock_ledger.xlsx")
+
+
+_STOCK_GROUPS = {
+    "purchases": ("purchase_receipt", "grn_receipt", "opening_stock"),
+    "sales": ("sale", "online_sale"),
+    "sales_returns": ("return_to_saleable", "order_return_to_saleable"),
+    "transfers_in": ("transfer_in", "transfer_cancelled"),
+    "transfers_out": ("transfer_out",),
+}
+
+
+async def _stock_statement(db: AsyncSession, store_id: uuid.UUID, d1: date, d2: date) -> dict:
+    """Stock balance sheet of one store for a period, built from the stock ledger: opening + purchases + sales returns +
+    transfers in - sales - transfers out +/- adjustments = closing, for every product that moved or held stock. The closing
+    quantity is also checked against the balance the store holds today when the period runs to today."""
+    day = "timezone('Asia/Kolkata', im.created_at)::date"
+    named = [r for group in _STOCK_GROUPS.values() for r in group]
+    cols = ",\n".join(
+        f"coalesce(sum(im.delta) filter (where {day} between :d1 and :d2 and im.reason_code = any(:{name})), 0) as {name}"
+        for name in _STOCK_GROUPS
+    )
+    rows = (
+        await db.execute(
+            text(
+                f"""
+                select p.id::text as product_id, p.sku, p.name, p.uom, p.purchase_price,
+                       coalesce(sum(im.delta) filter (where {day} < :d1), 0) as opening,
+                       {cols},
+                       coalesce(sum(im.delta) filter (where {day} between :d1 and :d2 and not (im.reason_code = any(:named))), 0) as adjustments,
+                       coalesce(sum(im.delta) filter (where {day} <= :d2), 0) as closing,
+                       coalesce(ib.quantity, 0) as balance_today
+                from products p
+                join inventory_movements im on im.product_id = p.id and im.store_id = :store_id
+                left join inventory_balances ib on ib.product_id = p.id and ib.store_id = :store_id
+                group by p.id, p.sku, p.name, p.uom, p.purchase_price, ib.quantity
+                having coalesce(sum(im.delta) filter (where {day} <= :d2), 0) <> 0
+                    or bool_or({day} between :d1 and :d2)
+                order by p.name
+                """
+            ),
+            {"store_id": str(store_id), "d1": d1, "d2": d2, "named": named, **{k: list(v) for k, v in _STOCK_GROUPS.items()}},
+        )
+    ).mappings().all()
+    through_today = d2 >= date.today()
+    out, totals = [], {k: 0.0 for k in ("opening", "purchases", "sales_returns", "transfers_in", "sales", "transfers_out", "adjustments", "closing", "closing_value")}
+    for r in rows:
+        closing = float(r["closing"])
+        value = round(closing * float(r["purchase_price"] or 0), 2)
+        row = {
+            "product_id": r["product_id"], "sku": r["sku"], "name": r["name"], "uom": r["uom"], "cost": float(r["purchase_price"] or 0),
+            "opening": float(r["opening"]), "purchases": float(r["purchases"]), "sales_returns": float(r["sales_returns"]),
+            "transfers_in": float(r["transfers_in"]), "sales": float(r["sales"]), "transfers_out": float(r["transfers_out"]),
+            "adjustments": float(r["adjustments"]), "closing": closing, "closing_value": value,
+            # when the period runs to today the ledger's closing should equal what the store holds; a gap means stock that never went through the ledger
+            "balance_today": float(r["balance_today"]) if through_today else None,
+            "difference": round(float(r["balance_today"]) - closing, 3) if through_today else None,
+        }
+        for k in totals:
+            totals[k] += row[k]
+        out.append(row)
+    return {
+        "store_id": str(store_id), "from": d1.isoformat(), "to": d2.isoformat(), "rows": out,
+        "totals": {k: round(v, 3 if k != "closing_value" else 2) for k, v in totals.items()},
+        "out_of_balance": sum(1 for r in out if r["difference"] not in (None, 0)),
+        "note": "Valued at each product's current cost price. Sales and transfers out are shown as negative quantities.",
+    }
+
+
+def _stock_dates(date_from: date | None, date_to: date | None) -> tuple[date, date]:
+    d2 = date_to or date.today()
+    d1 = date_from or d2.replace(day=1)
+    if d1 > d2:
+        raise HTTPException(status_code=422, detail="The start date is after the end date")
+    return d1, d2
+
+
+@router.get("/stock-statement")
+async def stock_statement(
+    store_id: uuid.UUID,
+    date_from: date | None = None,
+    date_to: date | None = None,
+    db: AsyncSession = Depends(get_reporting_db),
+    current: CurrentUser = Depends(require_permission("reports.inventory.export")),
+) -> dict:
+    require_store_access(store_id, current)
+    d1, d2 = _stock_dates(date_from, date_to)
+    return await _stock_statement(db, store_id, d1, d2)
+
+
+@router.get("/stock-statement/export")
+async def stock_statement_export(
+    store_id: uuid.UUID,
+    date_from: date | None = None,
+    date_to: date | None = None,
+    db: AsyncSession = Depends(get_reporting_db),
+    current: CurrentUser = Depends(require_permission("reports.inventory.export")),
+) -> StreamingResponse:
+    require_store_access(store_id, current)
+    d1, d2 = _stock_dates(date_from, date_to)
+    data = await _stock_statement(db, store_id, d1, d2)
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Stock balance sheet"
+    ws.append(["SKU", "Product", "Unit", "Opening", "Purchases", "Sales returns", "Transfers in", "Sales", "Transfers out", "Adjustments", "Closing", "Cost", "Closing value", "Held today", "Difference"])
+    for r in data["rows"]:
+        ws.append([r["sku"], r["name"], r["uom"], r["opening"], r["purchases"], r["sales_returns"], r["transfers_in"], r["sales"], r["transfers_out"], r["adjustments"], r["closing"], r["cost"], r["closing_value"], r["balance_today"], r["difference"]])
+    t = data["totals"]
+    ws.append(["", "TOTAL", "", t["opening"], t["purchases"], t["sales_returns"], t["transfers_in"], t["sales"], t["transfers_out"], t["adjustments"], t["closing"], "", t["closing_value"], "", ""])
+    ws.append([])
+    ws.append([data["note"]])
+    return _workbook_response(wb, f"stock-balance-sheet-{d1}-{d2}.xlsx")
 
 
 @router.get("/transfer-ageing")

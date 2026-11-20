@@ -93,7 +93,7 @@ Deposit Slip (bank name, slip number, amount) and see the list of recorded slips
 spend (Capex / Opex breakdown). Payment Check compares what payment gateways report with the bills. Export for Accountant produces
 journal lines for a date range. Consolidated Company P&L (month to date) and a per-store breakdown sorted by net contribution.
 E-Invoice Status by Store and the E-Invoice Status Log show each bill's status (Not Applicable, Pending, Submitted, IRN Generated,
-Failed, Cancelled).""",
+Failed, Cancelled). On the GST Invoices tab, GST returns (working figures) shows GSTR-1 (B2B, B2C large and small, credit notes from returns, HSN summary, invoice numbers issued) and GSTR-3B (tax on sales, input tax credit from purchases, tax to pay after credit) for any month, with Download Excel; the accountant checks and files them, nothing is filed from the app. Cash purchases marked Without GST give no input credit, and tax on purchases from vendors with no GSTIN is listed as not claimed.""",
     ),
     (
         "Offers & Rewards",
@@ -200,7 +200,7 @@ For a long bill use Import Data > Purchase Bill: choose the vendor, bill number 
         "reports export download csv sales details hourly stock movement purchase prices mismatch transfers profit customer groups loyalty history store performance checklist",
         """Reports: choose a report from the tabs: Sales Details, Hourly Sales, Current Stock, Stock Movements, Purchase Prices, Goods Receipt
 Mismatches, Pending Transfers, Profit by Store, Profit Change Explained, Customer Groups, Loyalty Points History, Store Performance and
-Daily Checklist Report. Pick the dates and store, then view or export.""",
+Daily Checklist Report. At the top, the Stock balance sheet shows one store for a period: opening + purchases + returns + transfers in - sales - transfers out +/- adjustments = closing, with closing value and a check against what the store holds today; Download Excel is there too. Pick the dates and store, then view or export.""",
     ),
     (
         "Alerts & Overview",

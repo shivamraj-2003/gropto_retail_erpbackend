@@ -30,6 +30,11 @@ async def lookup_customer(
     config = await get_or_create_loyalty_config(db)
     loyalty_balance = await get_loyalty_balance(db, customer_id=customer.id)
     wallet_balance = await get_wallet_balance(db, customer_id=customer.id)
+    from sqlalchemy import func
+
+    from app.models.models_credit import CreditEntry
+
+    owed = await db.scalar(select(func.coalesce(func.sum(CreditEntry.amount), 0)).where(CreditEntry.customer_id == customer.id))
 
     return {
         "customer_id": customer.id,
@@ -40,4 +45,6 @@ async def lookup_customer(
         if loyalty_balance >= float(config.min_balance_to_redeem)
         else 0.0,
         "wallet_balance": wallet_balance,
+        "credit_owed": round(float(owed or 0), 2),
+        "credit_limit": float(customer.credit_limit) if customer.credit_limit is not None else None,
     }
