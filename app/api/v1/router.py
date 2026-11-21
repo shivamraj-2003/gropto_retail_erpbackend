@@ -6,6 +6,7 @@ from app.api.v1 import (
     audit,
     auth,
     cash,
+    cash_register,
     checklist,
     lookups,
     rbac,
@@ -78,6 +79,7 @@ api_router.include_router(credit.router)
 api_router.include_router(sale_edits.router)
 api_router.include_router(transfers.router)
 api_router.include_router(cash.router)
+api_router.include_router(cash_register.router)
 api_router.include_router(procurement.router)
 api_router.include_router(phase2_misc.router)
 api_router.include_router(stock_count.router)
