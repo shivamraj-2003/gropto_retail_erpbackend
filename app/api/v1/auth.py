@@ -617,6 +617,37 @@ async def list_devices(
     return Page(items=items, total=total, limit=capped_limit, offset=offset)
 
 
+class DeviceRename(BaseModel):
+    code: str = Field(min_length=2, max_length=12, pattern=r"^[A-Za-z0-9-]+$")
+
+
+@router.patch("/devices/{device_id}")
+async def rename_device(
+    device_id: uuid.UUID,
+    payload: DeviceRename,
+    current: CurrentUser = Depends(require_permission("device.terminal.create")),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Give a till its own counter name (POS-01, COUNTER-2 ...). It is what the billing screen shows as the Counter and what new bill
+    numbers are made from (STORECODE-COUNTER-000123); bills already made keep their numbers. The till picks the new name up the next
+    time it signs in."""
+    device = await db.get(Device, device_id)
+    if device is None:
+        raise HTTPException(status_code=404, detail="Till not found")
+    code = payload.code.upper()
+    taken = await db.scalar(select(Device.id).where(Device.store_id == device.store_id, Device.code == code, Device.id != device_id))
+    if taken is not None:
+        raise HTTPException(status_code=409, detail=f"Another till in this store is already called {code}")
+    old = device.code
+    device.code = code
+    await write_audit(
+        db, user_id=current.user_id, role_code=current.role_code, store_id=device.store_id, device_id=device_id,
+        action="device.renamed", entity_type="device", entity_id=device_id, old_value={"code": old}, new_value={"code": code},
+    )
+    await db.commit()
+    return {"id": str(device.id), "code": device.code}
+
+
 @router.post("/devices/{device_id}/revoke", status_code=204)
 async def revoke_device(
     device_id: uuid.UUID,

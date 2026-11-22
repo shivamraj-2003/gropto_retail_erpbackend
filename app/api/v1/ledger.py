@@ -237,7 +237,15 @@ async def ledger(
             })
             tot_dr += dr
             tot_cr += cr
-        return {"mode": "all", "rows": rows, "totals": {"debit": round(tot_dr, 2), "credit": round(tot_cr, 2)}}
+        # the same period month by month, all accounts together, for the chart
+        by_month: dict[tuple[int, int], list[float]] = {}
+        for key in book.days:
+            for day, (dr, cr) in split(key)[2].items():
+                cell = by_month.setdefault((day.year, day.month), [0.0, 0.0])
+                cell[0] += dr
+                cell[1] += cr
+        months = [{"label": f"{MONTHS[m][:3]} {y}", "debit": round(v[0], 2), "credit": round(v[1], 2)} for (y, m), v in sorted(by_month.items())]
+        return {"mode": "all", "rows": rows, "months": months, "totals": {"debit": round(tot_dr, 2), "credit": round(tot_cr, 2)}}
 
     if account not in book.days:
         return {"mode": "account", "account": {"key": account, "name": book.names.get(account, (account, ""))[0]}, "opening": _signed(0, 0), "rows": [], "totals": {"debit": 0, "credit": 0}}
