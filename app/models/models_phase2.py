@@ -322,6 +322,9 @@ class Return(Base):
     # as a Return flagged as an exchange, linked to the replacement Sale once
     # it's billed (exchange_sale_id set after the fact via /returns/{id}/link-exchange).
     is_exchange: Mapped[bool] = mapped_column(Boolean, default=False)
+    # how the customer was refunded: cash comes out of the till's drawer (a cash-out on the open shift), upi/card are paid back to them
+    refund_mode: Mapped[str] = mapped_column(String, default="cash", server_default="cash")
+    device_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("devices.id"))
     exchange_sale_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("sales.id"))
 
     items: Mapped[list["ReturnItem"]] = relationship(cascade="all, delete-orphan", lazy="selectin")

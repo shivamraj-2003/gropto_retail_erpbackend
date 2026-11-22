@@ -17,6 +17,8 @@ from app.api.v1 import (
     dashboard,
     enterprise,
     finance_advanced,
+    ledger,
+    finance_vouchers,
     gift_vouchers,
     gst,
     hr,
@@ -98,6 +100,8 @@ api_router.include_router(procurement_advanced.router)
 api_router.include_router(inventory_intelligence.router)
 api_router.include_router(promotions.router)
 api_router.include_router(finance_advanced.router)
+api_router.include_router(ledger.router)
+api_router.include_router(finance_vouchers.router)
 api_router.include_router(gst.router)
 api_router.include_router(crm_advanced.router)
 api_router.include_router(hr_advanced.router)

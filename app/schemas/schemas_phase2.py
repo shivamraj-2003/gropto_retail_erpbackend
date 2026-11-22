@@ -21,6 +21,7 @@ class ReturnCreate(BaseModel):
     store_id: uuid.UUID
     reason: str | None = None
     is_exchange: bool = False
+    refund_mode: str = "cash"  # cash, upi or card
     items: list[ReturnItemIn]
 
 
@@ -33,6 +34,7 @@ class ReturnOut(BaseModel):
     refund_total: float
     status: str
     is_exchange: bool
+    refund_mode: str = "cash"
     exchange_sale_id: uuid.UUID | None
     created_at: datetime
 

@@ -12,7 +12,10 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser
-from app.models.models import InventoryBalance, PriceVariantStock, Product, Purchase, PurchaseItem
+from datetime import date, timedelta
+
+from app.models.models import InventoryBalance, PriceVariantStock, Product, Purchase, PurchaseItem, Vendor
+from app.models.models_phase2 import Payable
 from app.models.models_phase4 import InventoryBatch
 from app.schemas.schemas import PurchaseCreate
 from app.services.approvals import submit_or_apply
@@ -77,6 +80,16 @@ async def record_purchase(db: AsyncSession, payload: PurchaseCreate, current: Cu
     )
     db.add(purchase)
     await db.flush()
+    # What the shop owes the vendor for this bill, due after the vendor's credit days. Finance lists it under Payables, and a payment
+    # recorded there is what the ledger shows as paid.
+    vendor = await db.get(Vendor, payload.vendor_id)
+    start = payload.invoice_date or date.today()
+    db.add(
+        Payable(
+            vendor_id=payload.vendor_id, purchase_id=purchase.id, original_amount=total, amount_due=total,
+            due_date=start + timedelta(days=int(vendor.credit_days or 0) if vendor else 0), status="outstanding",
+        )
+    )
 
     notes: list[str] = []
     await _apply_price_actions(db, rows, payload, current, notes)

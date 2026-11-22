@@ -41,6 +41,13 @@ async def notify_requester(db: AsyncSession, *, ret: Return, decision: str) -> N
     )
 
 
+def _mode(payload: ReturnCreate) -> str:
+    mode = (payload.refund_mode or "cash").lower()
+    if mode not in ("cash", "upi", "card"):
+        raise HTTPException(status_code=422, detail="Refund by cash, UPI or card")
+    return mode
+
+
 async def create_no_bill_return(db: AsyncSession, *, current: CurrentUser, payload: ReturnCreate) -> Return:
     """The customer has no bill and nothing on record. The refund cannot be proved from a sale, so it is worked out from the
     product instead: at most the product's current selling price per unit (never the MRP), whatever the till types is capped at that,
@@ -62,7 +69,7 @@ async def create_no_bill_return(db: AsyncSession, *, current: CurrentUser, paylo
         if item.refund_amount > cap + REFUND_TOLERANCE:
             raise HTTPException(status_code=400, detail=f"{product.name}: with no bill the refund cannot be more than ₹{cap:.2f} (the current selling price)")
         refund_total += item.refund_amount
-    ret = Return(sale_id=None, no_bill=True, store_id=payload.store_id, requested_by=current.user_id, reason=payload.reason, refund_total=refund_total, is_exchange=payload.is_exchange, status="pending")
+    ret = Return(sale_id=None, no_bill=True, store_id=payload.store_id, requested_by=current.user_id, reason=payload.reason, refund_total=refund_total, is_exchange=payload.is_exchange, refund_mode=_mode(payload), device_id=current.device_id, status="pending")
     db.add(ret)
     await db.flush()
     for item in payload.items:
@@ -152,6 +159,8 @@ async def create_return(db: AsyncSession, *, current: CurrentUser, payload: Retu
         reason=payload.reason,
         refund_total=refund_total,
         is_exchange=payload.is_exchange,
+        refund_mode=_mode(payload),
+        device_id=current.device_id,
         status="pending",
     )
     db.add(ret)
@@ -235,6 +244,14 @@ async def finalize_return(db: AsyncSession, ret: Return) -> None:
         # vendor_return: genuinely leaves the store's books (goes back to the
         # vendor) — correctly not credited to any local balance.
     ret.status = "completed"
+    # A cash refund leaves the drawer: it is a cash-out on the till's open shift, so the shift count and the day's cash still agree
+    if ret.refund_mode == "cash" and float(ret.refund_total) > 0:
+        from app.models.models_phase2 import CashierShift, CashMovement
+
+        open_shifts = (await db.execute(select(CashierShift).where(CashierShift.store_id == ret.store_id, CashierShift.status == "open"))).scalars().all()
+        shift = next((x for x in open_shifts if x.device_id == ret.device_id), open_shifts[0] if open_shifts else None)
+        if shift is not None:
+            db.add(CashMovement(shift_id=shift.id, direction="out", amount=float(ret.refund_total), reason=f"Refund on return {str(ret.id)[:8]}"))
 
     # Point 9 audit fix: a return previously left the loyalty points earned
     # (and any points redeemed to pay for the bill) untouched — a customer

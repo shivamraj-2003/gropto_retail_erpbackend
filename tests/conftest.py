@@ -19,10 +19,12 @@ activation, logins here will fail with 403 "Invalid activation code" —
 activate it once via the app or `POST /auth/devices/register` first.
 """
 
+import os
 import socket
 import subprocess
 import sys
 import time
+from urllib.parse import urlparse
 
 import httpx
 import pytest
@@ -137,3 +139,27 @@ async def cashier_token(client: httpx.AsyncClient) -> str:
 
 def auth_headers(token: str) -> dict:
     return {"Authorization": f"Bearer {token}"}
+
+
+def pytest_collection_modifyitems(config, items):  # noqa: D401
+    """The integration tests create real bills, purchases and users. Run against a shared or production database they leave test
+    data in the books (it happened: PYTEST-... bills in the pilot store). So they only run against a local database (or CI's own),
+    unless ALLOW_TESTS_ON_REMOTE_DB=1 is set on purpose."""
+    import pytest
+
+    url = os.environ.get("DATABASE_URL", "")
+    if not url:
+        try:
+            from app.core.config import settings
+
+            url = settings.database_url
+        except Exception:  # noqa: BLE001
+            url = ""
+    host = (urlparse(url.replace("+asyncpg", "")).hostname or "").lower()
+    local = host in ("", "localhost", "127.0.0.1", "::1", "postgres", "db")
+    if local or os.environ.get("ALLOW_TESTS_ON_REMOTE_DB") == "1":
+        return
+    skip = pytest.mark.skip(reason=f"DATABASE_URL points at a remote database ({host}); set ALLOW_TESTS_ON_REMOTE_DB=1 to run these on purpose")
+    for item in items:
+        if "unit" not in item.nodeid and not item.nodeid.split("::")[0].endswith(("_unit.py", "test_paytm_pos.py", "test_price_stock.py", "test_purchase_bill.py", "test_transfer_math.py", "test_vendor_ids.py", "test_rbac_unit.py", "test_kv_unit.py")):
+            item.add_marker(skip)
