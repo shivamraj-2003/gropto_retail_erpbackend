@@ -268,3 +268,84 @@ async def ledger(
         "opening": _signed(b_dr, b_cr), "rows": rows,
         "totals": {"debit": round(sum(r["debit"] for r in rows), 2), "credit": round(sum(r["credit"] for r in rows), 2)},
     }
+
+
+@router.get("/purchases")
+async def purchase_register(
+    store_id: uuid.UUID,
+    date_from: date,
+    date_to: date,
+    vendor_id: uuid.UUID | None = None,
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(require_permission("finance.pnl.view")),
+) -> dict:
+    """Every purchase bill posted for the store in the period: party by party (how many bills, how much, what is paid and what is
+    still owed), the bills themselves, and the tax by GST rate. Added up from the same purchase tables the ledger uses."""
+    require_store_access(store_id, current)
+    if date_to < date_from:
+        raise HTTPException(status_code=422, detail="The end date is before the start date")
+    day = f"coalesce(pu.invoice_date, {IST_DAY.format(col='pu.created_at')})"
+    params = {"sid": store_id, "d1": date_from, "d2": date_to, "vid": vendor_id}
+    bills = (
+        await db.execute(
+            text(
+                f"""select pu.id, pu.vendor_id, v.name, v.gst_number, pu.invoice_number, {day} d, pu.without_gst,
+                           count(pi.id) lines,
+                           coalesce(sum(pi.unit_cost * pi.quantity - coalesce(pi.discount_amount,0)),0) taxable,
+                           coalesce(sum(coalesce(pi.gst_amount,0)),0) gst,
+                           coalesce(sum(coalesce(pi.cess_amount,0)),0) cess,
+                           coalesce(sum(coalesce(pi.surcharge_amount,0)),0) surcharge,
+                           pu.total_amount,
+                           (select coalesce(sum(vp.amount),0) from vendor_payments vp join payables pa on pa.id = vp.payable_id
+                              where pa.purchase_id = pu.id and vp.status = 'applied') paid
+                    from purchases pu join vendors v on v.id = pu.vendor_id left join purchase_items pi on pi.purchase_id = pu.id
+                    where pu.store_id = :sid and {day} between :d1 and :d2 and (cast(:vid as uuid) is null or pu.vendor_id = cast(:vid as uuid))
+                    group by pu.id, v.name, v.gst_number order by d desc, pu.created_at desc limit 1000"""
+            ),
+            params,
+        )
+    ).all()
+    slabs = (
+        await db.execute(
+            text(
+                f"""select coalesce(pi.gst_rate, 0) r,
+                           coalesce(sum(pi.unit_cost * pi.quantity - coalesce(pi.discount_amount,0)),0) taxable,
+                           coalesce(sum(coalesce(pi.gst_amount,0)),0) gst, coalesce(sum(coalesce(pi.cess_amount,0)),0) cess
+                    from purchase_items pi join purchases pu on pu.id = pi.purchase_id
+                    where pu.store_id = :sid and {day} between :d1 and :d2 and (cast(:vid as uuid) is null or pu.vendor_id = cast(:vid as uuid))
+                    group by 1 order by 1"""
+            ),
+            params,
+        )
+    ).all()
+
+    out_bills, parties = [], {}
+    for b in bills:
+        total, paid = float(b.total_amount or 0), float(b.paid or 0)
+        due = round(max(total - paid, 0), 2)
+        out_bills.append({
+            "id": str(b.id), "vendor_id": str(b.vendor_id), "vendor": b.name, "invoice_number": b.invoice_number, "date": b.d.isoformat() if b.d else None,
+            "without_gst": bool(b.without_gst), "lines": b.lines, "taxable": round(float(b.taxable), 2), "gst": round(float(b.gst), 2),
+            "cess": round(float(b.cess), 2), "surcharge": round(float(b.surcharge), 2), "total": round(total, 2), "paid": round(paid, 2), "due": due,
+            "status": "paid" if due <= 0.005 else ("part paid" if paid > 0 else "unpaid"),
+        })
+        p = parties.setdefault(str(b.vendor_id), {"vendor_id": str(b.vendor_id), "name": b.name, "gst_number": b.gst_number, "bills": 0, "taxable": 0.0, "gst": 0.0, "total": 0.0, "paid": 0.0, "due": 0.0, "last_date": None})
+        p["bills"] += 1
+        p["taxable"] += float(b.taxable)
+        p["gst"] += float(b.gst)
+        p["total"] += total
+        p["paid"] += paid
+        p["due"] += due
+        if b.d and (p["last_date"] is None or b.d.isoformat() > p["last_date"]):
+            p["last_date"] = b.d.isoformat()
+    party_list = sorted(({**p, **{k: round(p[k], 2) for k in ("taxable", "gst", "total", "paid", "due")}} for p in parties.values()), key=lambda p: -p["total"])
+    return {
+        "bills": out_bills,
+        "parties": party_list,
+        "slabs": [{"rate": float(s.r), "taxable": round(float(s.taxable), 2), "gst": round(float(s.gst), 2), "cess": round(float(s.cess), 2)} for s in slabs],
+        "totals": {
+            "bills": len(out_bills), "parties": len(party_list),
+            "taxable": round(sum(p["taxable"] for p in party_list), 2), "gst": round(sum(p["gst"] for p in party_list), 2),
+            "total": round(sum(p["total"] for p in party_list), 2), "paid": round(sum(p["paid"] for p in party_list), 2), "due": round(sum(p["due"] for p in party_list), 2),
+        },
+    }
