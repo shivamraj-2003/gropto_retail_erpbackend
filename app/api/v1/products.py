@@ -261,8 +261,16 @@ def _check_numbers(**values: float | None) -> None:
 
 
 async def _assert_unique(
-    db: AsyncSession, *, sku: str | None, barcodes: list[str], except_id: uuid.UUID | None = None
+    db: AsyncSession, *, sku: str | None, barcodes: list[str], item_code: int | None = None, except_id: uuid.UUID | None = None
 ) -> None:
+    if item_code is not None:
+        taken = (await db.execute(select(Product.id, Product.name).where(Product.item_code == item_code))).first()
+        if taken is not None and taken.id != except_id:
+            raise HTTPException(status_code=409, detail=f"Item code {item_code} is already used by {taken.name}")
+        # typed into a search box, the same digits must not also be some other product's barcode
+        owner = await barcode_owner(db, str(item_code))
+        if owner is not None and owner != except_id:
+            raise HTTPException(status_code=409, detail=f"Item code {item_code} is another product's barcode")
     if sku:
         clash = (await db.execute(select(Product.id).where(Product.sku == sku))).scalar_one_or_none()
         if clash is not None and clash != except_id:
@@ -290,7 +298,7 @@ async def create_product(
         data["mrp"] = data["selling_price"]
     elif data["mrp"] < data["selling_price"]:
         raise HTTPException(status_code=400, detail="MRP cannot be lower than the selling price")
-    await _assert_unique(db, sku=data["sku"], barcodes=([data["barcode"]] if data["barcode"] else []) + extras)
+    await _assert_unique(db, sku=data["sku"], barcodes=([data["barcode"]] if data["barcode"] else []) + extras, item_code=data["item_code"])
     seen_prices = {(float(data["mrp"]), float(data["selling_price"]))}
     variants: list[ProductPriceVariant] = []
     for extra in payload.other_prices:
@@ -318,7 +326,7 @@ async def create_product(
         action="product.created",
         entity_type="product",
         entity_id=product.id,
-        new_value=payload.model_dump(mode="json"),
+        new_value={**payload.model_dump(mode="json"), "item_code": product.item_code},
     )
     await db.commit()
     await db.refresh(product)
@@ -353,8 +361,10 @@ async def update_product(
         changes["barcode"] = new_main
     if changes.get("uom") is None and "uom" in changes:
         changes.pop("uom")
+    if "item_code" in changes and changes["item_code"] in (None, product.item_code):
+        changes.pop("item_code")
     _check_numbers(purchase_price=changes.get("purchase_price"), pack_size=changes.get("pack_size"), tax_rate=changes.get("tax_rate"))
-    await _assert_unique(db, sku=None, barcodes=([new_main] if new_main else []) + new_extras, except_id=product_id)
+    await _assert_unique(db, sku=None, barcodes=([new_main] if new_main else []) + new_extras, item_code=changes.get("item_code"), except_id=product_id)
     old = {k: _plain(getattr(product, k)) for k in changes}
     old_extras = [b.barcode for b in product.alt_barcodes]
     for key, value in changes.items():

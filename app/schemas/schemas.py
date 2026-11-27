@@ -279,6 +279,8 @@ class OtherPriceIn(BaseModel):
 
 class ProductCreate(BaseModel):
     sku: str
+    # The short number staff type to find the product. Left out, the next free number is given.
+    item_code: int | None = Field(default=None, ge=1, le=999_999_999_999)
     barcode: str | None = None
     name: str
     category_id: uuid.UUID | None = None
@@ -299,6 +301,8 @@ class ProductUpdate(BaseModel):
     """Everything about a product except its selling price and MRP (those go through a price change)."""
 
     name: str | None = None
+    # Left out (or null), the product keeps the code it has.
+    item_code: int | None = Field(default=None, ge=1, le=999_999_999_999)
     barcode: str | None = None
     uom: str | None = None
     pack_size: float | None = None

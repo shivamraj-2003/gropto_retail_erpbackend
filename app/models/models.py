@@ -15,7 +15,9 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    event,
     func,
+    select,
     text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
@@ -288,7 +290,7 @@ class Product(Base):
     __tablename__ = "products"
     id: Mapped[uuid.UUID] = uuid_pk()
     sku: Mapped[str] = mapped_column(String, unique=True, nullable=False)
-    # A short number staff can type to find the item (given by the database, from 100001).
+    # A short number staff can type to find the item: typed on the product form, else the next free one (from 100001).
     item_code: Mapped[int] = mapped_column(BigInteger, server_default=text("nextval('product_item_code_seq')"), unique=True, nullable=False)
     barcode: Mapped[str | None] = mapped_column(String, unique=True)
     name: Mapped[str] = mapped_column(String, nullable=False)
@@ -317,6 +319,18 @@ class Product(Base):
     price_variants: Mapped[list["ProductPriceVariant"]] = relationship(
         lazy="selectin", cascade="all, delete-orphan", order_by="ProductPriceVariant.created_at"
     )
+
+
+@event.listens_for(Product, "before_insert")
+def _give_free_item_code(_mapper, connection, product: Product) -> None:
+    """A product saved without a code gets the next number of the sequence that nobody has typed in by hand."""
+    if product.item_code is not None:
+        return
+    while True:
+        number = connection.execute(select(product_item_code_seq.next_value())).scalar_one()
+        if connection.execute(select(Product.id).where(Product.item_code == number)).first() is None:
+            product.item_code = number
+            return
 
 
 class ProductPriceVariant(Base):
