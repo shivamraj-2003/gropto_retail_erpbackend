@@ -40,6 +40,7 @@ class Book:
     def __init__(self) -> None:
         self.days: dict[str, dict[date, list[float]]] = {}
         self.names: dict[str, tuple[str, str]] = dict(FIXED)
+        self.heads: dict[str, str] = {}  # the head chosen in a voucher for a shop-named account
 
     def post(self, key: str, day: date, debit: float = 0.0, credit: float = 0.0, name: str | None = None, group: str | None = None) -> None:
         if not (debit or credit):
@@ -121,11 +122,11 @@ async def build_book(db: AsyncSession, *, store_id: uuid.UUID, warehouse: bool, 
             book.post(mode if mode in ("cash", "upi", "card") else "cash", day, credit=amount)  # the refund goes out the way it was paid back
 
         # manual vouchers: what has no bill (money paid from the pocket, a bank charge) and the balances brought forward
-        for v_day, v_main, v_main_name, v_type, v_dc, v_key, v_name, v_amt in (
+        for v_day, v_main, v_main_name, v_type, v_dc, v_key, v_name, v_amt, v_group in (
             await rows(
-                """select v.voucher_date, v.main_account, v.main_account_name, v.voucher_type, l.dc, l.account_key, l.account_name, l.amount
+                """select v.voucher_date, v.main_account, v.main_account_name, v.voucher_type, l.dc, l.account_key, l.account_name, l.amount, l.account_group
                    from finance_vouchers v join finance_voucher_lines l on l.voucher_id = v.id
-                   where v.store_id = :sid and v.voucher_date <= :upto"""
+                   where v.store_id = :sid and v.voucher_date <= :upto order by v.created_at"""
             )
         ).all():
             def acct(key: str, name: str) -> tuple[str, str | None, str | None]:
@@ -135,6 +136,8 @@ async def build_book(db: AsyncSession, *, store_id: uuid.UUID, warehouse: bool, 
                     return key, name, "Vendors" if key.startswith("vendor:") else "Expenses"
                 return key, name, "Other accounts"
             k, nm, grp = acct(v_key, v_name)
+            if v_group:
+                book.heads[k] = v_group  # the latest choice wins
             book.post(k, v_day, debit=float(v_amt) if v_dc == "D" else 0, credit=float(v_amt) if v_dc == "C" else 0, name=nm, group=grp)
             if v_main:  # the cash or bank side of a receipt, payment or contra
                 mk, mnm, mgrp = acct(v_main, v_main_name or v_main)
@@ -348,4 +351,88 @@ async def purchase_register(
             "taxable": round(sum(p["taxable"] for p in party_list), 2), "gst": round(sum(p["gst"] for p in party_list), 2),
             "total": round(sum(p["total"] for p in party_list), 2), "paid": round(sum(p["paid"] for p in party_list), 2), "due": round(sum(p["due"] for p in party_list), 2),
         },
+    }
+
+
+@router.get("/party-statement")
+async def party_statement(
+    store_id: uuid.UUID,
+    vendor_id: uuid.UUID,
+    date_from: date,
+    date_to: date,
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(require_permission("finance.pnl.view")),
+) -> dict:
+    """One vendor's account for the store: every purchase bill (credit) and payment (debit) with the running balance, and the totals
+    month by month. A positive balance is what the shop owes."""
+    require_store_access(store_id, current)
+    if date_to < date_from:
+        raise HTTPException(status_code=422, detail="The end date is before the start date")
+    p = {"sid": store_id, "vid": vendor_id, "key": f"vendor:{vendor_id}", "upto": date_to}
+    pur_day = f"coalesce(pu.invoice_date, {IST_DAY.format(col='pu.created_at')})"
+    entries: list[dict] = []
+    for r in (
+        await db.execute(
+            text(
+                f"""select pu.id, {pur_day} d, pu.invoice_number, pu.without_gst,
+                           coalesce(sum(coalesce(pi.net_amount, pi.unit_cost * pi.quantity - coalesce(pi.discount_amount,0))),0) amount, count(pi.id) lines
+                    from purchases pu join purchase_items pi on pi.purchase_id = pu.id
+                    where pu.store_id = :sid and pu.vendor_id = :vid and pi.warehouse_id is null and {pur_day} <= :upto
+                    group by pu.id order by 2, pu.created_at"""
+            ),
+            p,
+        )
+    ).all():
+        entries.append({"date": r.d, "type": "Purchase", "ref": r.invoice_number or "no bill number", "detail": f"{r.lines} item(s)" + (", cash purchase" if r.without_gst else ""),
+                        "purchase_id": str(r.id), "debit": 0.0, "credit": round(float(r.amount), 2)})
+    pay_day = IST_DAY.format(col="vp.created_at")
+    for r in (
+        await db.execute(
+            text(
+                f"""select {pay_day} d, vp.amount, vp.reference, pu.invoice_number
+                    from vendor_payments vp join payables pa on pa.id = vp.payable_id join purchases pu on pu.id = pa.purchase_id
+                    where pu.store_id = :sid and pa.vendor_id = :vid and vp.status = 'applied' and {pay_day} <= :upto"""
+            ),
+            p,
+        )
+    ).all():
+        entries.append({"date": r.d, "type": "Payment", "ref": r.reference or "payment", "detail": f"against bill {r.invoice_number or '-'}",
+                        "purchase_id": None, "debit": round(float(r.amount), 2), "credit": 0.0})
+    for r in (
+        await db.execute(
+            text(
+                """select v.voucher_date d, v.voucher_no, v.voucher_type, v.narration, l.dc, l.amount
+                   from finance_vouchers v join finance_voucher_lines l on l.voucher_id = v.id
+                   where v.store_id = :sid and l.account_key = :key and v.voucher_date <= :upto"""
+            ),
+            p,
+        )
+    ).all():
+        entries.append({"date": r.d, "type": "Voucher", "ref": r.voucher_no, "detail": r.narration or r.voucher_type.title(), "purchase_id": None,
+                        "debit": round(float(r.amount), 2) if r.dc == "D" else 0.0, "credit": round(float(r.amount), 2) if r.dc == "C" else 0.0})
+    entries.sort(key=lambda e: (e["date"], 0 if e["type"] == "Purchase" else 1))
+
+    balance = 0.0
+    opening = 0.0
+    shown: list[dict] = []
+    months: dict[str, dict] = {}
+    for e in entries:
+        balance = round(balance + e["credit"] - e["debit"], 2)
+        if e["date"] < date_from:
+            opening = balance
+            continue
+        shown.append({**e, "date": e["date"].isoformat(), "balance": balance})
+        key = f"{MONTHS[e['date'].month]} {e['date'].year}"
+        m = months.setdefault(key, {"month": key, "bills": 0, "purchase": 0.0, "paid": 0.0, "balance": 0.0})
+        m["bills"] += 1 if e["type"] == "Purchase" else 0
+        m["purchase"] = round(m["purchase"] + e["credit"], 2)
+        m["paid"] = round(m["paid"] + e["debit"], 2)
+        m["balance"] = balance
+    return {
+        "opening": opening,
+        "closing": balance,
+        "purchase": round(sum(e["credit"] for e in shown), 2),
+        "paid": round(sum(e["debit"] for e in shown), 2),
+        "months": list(months.values()),
+        "entries": shown,
     }

@@ -5,7 +5,7 @@ from datetime import date, datetime, time, timezone
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from openpyxl import Workbook
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import String, and_, cast, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser, require_permission, require_store_access, require_warehouse_access
@@ -179,7 +179,7 @@ def _filtered(
         by_product = select(TransferItem.transfer_id).join(Product, Product.id == TransferItem.product_id).where(
             or_(
                 Product.name.ilike(like),
-                Product.sku.ilike(like),
+                Product.sku.ilike(like), cast(Product.item_code, String).ilike(like),
                 Product.barcode.ilike(like),
                 Product.hsn_code.ilike(like),
                 Product.id.in_(select(ProductBarcode.product_id).where(ProductBarcode.barcode.ilike(like))),
@@ -294,7 +294,7 @@ async def source_stock(
         stmt = stmt.where(
             or_(
                 Product.name.ilike(like),
-                Product.sku.ilike(like),
+                Product.sku.ilike(like), cast(Product.item_code, String).ilike(like),
                 Product.brand.ilike(like),
                 Product.barcode.ilike(like),
                 Product.hsn_code.ilike(like),

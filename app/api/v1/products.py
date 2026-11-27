@@ -5,7 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from openpyxl import Workbook
-from sqlalchemy import func, or_, select
+from sqlalchemy import String, cast, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser, require_permission, require_store_access
@@ -30,6 +30,7 @@ def _filtered(stmt, q: str | None, active_only: bool, missing: str | None):
             or_(
                 Product.name.ilike(like),
                 Product.sku.ilike(like),
+                cast(Product.item_code, String).ilike(like),
                 Product.barcode.ilike(like),
                 Product.brand.ilike(like),
                 Product.hsn_code.ilike(like),

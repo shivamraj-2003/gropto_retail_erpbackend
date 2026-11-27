@@ -2,7 +2,7 @@ import uuid
 from datetime import date
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import func, or_, select, text
+from sqlalchemy import String, cast, func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser, require_any_permission, require_permission, require_store_access, require_warehouse_access
@@ -66,7 +66,7 @@ async def warehouse_stock(
         like = f"%{q.strip()}%"
         base = base.where(
             or_(
-                Product.name.ilike(like), Product.sku.ilike(like), Product.brand.ilike(like), Product.barcode.ilike(like),
+                Product.name.ilike(like), Product.sku.ilike(like), cast(Product.item_code, String).ilike(like), Product.brand.ilike(like), Product.barcode.ilike(like),
                 Product.hsn_code.ilike(like),
                 Product.id.in_(select(ProductBarcode.product_id).where(ProductBarcode.barcode.ilike(like))),
             )

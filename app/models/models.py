@@ -2,6 +2,7 @@ import uuid
 from datetime import date, datetime
 
 from sqlalchemy import (
+    BigInteger,
     ARRAY,
     Boolean,
     Date,
@@ -25,6 +26,7 @@ from app.core.database import Base
 # Shared across products/categories/discount_rules so a device can pull every
 # master-data table against a single watermark during sync.
 global_revision_seq = Sequence("global_revision_seq")
+product_item_code_seq = Sequence("product_item_code_seq", start=100001, metadata=Base.metadata)
 
 
 def uuid_pk() -> Mapped[uuid.UUID]:
@@ -286,6 +288,8 @@ class Product(Base):
     __tablename__ = "products"
     id: Mapped[uuid.UUID] = uuid_pk()
     sku: Mapped[str] = mapped_column(String, unique=True, nullable=False)
+    # A short number staff can type to find the item (given by the database, from 100001).
+    item_code: Mapped[int] = mapped_column(BigInteger, server_default=text("nextval('product_item_code_seq')"), unique=True, nullable=False)
     barcode: Mapped[str | None] = mapped_column(String, unique=True)
     name: Mapped[str] = mapped_column(String, nullable=False)
     category_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("categories.id"))

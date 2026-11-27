@@ -236,6 +236,7 @@ class ProductOut(BaseModel):
     id: uuid.UUID
     store_quantity: float | None = None
     sku: str
+    item_code: int | None = None
     barcode: str | None
     name: str
     category_id: uuid.UUID | None

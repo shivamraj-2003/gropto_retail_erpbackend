@@ -17,6 +17,7 @@ router = APIRouter(prefix="/finance-advanced/vouchers", tags=["finance-vouchers"
 
 TYPES = ("CASH RECEIPT", "CASH PAYMENT", "BANK RECEIPT", "BANK PAYMENT", "CONTRA", "JOURNAL", "OPENING")
 PREFIX = {"CASH RECEIPT": "CR", "CASH PAYMENT": "CP", "BANK RECEIPT": "BR", "BANK PAYMENT": "BP", "CONTRA": "CV", "JOURNAL": "JV", "OPENING": "OB"}
+HEADS = ("capital", "current_assets", "current_liabilities", "fixed", "investment", "loan", "misc", "suspense", "income", "direct", "indirect")
 FIXED_KEYS = {"cash", "bank", "upi", "card", "other_tender", "udhaar", "sales", "gst_out", "returns", "purchases", "gst_in"}
 
 
@@ -24,6 +25,7 @@ class LineIn(BaseModel):
     dc: str = "D"  # D or C (receipts and payments decide it themselves)
     account: str = Field(min_length=1)  # a ledger account key, or a new account's name
     account_name: str | None = None
+    account_group: str | None = None  # the head of a shop-named account, see HEADS
     amount: float = Field(gt=0)
     mode_type: str | None = None
     mode_no: str | None = None
@@ -102,7 +104,7 @@ async def create_voucher(
     )
     for dc, key, name, ln in lines:
         voucher.lines.append(
-            FinanceVoucherLine(dc=dc, account_key=key, account_name=name, amount=ln.amount, mode_type=ln.mode_type, mode_no=ln.mode_no, mode_date=ln.mode_date)
+            FinanceVoucherLine(dc=dc, account_key=key, account_group=(ln.account_group if ln.account_group in HEADS and key.startswith("custom:") else None), account_name=name, amount=ln.amount, mode_type=ln.mode_type, mode_no=ln.mode_no, mode_date=ln.mode_date)
         )
     db.add(voucher)
     await db.flush()

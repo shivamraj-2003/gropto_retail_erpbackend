@@ -38,6 +38,8 @@ class FinanceVoucherLine(Base):
     dc: Mapped[str] = mapped_column(String, nullable=False)  # D or C
     account_key: Mapped[str] = mapped_column(String, nullable=False)  # a ledger account key (cash, vendor:<id>, expense:<name>, custom:<name> ...)
     account_name: Mapped[str] = mapped_column(String, nullable=False)
+    # the balance sheet or P&L head chosen for a shop-named account (capital, loan, fixed ...); empty = worked out from the name
+    account_group: Mapped[str | None] = mapped_column(String)
     amount: Mapped[float] = mapped_column(Numeric(14, 2), nullable=False)
     mode_type: Mapped[str | None] = mapped_column(String)  # cheque, rtgs, neft, upi, cash, card
     mode_no: Mapped[str | None] = mapped_column(String)
