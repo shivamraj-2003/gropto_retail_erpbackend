@@ -186,43 +186,66 @@ def balance_sheet(book: Book, upto: date, closing_stock: float, opening_stock: f
     }
 
 
+SUPPLIES = (("local", "Local (within state)"), ("central", "Central (outside state)"))
+_AMOUNTS = ("taxable", "cgst", "sgst", "igst", "tax")
+
+
+def _add_up(rows: list[dict]) -> dict:
+    return {k: round(sum(r[k] for r in rows), 2) for k in _AMOUNTS}
+
+
+def by_supply(rows: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Rows keyed by (supply, rate) into: one row per GST rate, and Local / Central, each with its totals and its own rates."""
+    rates = [{"rate": rate, **_add_up([r for r in rows if r["rate"] == rate])} for rate in sorted({r["rate"] for r in rows})]
+    supplies = []
+    for key, label in SUPPLIES:
+        mine = sorted((r for r in rows if r["supply"] == key), key=lambda r: r["rate"])
+        supplies.append({"key": key, "label": label, **_add_up(mine), "rates": [{k: v for k, v in r.items() if k != "supply"} for r in mine]})
+    return rates, supplies
+
+
 async def rate_detail(db: AsyncSession, store_id: uuid.UUID, date_from: date, date_to: date) -> dict:
-    """Sales and purchases of the period by GST rate: the value before GST and the GST on it."""
+    """Sales and purchases of the period by GST rate, each also split into Local (CGST + SGST) and Central (IGST, another state):
+    the value before GST and the GST on it."""
     p = {"sid": store_id, "d1": date_from, "d2": date_to}
     sale_day = IST_DAY.format(col="s.billed_at")
     sales = await db.execute(
         text(
-            f"""select si.tax_rate_snapshot rate, coalesce(sum(si.taxable_value),0) taxable,
+            f"""select si.tax_rate_snapshot rate, (coalesce(si.igst_amount,0) <> 0) central, coalesce(sum(si.taxable_value),0) taxable,
                        coalesce(sum(si.cgst_amount),0) cgst, coalesce(sum(si.sgst_amount),0) sgst, coalesce(sum(si.igst_amount),0) igst
                 from sales s join sale_items si on si.sale_id = s.id
-                where s.store_id = :sid and s.status = 'completed' and {sale_day} between :d1 and :d2 group by 1 order by 1"""
+                where s.store_id = :sid and s.status = 'completed' and {sale_day} between :d1 and :d2 group by 1, 2"""
         ),
         p,
     )
     out_sales = [
-        {"rate": float(r.rate), "taxable": round(float(r.taxable), 2), "cgst": round(float(r.cgst), 2), "sgst": round(float(r.sgst), 2),
+        {"rate": float(r.rate), "supply": "central" if r.central else "local", "taxable": round(float(r.taxable), 2), "cgst": round(float(r.cgst), 2), "sgst": round(float(r.sgst), 2),
          "igst": round(float(r.igst), 2), "tax": round(float(r.cgst + r.sgst + r.igst), 2)}
         for r in sales.all()
     ]
     pur_day = f"coalesce(pu.invoice_date, {IST_DAY.format(col='pu.created_at')})"
+    # Central = the vendor's GSTIN is of another state than the store's. A vendor with no GSTIN counts as local.
+    central = "(left(coalesce(v.gst_number,''),2) <> '' and left(coalesce(st.gstin,''),2) <> '' and left(v.gst_number,2) <> left(st.gstin,2))"
     purchases = await db.execute(
         text(
-            f"""select coalesce(pi.gst_rate,0) rate,
+            f"""select coalesce(pi.gst_rate,0) rate, {central} central,
                        coalesce(sum(coalesce(pi.net_amount, pi.unit_cost * pi.quantity - coalesce(pi.discount_amount,0)) - coalesce(pi.gst_amount,0)),0) taxable,
-                       coalesce(sum(coalesce(pi.gst_amount,0)),0) gst,
-                       coalesce(sum(case when left(coalesce(v.gst_number,''),2) <> '' and left(coalesce(st.gstin,''),2) <> '' and left(v.gst_number,2) <> left(st.gstin,2)
-                                         then coalesce(pi.gst_amount,0) else 0 end),0) igst
+                       coalesce(sum(coalesce(pi.gst_amount,0)),0) gst
                 from purchase_items pi join purchases pu on pu.id = pi.purchase_id join vendors v on v.id = pu.vendor_id join stores st on st.id = pu.store_id
-                where pu.store_id = :sid and pi.warehouse_id is null and {pur_day} between :d1 and :d2 group by 1 order by 1"""
+                where pu.store_id = :sid and pi.warehouse_id is null and {pur_day} between :d1 and :d2 group by 1, 2"""
         ),
         p,
     )
     out_pur = []
     for r in purchases.all():
-        gst, igst = round(float(r.gst), 2), round(float(r.igst), 2)
+        gst = round(float(r.gst), 2)
+        igst = gst if r.central else 0.0
         half = round((gst - igst) / 2, 2)
-        out_pur.append({"rate": float(r.rate), "taxable": round(float(r.taxable), 2), "cgst": half, "sgst": round(gst - igst - half, 2), "igst": igst, "tax": gst})
-    return {"sales": out_sales, "purchases": out_pur}
+        out_pur.append({"rate": float(r.rate), "supply": "central" if r.central else "local", "taxable": round(float(r.taxable), 2),
+                        "cgst": half, "sgst": round(gst - igst - half, 2), "igst": igst, "tax": gst})
+    sale_rates, sale_supplies = by_supply(out_sales)
+    purchase_rates, purchase_supplies = by_supply(out_pur)
+    return {"sales": sale_rates, "purchases": purchase_rates, "sales_supplies": sale_supplies, "purchase_supplies": purchase_supplies}
 
 
 @router.get("")
@@ -251,9 +274,9 @@ async def statements(
     rates = await rate_detail(db, store_id, date_from, date_to)
     for line in pl["trading"]["dr"] + pl["trading"]["cr"]:
         if line["label"] == "Sales A/c":
-            line["rates"] = rates["sales"]
+            line["rates"], line["supplies"] = rates["sales"], rates["sales_supplies"]
         elif line["label"] == "Purchase A/c":
-            line["rates"] = rates["purchases"]
+            line["rates"], line["supplies"] = rates["purchases"], rates["purchase_supplies"]
     return {
         "company": (head.company if head else None) or (head.store if head else ""),
         "store": f"{head.code} {head.store}" + (f", {head.city}" if head and head.city else "") if head else "",

@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser, require_permission, require_store_access
 from app.core.database import get_db
+from app.services.purchase_bill import LINE_VALUE
 
 router = APIRouter(prefix="/finance-advanced/ledger", tags=["ledger"])
 
@@ -305,7 +306,7 @@ async def purchase_register(
             text(
                 f"""select pu.id, pu.vendor_id, v.name, v.gst_number, pu.invoice_number, {day} d, pu.without_gst,
                            count(pi.id) lines,
-                           coalesce(sum(pi.unit_cost * pi.quantity - coalesce(pi.discount_amount,0)),0) taxable,
+                           coalesce(sum({LINE_VALUE}),0) taxable,
                            coalesce(sum(coalesce(pi.gst_amount,0)),0) gst,
                            coalesce(sum(coalesce(pi.cess_amount,0)),0) cess,
                            coalesce(sum(coalesce(pi.surcharge_amount,0)),0) surcharge,
@@ -325,7 +326,7 @@ async def purchase_register(
         await db.execute(
             text(
                 f"""select coalesce(pi.gst_rate, 0) r,
-                           coalesce(sum(pi.unit_cost * pi.quantity - coalesce(pi.discount_amount,0)),0) taxable,
+                           coalesce(sum({LINE_VALUE}),0) taxable,
                            coalesce(sum(coalesce(pi.gst_amount,0)),0) gst, coalesce(sum(coalesce(pi.cess_amount,0)),0) cess
                     from purchase_items pi join purchases pu on pu.id = pi.purchase_id
                     where pu.store_id = :sid and {day} between :d1 and :d2 and (cast(:vid as uuid) is null or pu.vendor_id = cast(:vid as uuid))

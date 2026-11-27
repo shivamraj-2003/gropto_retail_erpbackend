@@ -621,6 +621,8 @@ class Purchase(Base):
     total_amount: Mapped[float] = mapped_column(Numeric(12, 2), default=0)
     # A cash purchase with no tax invoice: stock goes in, no GST is charged or claimed, and it stays out of anything tax-related.
     without_gst: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+    # The rates on this bill already have GST in them (unit_cost is then the rate as typed, GST included).
+    rate_includes_gst: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
     created_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
@@ -633,7 +635,7 @@ class PurchaseItem(Base):
     purchase_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("purchases.id", ondelete="CASCADE"))
     product_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("products.id"), nullable=False)
     quantity: Mapped[float] = mapped_column(Numeric(12, 3), nullable=False)  # the quantity on the vendor's bill (the "Receipt" column)
-    unit_cost: Mapped[float] = mapped_column(Numeric(12, 4), nullable=False)  # vendor's rate before GST; vendors quote 3-4 decimals
+    unit_cost: Mapped[float] = mapped_column(Numeric(12, 4), nullable=False)  # the vendor's rate (before GST unless the purchase says it includes it); 3-4 decimals
     # Details of the vendor's bill line. Every one is optional so rows made before these existed read exactly as before.
     bill_serial: Mapped[str | None] = mapped_column(String)
     mrp: Mapped[float | None] = mapped_column(Numeric(12, 2))

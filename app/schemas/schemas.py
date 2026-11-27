@@ -545,7 +545,7 @@ class VendorUpdateIn(BaseModel):
 class PurchaseItemIn(BaseModel):
     product_id: uuid.UUID
     quantity: float = Field(gt=0)  # the quantity on the vendor's bill (the "Receipt" column)
-    unit_cost: float = Field(ge=0)  # the vendor's rate before GST (up to 4 decimals)
+    unit_cost: float = Field(ge=0)  # the vendor's rate (up to 4 decimals): before GST, unless the bill's rates include it
     # The rest of the vendor's bill line. All optional: leaving them out records the line the way it always was.
     bill_serial: str | None = Field(default=None, max_length=30)
     mrp: float | None = Field(default=None, ge=0)
@@ -574,6 +574,8 @@ class PurchaseCreate(BaseModel):
     update_cost: bool = False
     # A cash purchase with no tax invoice: no GST, cess or surcharge on any line, and not counted as a GST purchase
     without_gst: bool = False
+    # The rates on this bill include GST: it is taken out first, and discounts apply to the value before GST
+    rate_includes_gst: bool = False
     items: list[PurchaseItemIn]
 
 
@@ -587,6 +589,7 @@ class PurchaseOut(BaseModel):
     total_amount: float  # what is owed the vendor: GST, cess and surcharge included (older entries: before GST)
     notes: list[str] = []  # what else happened (price changes made or waiting for approval, cost prices updated)
     without_gst: bool = False
+    rate_includes_gst: bool = False
 
 
 # ---------------------------------------------------------------------------

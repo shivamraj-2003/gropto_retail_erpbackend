@@ -2,6 +2,8 @@
 
 from decimal import Decimal
 
+import pytest
+
 from app.services.purchase_bill import build_bill, line_amounts, stock_in
 
 
@@ -89,3 +91,34 @@ def test_the_bill_totals_include_discount_cess_and_surcharge():
 def test_a_line_saved_before_these_columns_read_exactly_as_before():
     old = build_bill([line(10, 100, 18)], inter_state=False)["lines"][0]
     assert old["taxable"] == 1000 and old["total"] == 1180 and old["cess"] == 0 and old["surcharge"] == 0
+
+
+def test_a_rate_with_gst_in_it_is_taken_apart():
+    a = line_amounts(receipt=1, rate=118, gst_rate=18, inclusive=True)
+    assert (a["amount"], a["taxable"], a["gst"], a["net"]) == (118, 100, 18, 118)
+
+
+def test_the_discount_comes_off_the_value_before_gst_not_off_the_tax():
+    a = line_amounts(receipt=1, rate=118, discount=10, gst_rate=18, inclusive=True)
+    assert (a["taxable"], a["gst"], a["net"]) == (90, Decimal("16.20"), Decimal("106.20"))
+    # the same goods quoted before GST come to the same money
+    b = line_amounts(receipt=1, rate=100, discount=10, gst_rate=18)
+    assert (b["taxable"], b["gst"], b["net"]) == (a["taxable"], a["gst"], a["net"])
+
+
+@pytest.mark.parametrize("amount", ["100", "99.99", "1", "0.07", "12345.67"])
+@pytest.mark.parametrize("rate", [0, 5, 12, 18, 28, 40])
+def test_with_no_discount_an_inclusive_line_comes_to_exactly_the_amount(amount, rate):
+    a = line_amounts(receipt=1, rate=amount, gst_rate=rate, inclusive=True)
+    assert a["net"] == Decimal(amount)
+    assert a["taxable"] + a["gst"] == Decimal(amount)
+
+
+def test_a_discount_of_the_whole_value_leaves_no_tax():
+    a = line_amounts(receipt=1, rate=100, discount="84.75", gst_rate=18, inclusive=True)
+    assert (a["taxable"], a["gst"], a["net"]) == (0, 0, 0)
+
+
+def test_the_saved_bill_is_laid_out_the_same_way():
+    bill = build_bill([line(1, 118, 18)], inter_state=True, inclusive=True)
+    assert (bill["totals"]["taxable"], bill["totals"]["igst"], bill["totals"]["invoice_total"]) == (100, 18, 118)

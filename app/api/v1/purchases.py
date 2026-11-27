@@ -192,7 +192,7 @@ async def purchase_bill(
     current: CurrentUser = Depends(require_permission("procurement.purchase.view")),
 ) -> dict:
     """A recorded purchase laid out as the vendor's bill: who sold it (name, GSTIN, CIN, PAN, address), who bought it,
-    each item with its HSN and GST, the tax split and the total. Costs are the vendor's rate before GST."""
+    each item with its HSN and GST, the tax split and the total. Rates are as the vendor quoted them (before GST, or with it)."""
     purchase = await db.get(Purchase, purchase_id)
     if purchase is None:
         raise HTTPException(status_code=404, detail="Purchase not found")
@@ -235,7 +235,7 @@ async def purchase_bill(
                 "surcharge_rate": float(item.surcharge_rate or 0),
             }
         )
-    bill = build_bill(raw, inter_state=inter_state)
+    bill = build_bill(raw, inter_state=inter_state, inclusive=bool(purchase.rate_includes_gst))
     return {
         "id": str(purchase.id),
         "number": f"PUR-{str(purchase.id)[:8].upper()}",
@@ -245,6 +245,7 @@ async def purchase_bill(
         "recorded_by": buyer.full_name if buyer else None,
         "inter_state": inter_state,
         "without_gst": bool(purchase.without_gst),
+        "rate_includes_gst": bool(purchase.rate_includes_gst),
         "vendor": VendorOut.model_validate(vendor).model_dump(mode="json") if vendor else None,
         "store": {"id": str(store.id), "name": store.name, "city": store.city, "state": store.state, "gstin": store.gstin} if store else None,
         "lines": bill["lines"],

@@ -1,12 +1,17 @@
 """The numbers on a vendor's purchase bill.
 
-A purchase line is receipt quantity x rate (the vendor's rate BEFORE GST). From that:
+A purchase line is receipt quantity x rate. A vendor's bill quotes the rate either BEFORE GST (exclusive, the usual) or with
+GST already in it (inclusive). Either way the discount comes off the value before GST, never off the tax, and the tax is
+charged on what is left:
 
     amount     = receipt qty x rate
-    taxable    = amount - discount
+    base       = amount                          (exclusive)    or    amount / (1 + GST %)    (inclusive)
+    taxable    = base - discount
     GST        = taxable x GST code %            (the line's own code, else the product's rate)
     surcharge  = taxable x surcharge %
     net amount = taxable + GST + cess + surcharge
+
+With an inclusive rate and no discount, taxable + GST is exactly the amount (no paisa is lost to rounding).
 
 Free goods cost nothing and rejected / broken goods never enter stock: stock-in = receipt + free - reject - H.L.
 Within a state the GST splits into CGST + SGST (half each); between states it is IGST.
@@ -15,6 +20,13 @@ Within a state the GST splits into CGST + SGST (half each); between states it is
 from decimal import ROUND_HALF_UP, Decimal
 
 ALLOWED_GST_RATES = (0, 0.1, 0.25, 1.5, 3, 5, 12, 18, 28, 40)
+
+# SQL for a saved line's value before GST (purchase_items as `pi`). The net amount less the taxes is right whether the rate was
+# quoted with GST or without; lines saved before net amounts existed are rate x quantity less discount.
+LINE_VALUE = (
+    "coalesce(pi.net_amount - coalesce(pi.gst_amount,0) - coalesce(pi.cess_amount,0) - coalesce(pi.surcharge_amount,0), "
+    "pi.unit_cost * pi.quantity - coalesce(pi.discount_amount,0))"
+)
 
 
 def _r2(value: Decimal) -> Decimal:
@@ -30,17 +42,23 @@ def stock_in(receipt, free=0, reject=0, hl=0) -> Decimal:
     return _d(receipt) + _d(free) - _d(reject) - _d(hl)
 
 
-def line_amounts(*, receipt, rate, discount=0, gst_rate=0, cess=0, surcharge_rate=0) -> dict[str, Decimal]:
-    """The money on one line, rounded to paise the way the vendor's bill rounds it."""
+def line_amounts(*, receipt, rate, discount=0, gst_rate=0, cess=0, surcharge_rate=0, inclusive=False) -> dict[str, Decimal]:
+    """The money on one line, rounded to paise the way the vendor's bill rounds it. `inclusive`: the rate already has GST in it."""
     amount = _r2(_d(receipt) * _d(rate))
-    taxable = amount - _r2(_d(discount))
-    gst = _r2(taxable * _d(gst_rate) / 100)
+    off = _r2(_d(discount))
+    if inclusive:
+        factor = 1 + _d(gst_rate) / 100
+        taxable = _r2(amount / factor) - off
+        gst = _r2(amount - off * factor) - taxable if taxable else Decimal(0)
+    else:
+        taxable = amount - off
+        gst = _r2(taxable * _d(gst_rate) / 100)
     surcharge = _r2(taxable * _d(surcharge_rate) / 100)
     cess = _r2(_d(cess))
     return {"amount": amount, "taxable": taxable, "gst": gst, "surcharge": surcharge, "cess": cess, "net": taxable + gst + cess + surcharge}
 
 
-def build_bill(lines: list[dict], *, inter_state: bool) -> dict:
+def build_bill(lines: list[dict], *, inter_state: bool, inclusive: bool = False) -> dict:
     """lines: dicts with quantity (receipt), unit_cost, tax_rate and, when the entry carries them, discount, cess,
     surcharge_rate, free_qty, reject_qty, hl_qty. Returns the lines with their tax, a summary per GST rate and totals."""
     out_lines = []
@@ -50,7 +68,7 @@ def build_bill(lines: list[dict], *, inter_state: bool) -> dict:
         rate = _d(ln["tax_rate"])
         amt = line_amounts(
             receipt=ln["quantity"], rate=ln["unit_cost"], discount=ln.get("discount", 0), gst_rate=rate,
-            cess=ln.get("cess", 0), surcharge_rate=ln.get("surcharge_rate", 0),
+            cess=ln.get("cess", 0), surcharge_rate=ln.get("surcharge_rate", 0), inclusive=inclusive,
         )
         taxable, gst = amt["taxable"], amt["gst"]
         if inter_state:

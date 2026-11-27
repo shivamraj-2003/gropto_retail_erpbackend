@@ -25,6 +25,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.services.gst import GST_STATE_CODES
+from app.services.purchase_bill import LINE_VALUE
 
 B2CL_LIMIT = 250000.0  # inter-state invoice value above which an unregistered sale is reported invoice by invoice
 
@@ -115,9 +116,11 @@ _PURCHASES = text(
     select pu.id::text as purchase_id, pu.invoice_number, coalesce(pu.invoice_date, pu.created_at::date) as day, pu.without_gst,
            v.name as vendor, v.gst_number as vendor_gstin, st.gstin as store_gstin,
            (v.gst_number is not null and st.gstin is not null and left(v.gst_number, 2) <> left(st.gstin, 2)) as inter_state,
-           pi.quantity, pi.unit_cost, coalesce(pi.discount_amount, 0) as discount,
+           """
+    + LINE_VALUE
+    + """ as value,
            coalesce(pi.gst_rate, p.tax_rate, 0) as rate,
-           coalesce(pi.gst_amount, round(((pi.quantity * pi.unit_cost) - coalesce(pi.discount_amount, 0)) * coalesce(pi.gst_rate, p.tax_rate, 0) / 100, 2)) as gst
+           coalesce(pi.gst_amount, round((pi.quantity * pi.unit_cost - coalesce(pi.discount_amount, 0)) * coalesce(pi.gst_rate, p.tax_rate, 0) / 100, 2)) as gst
     from purchases pu
     join purchase_items pi on pi.purchase_id = pu.id
     join products p on p.id = pi.product_id
@@ -311,7 +314,7 @@ async def gstr3b(db: AsyncSession, *, stores: list, month: str) -> dict:
     cash_purchases = 0.0
     bills_with_credit: set[str] = set()
     for p in purchases:
-        value = float(p["quantity"]) * float(p["unit_cost"]) - float(p["discount"])
+        value = float(p["value"])
         gst = float(p["gst"] or 0)
         if p["without_gst"]:
             cash_purchases += value

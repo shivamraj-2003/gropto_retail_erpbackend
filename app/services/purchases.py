@@ -6,6 +6,7 @@ line names a warehouse, in that warehouse.
 """
 
 import uuid
+from decimal import Decimal
 
 from fastapi import HTTPException
 from sqlalchemy import select
@@ -34,6 +35,7 @@ async def record_purchase(db: AsyncSession, payload: PurchaseCreate, current: Cu
         for p in (await db.execute(select(Product).where(Product.id.in_({i.product_id for i in payload.items})))).scalars().all()
     }
 
+    inclusive = payload.rate_includes_gst and not payload.without_gst  # with no GST there is nothing included
     rows: list[tuple] = []  # (item, product, gst_rate, amounts, stock_in)
     for n, item in enumerate(payload.items, start=1):
         product = products.get(item.product_id)
@@ -50,6 +52,7 @@ async def record_purchase(db: AsyncSession, payload: PurchaseCreate, current: Cu
         amounts = line_amounts(
             receipt=item.quantity, rate=item.unit_cost, discount=item.discount_amount, gst_rate=gst_rate,
             cess=0 if payload.without_gst else item.cess_amount, surcharge_rate=0 if payload.without_gst else item.surcharge_rate,
+            inclusive=inclusive,
         )
         if amounts["taxable"] < 0:
             raise HTTPException(status_code=422, detail=f"Line {n} ({product.name}): the discount is more than the amount")
@@ -75,6 +78,7 @@ async def record_purchase(db: AsyncSession, payload: PurchaseCreate, current: Cu
         invoice_number=payload.invoice_number,
         invoice_date=payload.invoice_date,
         without_gst=payload.without_gst,
+        rate_includes_gst=inclusive,
         total_amount=total,
         created_by=current.user_id,
     )
@@ -160,7 +164,7 @@ async def record_purchase(db: AsyncSession, payload: PurchaseCreate, current: Cu
         action="purchase.created",
         entity_type="purchase",
         entity_id=purchase.id,
-        new_value={"total_amount": float(total), "vendor_id": str(payload.vendor_id), "lines": len(rows), "source": source, "without_gst": payload.without_gst},
+        new_value={"total_amount": float(total), "vendor_id": str(payload.vendor_id), "lines": len(rows), "source": source, "without_gst": payload.without_gst, "rate_includes_gst": inclusive},
     )
     purchase.notes = notes  # shown to the person who entered it; not stored
     return purchase
@@ -240,7 +244,8 @@ async def _update_costs(db: AsyncSession, rows: list[tuple], current: CurrentUse
     product wins). Cost price is not an approval-gated field, so this is the same as editing it on the product."""
     last: dict[uuid.UUID, tuple] = {}
     for item, product, _gst, amounts, into_stock in rows:
-        cost = float(amounts["taxable"] / into_stock) if into_stock > 0 else float(item.unit_cost)
+        units = into_stock if into_stock > 0 else Decimal(str(item.quantity))
+        cost = float(amounts["taxable"] / units) if units > 0 else float(product.purchase_price or 0)
         last[product.id] = (product, round(cost, 2))
     for product, cost in last.values():
         old = float(product.purchase_price or 0)
