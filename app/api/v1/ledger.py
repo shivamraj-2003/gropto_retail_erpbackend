@@ -146,6 +146,17 @@ async def build_book(db: AsyncSession, *, store_id: uuid.UUID, warehouse: bool, 
                 else:
                     book.post(mk, v_day, credit=float(v_amt), name=mnm, group=mgrp)
 
+    if not warehouse:
+        for day, vendor_key, vendor_name, amount in (
+            await rows(
+                """select v.voucher_date, l.account_key, l.account_name, coalesce(sum(a.deduction),0)
+                   from finance_voucher_allocations a join finance_voucher_lines l on l.id = a.line_id join finance_vouchers v on v.id = l.voucher_id
+                   where v.store_id = :sid and v.voucher_date <= :upto and a.deduction > 0 group by 1, 2, 3"""
+            )
+        ).all():
+            book.post(vendor_key, day, debit=amount, name=vendor_name, group="Vendors")
+            book.post("custom:DISCOUNT RECEIVED", day, credit=amount, name="DISCOUNT RECEIVED", group="Other accounts")
+
     # purchases: the store's own, or what was received into warehouses
     place = "pi.warehouse_id is not null and (cast(:wid as uuid) is null or pi.warehouse_id = cast(:wid as uuid))" if warehouse else "pi.warehouse_id is null"
     day_expr = f"coalesce(pu.invoice_date, {IST_DAY.format(col='pu.created_at')})"
@@ -300,7 +311,9 @@ async def purchase_register(
                            coalesce(sum(coalesce(pi.surcharge_amount,0)),0) surcharge,
                            pu.total_amount,
                            (select coalesce(sum(vp.amount),0) from vendor_payments vp join payables pa on pa.id = vp.payable_id
-                              where pa.purchase_id = pu.id and vp.status = 'applied') paid
+                              where pa.purchase_id = pu.id and vp.status = 'applied')
+                           + (select coalesce(sum(a.amount + a.deduction),0) from finance_voucher_allocations a join payables pa2 on pa2.id = a.payable_id
+                              where pa2.purchase_id = pu.id) paid
                     from purchases pu join vendors v on v.id = pu.vendor_id left join purchase_items pi on pi.purchase_id = pu.id
                     where pu.store_id = :sid and {day} between :d1 and :d2 and (cast(:vid as uuid) is null or pu.vendor_id = cast(:vid as uuid))
                     group by pu.id, v.name, v.gst_number order by d desc, pu.created_at desc limit 1000"""
@@ -410,6 +423,17 @@ async def party_statement(
     ).all():
         entries.append({"date": r.d, "type": "Voucher", "ref": r.voucher_no, "detail": r.narration or r.voucher_type.title(), "purchase_id": None,
                         "debit": round(float(r.amount), 2) if r.dc == "D" else 0.0, "credit": round(float(r.amount), 2) if r.dc == "C" else 0.0})
+    for r in (
+        await db.execute(
+            text(
+                """select v.voucher_date d, v.voucher_no, a.deduction, a.bill_no
+                   from finance_voucher_allocations a join finance_voucher_lines l on l.id = a.line_id join finance_vouchers v on v.id = l.voucher_id
+                   where v.store_id = :sid and l.account_key = :key and v.voucher_date <= :upto and a.deduction > 0"""
+            ),
+            p,
+        )
+    ).all():
+        entries.append({"date": r.d, "type": "Deduction", "ref": r.voucher_no, "detail": f"less on bill {r.bill_no or '-'}", "purchase_id": None, "debit": round(float(r.deduction), 2), "credit": 0.0})
     entries.sort(key=lambda e: (e["date"], 0 if e["type"] == "Purchase" else 1))
 
     balance = 0.0
@@ -435,4 +459,160 @@ async def party_statement(
         "paid": round(sum(e["debit"] for e in shown), 2),
         "months": list(months.values()),
         "entries": shown,
+    }
+
+
+@router.get("/directory")
+async def account_directory(
+    store_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(require_permission("finance.pnl.view")),
+) -> list[dict]:
+    """Every account that can be picked in a voucher or the ledger (all vendors, even with nothing posted yet), with today's balance."""
+    require_store_access(store_id, current)
+    book = await build_book(db, store_id=store_id, warehouse=False, warehouse_id=None, upto=date(2999, 12, 31))
+    balance = {k: round(sum(d - c for d, c in days.values()), 2) for k, days in book.days.items()}
+    out: dict[str, dict] = {}
+
+    def add(key: str, name: str, group: str, gst: str | None = None, mobile: str | None = None) -> None:
+        out[key] = {"key": key, "name": name, "group": group, "gst": gst, "mobile": mobile, "balance": balance.get(key, 0.0)}
+
+    add("cash", FIXED["cash"][0], FIXED["cash"][1])
+    add("bank", FIXED["bank"][0], FIXED["bank"][1])
+    for v in (await db.execute(text("select id, name, gst_number, phone from vendors order by name"))).all():
+        add(f"vendor:{v.id}", v.name, "Vendors", v.gst_number, v.phone)
+    for key in book.days:
+        if key not in out:
+            add(key, book.names[key][0], book.names[key][1])
+    # a bank account the shop named itself in a voucher can be the paying account
+    for key, item in out.items():
+        item["is_money"] = key in ("cash", "bank", "upi", "card") or (key.startswith("custom:") and "BANK" in key.upper() and "CHARGE" not in key.upper())
+    return sorted(out.values(), key=lambda a: (a["name"].upper()))
+
+
+@router.get("/entries")
+async def account_entries(
+    store_id: uuid.UUID,
+    account: str,
+    date_from: date,
+    date_to: date,
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(require_permission("finance.pnl.view")),
+) -> dict:
+    """One account the long way: every voucher (and every purchase and payment of a vendor) as its own line with the running balance,
+    what the system posts by itself added up per day, and the twelve months of the financial year."""
+    require_store_access(store_id, current)
+    if date_to < date_from:
+        raise HTTPException(status_code=422, detail="The end date is before the start date")
+    fy_start = date(date_from.year if date_from.month >= 4 else date_from.year - 1, 4, 1)
+    fy_end = date(fy_start.year + 1, 3, 31)
+    book = await build_book(db, store_id=store_id, warehouse=False, warehouse_id=None, upto=max(date_to, fy_end))
+    days = book.days.get(account, {})
+    p = {"sid": store_id, "key": account}
+    items: list[dict] = []
+
+    def item(day: date, number: str, particulars: str, debit: float = 0.0, credit: float = 0.0, **more) -> None:
+        items.append({"date": day, "number": number, "particulars": particulars, "debit": round(float(debit), 2), "credit": round(float(credit), 2),
+                      "cheque_no": more.get("cheque"), "reco_date": more.get("reco"), "narration": more.get("narration"),
+                      "voucher_id": more.get("voucher_id"), "purchase_id": more.get("purchase_id")})
+
+    vouchers = (
+        await db.execute(
+            text(
+                """select v.id, v.voucher_date, v.voucher_no, v.voucher_type, v.narration, v.reco_date, v.main_account, v.main_account_name,
+                          l.dc, l.account_key, l.account_name, l.amount, l.mode_no
+                   from finance_vouchers v join finance_voucher_lines l on l.voucher_id = v.id
+                   where v.store_id = :sid and (l.account_key = :key or v.main_account = :key) order by v.voucher_date, v.created_at"""
+            ),
+            p,
+        )
+    ).all()
+    main_rows: dict = {}
+    for r in vouchers:
+        extra = {"narration": r.narration, "reco": r.reco_date.isoformat() if r.reco_date else None, "voucher_id": str(r.id)}
+        if r.account_key == account:
+            amount = float(r.amount)
+            item(r.voucher_date, r.voucher_no, r.main_account_name or r.voucher_type.title(), debit=amount if r.dc == "D" else 0,
+                 credit=amount if r.dc == "C" else 0, cheque=r.mode_no, **extra)
+        if r.main_account == account:
+            m = main_rows.setdefault(r.id, {"day": r.voucher_date, "no": r.voucher_no, "type": r.voucher_type, "names": [], "amount": 0.0, "cheques": [], "extra": extra})
+            m["names"].append(r.account_name)
+            m["amount"] += float(r.amount)
+            if r.mode_no:
+                m["cheques"].append(r.mode_no)
+    for m in main_rows.values():
+        receipt = m["type"].endswith("RECEIPT")
+        item(m["day"], m["no"], ", ".join(m["names"]), debit=m["amount"] if receipt else 0, credit=0 if receipt else m["amount"],
+             cheque=", ".join(m["cheques"]) or None, **m["extra"])
+
+    if account.startswith("vendor:"):
+        vp = {"sid": store_id, "vid": uuid.UUID(account.split(":", 1)[1])}
+        pur_day = f"coalesce(pu.invoice_date, {IST_DAY.format(col='pu.created_at')})"
+        for r in (
+            await db.execute(
+                text(
+                    f"""select pu.id, {pur_day} d, pu.invoice_number,
+                               coalesce(sum(coalesce(pi.net_amount, pi.unit_cost * pi.quantity - coalesce(pi.discount_amount,0))),0) amount,
+                               string_agg(distinct trim(to_char(coalesce(pi.gst_rate,0), 'FM990.##'), '.') || '%', ', ') rates
+                        from purchases pu join purchase_items pi on pi.purchase_id = pu.id
+                        where pu.store_id = :sid and pu.vendor_id = :vid and pi.warehouse_id is null group by pu.id"""
+                ),
+                vp,
+            )
+        ).all():
+            item(r.d, r.invoice_number or "-", f"PURCHASE (GST {r.rates})", credit=r.amount, narration=f"Bill No.: {r.invoice_number or '-'}", purchase_id=str(r.id))
+        pay_day = IST_DAY.format(col="vp.created_at")
+        for r in (
+            await db.execute(
+                text(
+                    f"""select {pay_day} d, vp.amount, vp.reference, pu.invoice_number
+                        from vendor_payments vp join payables pa on pa.id = vp.payable_id join purchases pu on pu.id = pa.purchase_id
+                        where pu.store_id = :sid and pa.vendor_id = :vid and vp.status = 'applied'"""
+                ),
+                vp,
+            )
+        ).all():
+            item(r.d, r.reference or "-", "PAYMENT", debit=r.amount, narration=f"against bill {r.invoice_number or '-'}")
+
+    # what the system posted by itself (sales, cash book, deposits ...) is whatever the day's total has beyond the lines above
+    listed: dict[date, list[float]] = {}
+    for it in items:
+        cell = listed.setdefault(it["date"], [0.0, 0.0])
+        cell[0] += it["debit"]
+        cell[1] += it["credit"]
+    for day, (dr, cr) in days.items():
+        have = listed.get(day, [0.0, 0.0])
+        rest_dr, rest_cr = round(dr - have[0], 2), round(cr - have[1], 2)
+        if abs(rest_dr) > 0.004 or abs(rest_cr) > 0.004:
+            item(day, "-", "Bills and entries of the day", debit=rest_dr, credit=rest_cr)
+    items.sort(key=lambda i: i["date"])
+
+    def before(d: date) -> float:
+        return round(sum(dr - cr for day, (dr, cr) in days.items() if day < d), 2)
+
+    opening = before(date_from)
+    balance = opening
+    rows = []
+    for it in items:
+        if not (date_from <= it["date"] <= date_to):
+            continue
+        balance = round(balance + it["debit"] - it["credit"], 2)
+        rows.append({**it, "date": it["date"].isoformat(), "balance": balance})
+
+    months, running = [], before(fy_start)
+    fy_opening = running
+    for n in range(12):
+        month = (3 + n) % 12 + 1
+        year = fy_start.year if month >= 4 else fy_start.year + 1
+        dr = round(sum(c[0] for d, c in days.items() if d.year == year and d.month == month), 2)
+        cr = round(sum(c[1] for d, c in days.items() if d.year == year and d.month == month), 2)
+        running = round(running + dr - cr, 2)
+        months.append({"label": MONTHS[month], "year": year, "month": month, "debit": dr, "credit": cr, "closing": running})
+    return {
+        "opening": opening,
+        "debit": round(sum(r["debit"] for r in rows), 2),
+        "credit": round(sum(r["credit"] for r in rows), 2),
+        "closing": balance,
+        "rows": rows,
+        "fy": {"label": f"{fy_start.year}-{(fy_start.year + 1) % 100:02d}", "opening": fy_opening, "months": months},
     }

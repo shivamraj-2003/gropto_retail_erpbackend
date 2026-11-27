@@ -24,6 +24,7 @@ class FinanceVoucher(Base):
     main_account: Mapped[str | None] = mapped_column(String)  # the cash / bank account the money moved through (not for journals)
     main_account_name: Mapped[str | None] = mapped_column(String)
     narration: Mapped[str | None] = mapped_column(Text)
+    reco_date: Mapped[date | None] = mapped_column(Date)  # when the bank entry was matched with the bank statement
     total_amount: Mapped[float] = mapped_column(Numeric(14, 2), nullable=False)
     created_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
@@ -40,7 +41,26 @@ class FinanceVoucherLine(Base):
     account_name: Mapped[str] = mapped_column(String, nullable=False)
     # the balance sheet or P&L head chosen for a shop-named account (capital, loan, fixed ...); empty = worked out from the name
     account_group: Mapped[str | None] = mapped_column(String)
+    cost_center: Mapped[str | None] = mapped_column(String)
+    department: Mapped[str | None] = mapped_column(String)
+    employee: Mapped[str | None] = mapped_column(String)
+    allocations: Mapped[list["FinanceVoucherAllocation"]] = relationship(cascade="all, delete-orphan", lazy="selectin")
     amount: Mapped[float] = mapped_column(Numeric(14, 2), nullable=False)
     mode_type: Mapped[str | None] = mapped_column(String)  # cheque, rtgs, neft, upi, cash, card
     mode_no: Mapped[str | None] = mapped_column(String)
     mode_date: Mapped[date | None] = mapped_column(Date)
+
+
+class FinanceVoucherAllocation(Base):
+    """How a vendor line of a voucher is set against the vendor's bills: on account, against a bill, a new reference or an advance.
+    A deduction settles part of a bill without money (a discount the vendor gave)."""
+
+    __tablename__ = "finance_voucher_allocations"
+    id: Mapped[uuid.UUID] = uuid_pk()
+    line_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("finance_voucher_lines.id", ondelete="CASCADE"), nullable=False, index=True)
+    kind: Mapped[str] = mapped_column(String, nullable=False)  # on_account, against, new_ref, advance
+    payable_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("payables.id"), index=True)
+    bill_no: Mapped[str | None] = mapped_column(String)
+    amount: Mapped[float] = mapped_column(Numeric(14, 2), default=0)
+    deduction: Mapped[float] = mapped_column(Numeric(14, 2), default=0)
+    remarks: Mapped[str | None] = mapped_column(String)
