@@ -514,13 +514,15 @@ async def account_entries(
     def item(day: date, number: str, particulars: str, debit: float = 0.0, credit: float = 0.0, **more) -> None:
         items.append({"date": day, "number": number, "particulars": particulars, "debit": round(float(debit), 2), "credit": round(float(credit), 2),
                       "cheque_no": more.get("cheque"), "reco_date": more.get("reco"), "narration": more.get("narration"),
-                      "voucher_id": more.get("voucher_id"), "purchase_id": more.get("purchase_id")})
+                      "voucher_id": more.get("voucher_id"), "purchase_id": more.get("purchase_id"),
+                      "remarks": more.get("remarks"), "department": more.get("department"), "employee": more.get("employee")})
 
     vouchers = (
         await db.execute(
             text(
                 """select v.id, v.voucher_date, v.voucher_no, v.voucher_type, v.narration, v.reco_date, v.main_account, v.main_account_name,
-                          l.dc, l.account_key, l.account_name, l.amount, l.mode_no
+                          l.dc, l.account_key, l.account_name, l.amount, l.mode_no, l.department, l.employee,
+                          (select string_agg(a.remarks, ', ') from finance_voucher_allocations a where a.line_id = l.id and a.remarks is not null) remarks
                    from finance_vouchers v join finance_voucher_lines l on l.voucher_id = v.id
                    where v.store_id = :sid and (l.account_key = :key or v.main_account = :key) order by v.voucher_date, v.created_at"""
             ),
@@ -533,7 +535,7 @@ async def account_entries(
         if r.account_key == account:
             amount = float(r.amount)
             item(r.voucher_date, r.voucher_no, r.main_account_name or r.voucher_type.title(), debit=amount if r.dc == "D" else 0,
-                 credit=amount if r.dc == "C" else 0, cheque=r.mode_no, **extra)
+                 credit=amount if r.dc == "C" else 0, cheque=r.mode_no, remarks=r.remarks, department=r.department, employee=r.employee, **extra)
         if r.main_account == account:
             m = main_rows.setdefault(r.id, {"day": r.voucher_date, "no": r.voucher_no, "type": r.voucher_type, "names": [], "amount": 0.0, "cheques": [], "extra": extra})
             m["names"].append(r.account_name)
@@ -552,15 +554,19 @@ async def account_entries(
             await db.execute(
                 text(
                     f"""select pu.id, {pur_day} d, pu.invoice_number,
+                               bool_or(left(coalesce(ve.gst_number,''),2) <> '' and left(coalesce(st.gstin,''),2) <> '' and left(ve.gst_number,2) <> left(st.gstin,2)) inter,
                                coalesce(sum(coalesce(pi.net_amount, pi.unit_cost * pi.quantity - coalesce(pi.discount_amount,0))),0) amount,
                                string_agg(distinct trim(to_char(coalesce(pi.gst_rate,0), 'FM990.##'), '.') || '%', ', ') rates
                         from purchases pu join purchase_items pi on pi.purchase_id = pu.id
+                             join vendors ve on ve.id = pu.vendor_id join stores st on st.id = pu.store_id
                         where pu.store_id = :sid and pu.vendor_id = :vid and pi.warehouse_id is null group by pu.id"""
                 ),
                 vp,
             )
         ).all():
-            item(r.d, r.invoice_number or "-", f"PURCHASE (GST {r.rates})", credit=r.amount, narration=f"Bill No.: {r.invoice_number or '-'}", purchase_id=str(r.id))
+            tax = "" if r.rates == "0%" else ("IGST " if r.inter else "CGST ")
+            item(r.d, r.invoice_number or "-", f"{tax}PURCHASE {r.rates}", credit=r.amount,
+                 narration=f"Bill No. : {r.invoice_number or '-'} Dated {r.d:%d-%B-%Y}", purchase_id=str(r.id))
         pay_day = IST_DAY.format(col="vp.created_at")
         for r in (
             await db.execute(
