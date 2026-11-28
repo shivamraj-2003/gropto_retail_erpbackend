@@ -195,12 +195,18 @@ def _add_up(rows: list[dict]) -> dict:
 
 
 def by_supply(rows: list[dict]) -> tuple[list[dict], list[dict]]:
-    """Rows keyed by (supply, rate) into: one row per GST rate, and Local / Central, each with its totals and its own rates."""
+    """Rows keyed by (supply, rate) into: one row per GST rate, and Local / Central, each with its totals and its own rates.
+    Goods bought with no tax invoice (rows marked `without_gst`) count in the totals but are no GST rate's: they are given apart."""
     rates = [{"rate": rate, **_add_up([r for r in rows if r["rate"] == rate])} for rate in sorted({r["rate"] for r in rows})]
     supplies = []
     for key, label in SUPPLIES:
         mine = sorted((r for r in rows if r["supply"] == key), key=lambda r: r["rate"])
-        supplies.append({"key": key, "label": label, **_add_up(mine), "rates": [{k: v for k, v in r.items() if k != "supply"} for r in mine]})
+        billed = [r for r in mine if not r.get("without_gst")]
+        supplies.append({
+            "key": key, "label": label, **_add_up(mine),
+            "without_gst": round(sum(r["taxable"] for r in mine if r.get("without_gst")), 2),
+            "rates": [{k: v for k, v in r.items() if k not in ("supply", "without_gst")} for r in billed],
+        })
     return rates, supplies
 
 
@@ -228,11 +234,11 @@ async def rate_detail(db: AsyncSession, store_id: uuid.UUID, date_from: date, da
     central = "(left(coalesce(v.gst_number,''),2) <> '' and left(coalesce(st.gstin,''),2) <> '' and left(v.gst_number,2) <> left(st.gstin,2))"
     purchases = await db.execute(
         text(
-            f"""select coalesce(pi.gst_rate,0) rate, {central} central,
+            f"""select coalesce(pi.gst_rate,0) rate, {central} central, pu.without_gst,
                        coalesce(sum(coalesce(pi.net_amount, pi.unit_cost * pi.quantity - coalesce(pi.discount_amount,0)) - coalesce(pi.gst_amount,0)),0) taxable,
                        coalesce(sum(coalesce(pi.gst_amount,0)),0) gst
                 from purchase_items pi join purchases pu on pu.id = pi.purchase_id join vendors v on v.id = pu.vendor_id join stores st on st.id = pu.store_id
-                where pu.store_id = :sid and pi.warehouse_id is null and {pur_day} between :d1 and :d2 group by 1, 2"""
+                where pu.store_id = :sid and pi.warehouse_id is null and {pur_day} between :d1 and :d2 group by 1, 2, 3"""
         ),
         p,
     )
@@ -241,7 +247,7 @@ async def rate_detail(db: AsyncSession, store_id: uuid.UUID, date_from: date, da
         gst = round(float(r.gst), 2)
         igst = gst if r.central else 0.0
         half = round((gst - igst) / 2, 2)
-        out_pur.append({"rate": float(r.rate), "supply": "central" if r.central else "local", "taxable": round(float(r.taxable), 2),
+        out_pur.append({"rate": float(r.rate), "supply": "central" if r.central else "local", "without_gst": bool(r.without_gst), "taxable": round(float(r.taxable), 2),
                         "cgst": half, "sgst": round(gst - igst - half, 2), "igst": igst, "tax": gst})
     sale_rates, sale_supplies = by_supply(out_sales)
     purchase_rates, purchase_supplies = by_supply(out_pur)

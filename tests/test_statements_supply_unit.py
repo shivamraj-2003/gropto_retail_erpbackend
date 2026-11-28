@@ -17,3 +17,12 @@ def test_both_heads_are_there_when_nothing_was_bought():
     rates, supplies = by_supply([])
     assert rates == []
     assert [(s["key"], s["taxable"], s["rates"]) for s in supplies] == [("local", 0, []), ("central", 0, [])]
+
+
+def test_goods_bought_without_gst_are_given_apart_from_zero_rated_ones():
+    cash = {**row("local", 0.0, 70), "without_gst": True}
+    rates, supplies = by_supply([row("local", 0.0, 30), cash])
+    local = supplies[0]
+    assert (local["taxable"], local["without_gst"], [(r["rate"], r["taxable"]) for r in local["rates"]]) == (100, 70, [(0.0, 30)])
+    assert [(r["rate"], r["taxable"]) for r in rates] == [(0.0, 100)]
+    assert "without_gst" not in local["rates"][0]
