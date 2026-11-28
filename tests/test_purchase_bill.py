@@ -16,7 +16,8 @@ def test_within_the_state_tax_is_cgst_plus_sgst():
     assert bill["lines"][0]["taxable"] == 1000
     assert (bill["lines"][0]["cgst"], bill["lines"][0]["sgst"], bill["lines"][0]["igst"]) == (90, 90, 0)
     assert bill["totals"] == {
-        "taxable": 1000, "cgst": 90, "sgst": 90, "igst": 0, "gst": 180, "discount": 0, "cess": 0, "surcharge": 0, "round_off": 0, "invoice_total": 1180,
+        "taxable": 1000, "cgst": 90, "sgst": 90, "igst": 0, "gst": 180, "discount": 0, "cess": 0, "surcharge": 0, "cash_discount": 0,
+        "reverse_charge_tax": 0, "round_off": 0, "invoice_total": 1180,
     }
 
 
@@ -122,3 +123,55 @@ def test_a_discount_of_the_whole_value_leaves_no_tax():
 def test_the_saved_bill_is_laid_out_the_same_way():
     bill = build_bill([line(1, 118, 18)], inter_state=True, inclusive=True)
     assert (bill["totals"]["taxable"], bill["totals"]["igst"], bill["totals"]["invoice_total"]) == (100, 18, 118)
+
+
+# the bill's "Taxes & Levies": one item, rate 100 before GST, 18%, discount 10
+ONE = {"receipt": 1, "rate": 100, "discount": 10, "gst_rate": 18}
+
+
+def money(a, *keys):
+    return tuple(float(a[k]) for k in keys)
+
+
+def test_gst_before_discount_charges_tax_on_the_whole_value():
+    a = line_amounts(**ONE, gst_before_discount=True)
+    assert money(a, "taxable", "gst", "value", "cash_discount", "net", "payable") == (100, 18, 90, 0, 108, 108)
+
+
+def test_a_cash_discount_after_gst_leaves_the_purchase_at_full_value():
+    a = line_amounts(**ONE, cash_discount_after_gst=True)
+    assert money(a, "taxable", "gst", "value", "cash_discount", "net", "payable") == (100, 18, 100, 10, 108, 108)
+    # both ticked: the cash discount rule
+    both = line_amounts(**ONE, cash_discount_after_gst=True, gst_before_discount=True)
+    assert both == a
+
+
+def test_a_cash_discount_may_be_more_than_the_goods_but_not_than_the_amount_with_gst():
+    assert not line_amounts(receipt=1, rate=100, discount=110, gst_rate=18, cash_discount_after_gst=True)["over_discount"]
+    assert line_amounts(receipt=1, rate=100, discount=119, gst_rate=18, cash_discount_after_gst=True)["over_discount"]
+    assert line_amounts(receipt=1, rate=100, discount=101, gst_rate=18)["over_discount"]
+
+
+def test_under_reverse_charge_the_vendor_is_owed_the_bill_without_tax():
+    a = line_amounts(**ONE, cess=5, reverse_charge=True)
+    assert money(a, "gst", "net", "reverse_tax", "payable", "value") == (16.2, 111.2, 21.2, 90, 90)
+
+
+@pytest.mark.parametrize("flags", [{}, {"gst_before_discount": True}, {"cash_discount_after_gst": True}, {"reverse_charge": True}])
+@pytest.mark.parametrize("inclusive", [False, True])
+def test_the_books_balance_for_every_option(flags, inclusive):
+    a = line_amounts(receipt=3, rate="99.99", discount="7.35", gst_rate=18, cess=2, surcharge_rate=1, inclusive=inclusive, **flags)
+    debit = a["value"] + a["cess"] + a["surcharge"] + a["gst"]  # purchases (with cess and surcharge) and the GST
+    credit = a["payable"] + a["reverse_tax"] + a["cash_discount"]  # the vendor, tax paid for them, discount received
+    assert debit == credit
+
+
+def test_an_inclusive_rate_with_gst_before_discount_keeps_all_the_tax_in_the_amount():
+    a = line_amounts(receipt=1, rate=118, discount=10, gst_rate=18, inclusive=True, gst_before_discount=True)
+    assert money(a, "taxable", "gst", "value", "net") == (100, 18, 90, 108)
+
+
+def test_the_saved_bill_shows_reverse_charge_and_cash_discount():
+    bill = build_bill([{**line(1, 100, 18), "discount": 10}], inter_state=True, cash_discount_after_gst=True, reverse_charge=True)
+    t = bill["totals"]
+    assert (t["igst"], t["cash_discount"], t["reverse_charge_tax"], t["invoice_total"]) == (18, 10, 18, 90)

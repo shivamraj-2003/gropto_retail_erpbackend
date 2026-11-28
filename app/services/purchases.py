@@ -35,7 +35,11 @@ async def record_purchase(db: AsyncSession, payload: PurchaseCreate, current: Cu
         for p in (await db.execute(select(Product).where(Product.id.in_({i.product_id for i in payload.items})))).scalars().all()
     }
 
-    inclusive = payload.rate_includes_gst and not payload.without_gst  # with no GST there is nothing included
+    taxed = not payload.without_gst  # with no GST there is nothing included, claimed or reverse-charged
+    inclusive = payload.rate_includes_gst and taxed
+    reverse = payload.reverse_charge and taxed
+    credit = payload.input_credit or not taxed
+    before = payload.gst_before_discount and taxed
     rows: list[tuple] = []  # (item, product, gst_rate, amounts, stock_in)
     for n, item in enumerate(payload.items, start=1):
         product = products.get(item.product_id)
@@ -52,9 +56,11 @@ async def record_purchase(db: AsyncSession, payload: PurchaseCreate, current: Cu
         amounts = line_amounts(
             receipt=item.quantity, rate=item.unit_cost, discount=item.discount_amount, gst_rate=gst_rate,
             cess=0 if payload.without_gst else item.cess_amount, surcharge_rate=0 if payload.without_gst else item.surcharge_rate,
-            inclusive=inclusive,
+            inclusive=inclusive, gst_before_discount=before, cash_discount_after_gst=payload.cash_discount_after_gst, reverse_charge=reverse,
         )
-        if amounts["taxable"] < 0:
+        # what a unit of this line really cost: the goods' value, and the GST too when it cannot be claimed back
+        amounts["cost"] = amounts["value"] + (0 if credit else amounts["gst"])
+        if amounts["over_discount"]:
             raise HTTPException(status_code=422, detail=f"Line {n} ({product.name}): the discount is more than the amount")
         if item.mrp_action != "keep":
             if item.warehouse_id is not None:
@@ -71,7 +77,7 @@ async def record_purchase(db: AsyncSession, payload: PurchaseCreate, current: Cu
     if payload.update_cost and not current.has_permission("catalog.product.create"):
         raise HTTPException(status_code=403, detail="You are not allowed to change product cost prices")
 
-    total = sum((r[3]["net"] for r in rows), 0)
+    total = sum((r[3]["payable"] for r in rows), 0)  # what the vendor is owed
     purchase = Purchase(
         vendor_id=payload.vendor_id,
         store_id=payload.store_id,
@@ -79,6 +85,11 @@ async def record_purchase(db: AsyncSession, payload: PurchaseCreate, current: Cu
         invoice_date=payload.invoice_date,
         without_gst=payload.without_gst,
         rate_includes_gst=inclusive,
+        inter_state=payload.inter_state,
+        reverse_charge=reverse,
+        input_credit=credit,
+        gst_before_discount=before,
+        cash_discount_after_gst=payload.cash_discount_after_gst,
         total_amount=total,
         created_by=current.user_id,
     )
@@ -109,6 +120,7 @@ async def record_purchase(db: AsyncSession, payload: PurchaseCreate, current: Cu
                 free_qty=item.free_qty, reject_qty=item.reject_qty, hl_qty=item.hl_qty, rate_unit=item.rate_unit,
                 discount_amount=item.discount_amount, gst_rate=gst_rate, gst_amount=amounts["gst"], cess_amount=amounts["cess"],
                 surcharge_rate=0 if payload.without_gst else item.surcharge_rate, surcharge_amount=amounts["surcharge"], net_amount=amounts["net"],
+                taxable_amount=amounts["taxable"], cash_discount=amounts["cash_discount"],
                 warehouse_id=item.warehouse_id,
             )
         )
@@ -120,7 +132,7 @@ async def record_purchase(db: AsyncSession, payload: PurchaseCreate, current: Cu
 
         # A batch number puts this lot in the batch ledger (of the store, or of the warehouse it went to). Free goods lower the cost per unit.
         if batch_no and into_stock > 0:
-            unit_cost = float(amounts["taxable"] / into_stock)
+            unit_cost = float(amounts["cost"] / into_stock)
             where = (
                 (InventoryBatch.store_id == payload.store_id, InventoryBatch.warehouse_id.is_(None))
                 if item.warehouse_id is None
@@ -164,7 +176,9 @@ async def record_purchase(db: AsyncSession, payload: PurchaseCreate, current: Cu
         action="purchase.created",
         entity_type="purchase",
         entity_id=purchase.id,
-        new_value={"total_amount": float(total), "vendor_id": str(payload.vendor_id), "lines": len(rows), "source": source, "without_gst": payload.without_gst, "rate_includes_gst": inclusive},
+        new_value={"total_amount": float(total), "vendor_id": str(payload.vendor_id), "lines": len(rows), "source": source, "without_gst": payload.without_gst, "rate_includes_gst": inclusive,
+                   "inter_state": payload.inter_state, "reverse_charge": reverse, "input_credit": credit, "gst_before_discount": before,
+                   "cash_discount_after_gst": payload.cash_discount_after_gst},
     )
     purchase.notes = notes  # shown to the person who entered it; not stored
     return purchase
@@ -211,7 +225,7 @@ async def _apply_price_actions(db: AsyncSession, rows: list[tuple], payload: Pur
                 db, current=current, request_type="price_variant_add", entity_type="product", entity_id=product.id,
                 old_value={"selling_price": old_sell, "mrp": old_mrp},
                 new_value={
-                    "mrp": new_mrp, "selling_price": sell, "purchase_price": float(amounts["taxable"] / into_stock),
+                    "mrp": new_mrp, "selling_price": sell, "purchase_price": float(amounts["cost"] / into_stock),
                     "label": f"MRP {new_mrp:g}", "store_id": str(payload.store_id), "quantity": float(into_stock),
                 },
                 reason=f"Purchase {payload.invoice_number or ''} at a different MRP".strip(), store_id=None,
@@ -240,12 +254,12 @@ async def _apply_price_actions(db: AsyncSession, rows: list[tuple], payload: Pur
 
 
 async def _update_costs(db: AsyncSession, rows: list[tuple], current: CurrentUser, notes: list[str], purchase_id: uuid.UUID) -> None:
-    """Set each product's cost price to what this bill cost per unit before GST, free goods counted in (the last line of a
-    product wins). Cost price is not an approval-gated field, so this is the same as editing it on the product."""
+    """Set each product's cost price to what this bill cost per unit (before GST, unless that GST cannot be claimed back), free
+    goods counted in (the last line of a product wins). Cost price is not an approval-gated field, so this is the same as editing it on the product."""
     last: dict[uuid.UUID, tuple] = {}
     for item, product, _gst, amounts, into_stock in rows:
         units = into_stock if into_stock > 0 else Decimal(str(item.quantity))
-        cost = float(amounts["taxable"] / units) if units > 0 else float(product.purchase_price or 0)
+        cost = float(amounts["cost"] / units) if units > 0 else float(product.purchase_price or 0)
         last[product.id] = (product, round(cost, 2))
     for product, cost in last.values():
         old = float(product.purchase_price or 0)

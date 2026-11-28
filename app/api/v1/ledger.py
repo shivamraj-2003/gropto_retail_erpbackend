@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser, require_permission, require_store_access
 from app.core.database import get_db
-from app.services.purchase_bill import LINE_VALUE
+from app.services.purchase_bill import LINE_VALUE, PURCHASE_ACCOUNT, REVERSE_TAX, VENDOR_AMOUNT, inter_state_sql
 
 router = APIRouter(prefix="/finance-advanced/ledger", tags=["ledger"])
 
@@ -32,6 +32,7 @@ FIXED = {
     "returns": ("Sales returns (refunds)", "Sales & tax"),
     "purchases": ("Purchases (before GST)", "Purchases"),
     "gst_in": ("GST paid on purchases", "Purchases"),
+    "gst_rcm": ("GST payable on reverse charge", "Sales & tax"),
 }
 
 
@@ -161,18 +162,24 @@ async def build_book(db: AsyncSession, *, store_id: uuid.UUID, warehouse: bool, 
     # purchases: the store's own, or what was received into warehouses
     place = "pi.warehouse_id is not null and (cast(:wid as uuid) is null or pi.warehouse_id = cast(:wid as uuid))" if warehouse else "pi.warehouse_id is null"
     day_expr = f"coalesce(pu.invoice_date, {IST_DAY.format(col='pu.created_at')})"
-    for day, vendor_id, vendor_name, net, gst in (
+    for day, vendor_id, vendor_name, credit, owed, goods, gst, reverse, cash_discount in (
         await rows(
-            f"""select {day_expr} d, pu.vendor_id, v.name,
-                       coalesce(sum(coalesce(pi.net_amount, pi.unit_cost * pi.quantity - coalesce(pi.discount_amount,0))),0),
-                       coalesce(sum(coalesce(pi.gst_amount,0)),0)
+            f"""select {day_expr} d, pu.vendor_id, v.name, pu.input_credit,
+                       coalesce(sum({VENDOR_AMOUNT}),0), coalesce(sum({PURCHASE_ACCOUNT}),0), coalesce(sum(coalesce(pi.gst_amount,0)),0),
+                       coalesce(sum({REVERSE_TAX}),0), coalesce(sum(coalesce(pi.cash_discount,0)),0)
                 from purchase_items pi join purchases pu on pu.id = pi.purchase_id join vendors v on v.id = pu.vendor_id
-                where pu.store_id = :sid and {place} and {day_expr} <= :upto group by 1, 2, 3"""
+                where pu.store_id = :sid and {place} and {day_expr} <= :upto group by 1, 2, 3, 4"""
         )
     ).all():
-        book.post("purchases", day, debit=float(net) - float(gst))
-        book.post("gst_in", day, debit=gst)
-        book.post(f"vendor:{vendor_id}", day, credit=net, name=f"Vendor: {vendor_name}", group="Vendors")
+        # debits: the goods and their GST; credits: the vendor, the tax paid for them (reverse charge) and any cash discount
+        book.post("purchases", day, debit=goods)
+        if credit:
+            book.post("gst_in", day, debit=gst)
+        else:  # GST that cannot be claimed back is an expense
+            book.post("expense:GST not claimable", day, debit=gst, name="GST not claimable", group="Expenses")
+        book.post(f"vendor:{vendor_id}", day, credit=owed, name=f"Vendor: {vendor_name}", group="Vendors")
+        book.post("gst_rcm", day, credit=reverse)
+        book.post("custom:DISCOUNT RECEIVED", day, credit=cash_discount, name="DISCOUNT RECEIVED", group="Other accounts")
 
     if not warehouse:
         Dv = IST_DAY.format(col="vp.created_at")
@@ -388,8 +395,8 @@ async def party_statement(
     for r in (
         await db.execute(
             text(
-                f"""select pu.id, {pur_day} d, pu.invoice_number, pu.without_gst,
-                           coalesce(sum(coalesce(pi.net_amount, pi.unit_cost * pi.quantity - coalesce(pi.discount_amount,0))),0) amount, count(pi.id) lines
+                f"""select pu.id, {pur_day} d, pu.invoice_number, pu.without_gst, pu.reverse_charge,
+                           coalesce(sum({VENDOR_AMOUNT}),0) amount, count(pi.id) lines
                     from purchases pu join purchase_items pi on pi.purchase_id = pu.id
                     where pu.store_id = :sid and pu.vendor_id = :vid and pi.warehouse_id is null and {pur_day} <= :upto
                     group by pu.id order by 2, pu.created_at"""
@@ -397,7 +404,7 @@ async def party_statement(
             p,
         )
     ).all():
-        entries.append({"date": r.d, "type": "Purchase", "ref": r.invoice_number or "no bill number", "detail": f"{r.lines} item(s)" + (", cash purchase" if r.without_gst else ""),
+        entries.append({"date": r.d, "type": "Purchase", "ref": r.invoice_number or "no bill number", "detail": f"{r.lines} item(s)" + (", cash purchase" if r.without_gst else "") + (", reverse charge" if r.reverse_charge else ""),
                         "purchase_id": str(r.id), "debit": 0.0, "credit": round(float(r.amount), 2)})
     pay_day = IST_DAY.format(col="vp.created_at")
     for r in (
@@ -555,8 +562,8 @@ async def account_entries(
             await db.execute(
                 text(
                     f"""select pu.id, {pur_day} d, pu.invoice_number,
-                               bool_or(left(coalesce(ve.gst_number,''),2) <> '' and left(coalesce(st.gstin,''),2) <> '' and left(ve.gst_number,2) <> left(st.gstin,2)) inter,
-                               coalesce(sum(coalesce(pi.net_amount, pi.unit_cost * pi.quantity - coalesce(pi.discount_amount,0))),0) amount,
+                               bool_or({inter_state_sql("ve")}) inter,
+                               coalesce(sum({VENDOR_AMOUNT}),0) amount,
                                string_agg(distinct trim(to_char(coalesce(pi.gst_rate,0), 'FM990.##'), '.') || '%', ', ') rates
                         from purchases pu join purchase_items pi on pi.purchase_id = pu.id
                              join vendors ve on ve.id = pu.vendor_id join stores st on st.id = pu.store_id

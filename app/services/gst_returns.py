@@ -25,7 +25,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.services.gst import GST_STATE_CODES
-from app.services.purchase_bill import LINE_VALUE
+from app.services.purchase_bill import LINE_TAXABLE, LINE_VALUE, inter_state_sql
 
 B2CL_LIMIT = 250000.0  # inter-state invoice value above which an unregistered sale is reported invoice by invoice
 
@@ -112,13 +112,12 @@ _DOCS = text(
 )
 
 _PURCHASES = text(
-    """
+    f"""
     select pu.id::text as purchase_id, pu.invoice_number, coalesce(pu.invoice_date, pu.created_at::date) as day, pu.without_gst,
+           pu.reverse_charge, pu.input_credit,
            v.name as vendor, v.gst_number as vendor_gstin, st.gstin as store_gstin,
-           (v.gst_number is not null and st.gstin is not null and left(v.gst_number, 2) <> left(st.gstin, 2)) as inter_state,
-           """
-    + LINE_VALUE
-    + """ as value,
+           {inter_state_sql()} as inter_state,
+           {LINE_VALUE} as value, {LINE_TAXABLE} as taxable,
            coalesce(pi.gst_rate, p.tax_rate, 0) as rate,
            coalesce(pi.gst_amount, round((pi.quantity * pi.unit_cost - coalesce(pi.discount_amount, 0)) * coalesce(pi.gst_rate, p.tax_rate, 0) / 100, 2)) as gst
     from purchases pu
@@ -130,7 +129,6 @@ _PURCHASES = text(
       and coalesce(pu.invoice_date, pu.created_at::date) >= :d1 and coalesce(pu.invoice_date, pu.created_at::date) < :d2
     """
 )
-
 
 def _tax_heads(rate_row) -> dict:
     return {"igst": r2(rate_row["igst"]), "cgst": r2(rate_row["cgst"]), "sgst": r2(rate_row["sgst"])}
@@ -280,6 +278,42 @@ def _gstr1_warnings(invoices: dict, b2b: list, hsn_rows: list) -> list[str]:
 
 # --------------------------------------------------------------------------- GSTR-3B
 
+
+def purchase_tax(purchases) -> dict:
+    """The month's purchase lines sorted the way GSTR-3B asks: credit that can be taken, credit that cannot, tax owed under
+    reverse charge, and purchases that carried no tax."""
+    heads_zero = lambda: {"igst": 0.0, "cgst": 0.0, "sgst": 0.0}  # noqa: E731
+    itc, not_claimed, ineligible = heads_zero(), heads_zero(), heads_zero()
+    reverse = {"txval": 0.0, **heads_zero()}
+    exempt = {"inter": 0.0, "intra": 0.0}
+    cash_purchases = 0.0
+    bills_with_credit: set[str] = set()
+    for p in purchases:
+        value = float(p["value"])
+        gst = float(p["gst"] or 0)
+        where = "inter" if p["inter_state"] else "intra"
+        if p["without_gst"]:
+            cash_purchases += value
+            _add(exempt, **{where: value})
+            continue
+        if float(p["rate"]) == 0 or gst == 0:
+            _add(exempt, **{where: value})
+            continue
+        heads = {"igst": gst} if p["inter_state"] else {"cgst": r2(gst / 2), "sgst": r2(gst - r2(gst / 2))}
+        if p["reverse_charge"]:
+            _add(reverse, txval=float(p["taxable"]), **heads)
+        if not p["input_credit"]:
+            _add(ineligible, **heads)
+        elif p["reverse_charge"] or p["vendor_gstin"]:  # tax the buyer paid is claimable whoever the vendor is
+            _add(itc, **heads)
+            bills_with_credit.add(p["purchase_id"])
+        else:
+            _add(not_claimed, **heads)
+    return {
+        "itc": itc, "not_claimed": not_claimed, "ineligible": ineligible, "reverse": reverse, "exempt": exempt,
+        "cash_purchases": cash_purchases, "bills_with_credit": bills_with_credit,
+    }
+
 async def gstr3b(db: AsyncSession, *, stores: list, month: str) -> dict:
     d1, d2 = month_bounds(month)
     one = await gstr1(db, stores=stores, month=month)
@@ -307,31 +341,12 @@ async def gstr3b(db: AsyncSession, *, stores: list, month: str) -> dict:
             put(i["rt"], i["txval"], i["iamt"], i["camt"], i["samt"], sign=-1)
 
     # input tax credit from purchases
-    purchases = await _rows(db, _PURCHASES, stores, d1, d2)
-    itc = {"igst": 0.0, "cgst": 0.0, "sgst": 0.0}
-    not_claimed = {"igst": 0.0, "cgst": 0.0, "sgst": 0.0}
-    inward_exempt = {"inter": 0.0, "intra": 0.0}
-    cash_purchases = 0.0
-    bills_with_credit: set[str] = set()
-    for p in purchases:
-        value = float(p["value"])
-        gst = float(p["gst"] or 0)
-        if p["without_gst"]:
-            cash_purchases += value
-            _add(inward_exempt, **{"inter" if p["inter_state"] else "intra": value})
-            continue
-        if float(p["rate"]) == 0 or gst == 0:
-            _add(inward_exempt, **{"inter" if p["inter_state"] else "intra": value})
-            continue
-        heads = {"igst": gst} if p["inter_state"] else {"cgst": r2(gst / 2), "sgst": r2(gst - r2(gst / 2))}
-        if p["vendor_gstin"]:
-            _add(itc, **heads)
-            bills_with_credit.add(p["purchase_id"])
-        else:
-            _add(not_claimed, **heads)
-
+    inward = purchase_tax(await _rows(db, _PURCHASES, stores, d1, d2))
+    itc, not_claimed, reverse = inward["itc"], inward["not_claimed"], inward["reverse"]
     output = {"igst": r2(taxable_rows["igst"]), "cgst": r2(taxable_rows["cgst"]), "sgst": r2(taxable_rows["sgst"])}
     settled = set_off(output, itc)
+    # tax under reverse charge is paid in cash: credit cannot be used for it
+    to_pay = {k: r2(settled["payable"][k] + reverse[k]) for k in ("igst", "cgst", "sgst")}
     warnings = list(one["warnings"])
     if sum(not_claimed.values()) > 0:
         warnings.append(f"Tax of ₹{r2(sum(not_claimed.values())):,.2f} on purchases from vendors with no GSTIN is not claimed as credit. Add the vendor's GSTIN if they are registered")
@@ -339,14 +354,16 @@ async def gstr3b(db: AsyncSession, *, stores: list, month: str) -> dict:
         "period": month,
         "outward_taxable": {k: r2(v) for k, v in taxable_rows.items()},  # 3.1(a)
         "outward_nil_exempt": {"txval": r2(nil_rows["txval"])},  # 3.1(c)
+        "inward_reverse_charge": {k: r2(v) for k, v in reverse.items()},  # 3.1(d)
         "inter_state_unregistered": [{"pos": k, "txval": r2(v["txval"]), "igst": r2(v["igst"])} for k, v in sorted(inter_unreg.items())],  # 3.2
-        "itc_available": {k: r2(v) for k, v in itc.items()},  # 4(A)(5)
+        "itc_available": {k: r2(v) for k, v in itc.items()},  # 4(A)
         "itc_not_claimed": {k: r2(v) for k, v in not_claimed.items()},
-        "inward_nil_exempt": {k: r2(v) for k, v in inward_exempt.items()},  # 5
-        "cash_purchases_without_gst": r2(cash_purchases),
+        "itc_ineligible": {k: r2(v) for k, v in inward["ineligible"].items()},  # marked on the bill as not claimable
+        "inward_nil_exempt": {k: r2(v) for k, v in inward["exempt"].items()},  # 5
+        "cash_purchases_without_gst": r2(inward["cash_purchases"]),
         "tax_payable_before_credit": output,
-        "tax_to_pay": settled["payable"],  # 6.1
+        "tax_to_pay": to_pay,  # 6.1: after credit, with the reverse-charge tax
         "itc_carried_forward": settled["carried_forward"],
-        "purchase_bills_with_credit": len(bills_with_credit),
+        "purchase_bills_with_credit": len(inward["bills_with_credit"]),
         "warnings": warnings,
     }

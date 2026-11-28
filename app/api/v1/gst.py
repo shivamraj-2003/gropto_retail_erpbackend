@@ -260,13 +260,15 @@ async def gstr3b_export(
     rows = [
         ["3.1(a) Outward taxable supplies", d["outward_taxable"]["txval"], d["outward_taxable"]["igst"], d["outward_taxable"]["cgst"], d["outward_taxable"]["sgst"]],
         ["3.1(c) Nil rated / exempt outward supplies", d["outward_nil_exempt"]["txval"], 0, 0, 0],
+        ["3.1(d) Inward supplies liable to reverse charge", d["inward_reverse_charge"]["txval"], d["inward_reverse_charge"]["igst"], d["inward_reverse_charge"]["cgst"], d["inward_reverse_charge"]["sgst"]],
         ["4(A) Input tax credit available (purchases with a tax invoice)", "", d["itc_available"]["igst"], d["itc_available"]["cgst"], d["itc_available"]["sgst"]],
         ["Input tax credit NOT claimed (vendor has no GSTIN)", "", d["itc_not_claimed"]["igst"], d["itc_not_claimed"]["cgst"], d["itc_not_claimed"]["sgst"]],
+        ["Input tax credit not eligible (marked on the bill)", "", d["itc_ineligible"]["igst"], d["itc_ineligible"]["cgst"], d["itc_ineligible"]["sgst"]],
         ["5 Inward nil / exempt / no-GST supplies: inter-state", d["inward_nil_exempt"]["inter"], "", "", ""],
         ["5 Inward nil / exempt / no-GST supplies: intra-state", d["inward_nil_exempt"]["intra"], "", "", ""],
         ["Cash purchases without GST (included above)", d["cash_purchases_without_gst"], "", "", ""],
         ["Tax payable before credit", "", d["tax_payable_before_credit"]["igst"], d["tax_payable_before_credit"]["cgst"], d["tax_payable_before_credit"]["sgst"]],
-        ["6.1 TAX TO PAY after credit", "", d["tax_to_pay"]["igst"], d["tax_to_pay"]["cgst"], d["tax_to_pay"]["sgst"]],
+        ["6.1 TAX TO PAY after credit (reverse charge included)", "", d["tax_to_pay"]["igst"], d["tax_to_pay"]["cgst"], d["tax_to_pay"]["sgst"]],
         ["Credit carried forward", "", d["itc_carried_forward"]["igst"], d["itc_carried_forward"]["cgst"], d["itc_carried_forward"]["sgst"]],
         *[["Check", w, "", "", ""] for w in d["warnings"]],
     ]

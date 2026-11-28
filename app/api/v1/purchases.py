@@ -209,6 +209,8 @@ async def purchase_bill(
     vendor_state = gstin_state_code(vendor.gst_number) if vendor else None
     store_state = gstin_state_code(store.gstin) if store else None
     inter_state = bool(vendor_state and store_state and vendor_state != store_state)
+    if purchase.inter_state is not None:
+        inter_state = purchase.inter_state  # as ticked on the bill
 
     raw = []
     for item in purchase.items:
@@ -235,7 +237,10 @@ async def purchase_bill(
                 "surcharge_rate": float(item.surcharge_rate or 0),
             }
         )
-    bill = build_bill(raw, inter_state=inter_state, inclusive=bool(purchase.rate_includes_gst))
+    bill = build_bill(
+        raw, inter_state=inter_state, inclusive=bool(purchase.rate_includes_gst), gst_before_discount=bool(purchase.gst_before_discount),
+        cash_discount_after_gst=bool(purchase.cash_discount_after_gst), reverse_charge=bool(purchase.reverse_charge),
+    )
     return {
         "id": str(purchase.id),
         "number": f"PUR-{str(purchase.id)[:8].upper()}",
@@ -246,6 +251,10 @@ async def purchase_bill(
         "inter_state": inter_state,
         "without_gst": bool(purchase.without_gst),
         "rate_includes_gst": bool(purchase.rate_includes_gst),
+        "reverse_charge": bool(purchase.reverse_charge),
+        "input_credit": bool(purchase.input_credit),
+        "gst_before_discount": bool(purchase.gst_before_discount),
+        "cash_discount_after_gst": bool(purchase.cash_discount_after_gst),
         "vendor": VendorOut.model_validate(vendor).model_dump(mode="json") if vendor else None,
         "store": {"id": str(store.id), "name": store.name, "city": store.city, "state": store.state, "gstin": store.gstin} if store else None,
         "lines": bill["lines"],

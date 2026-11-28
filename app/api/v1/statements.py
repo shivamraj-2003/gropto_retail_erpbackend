@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import CurrentUser, require_permission, require_store_access
 from app.api.v1.ledger import IST_DAY, Book, build_book
 from app.core.database import get_db
+from app.services.purchase_bill import PURCHASE_ACCOUNT, inter_state_sql
 
 router = APIRouter(prefix="/finance-advanced/statements", tags=["statements"])
 
@@ -57,7 +58,7 @@ def head_of(key: str, name: str, chosen: str | None = None) -> str:
         return "indirect"
     if key.startswith("vendor:"):
         return "current_liabilities"
-    if key == "gst_out":
+    if key in ("gst_out", "gst_rcm"):
         return "current_liabilities"
     if key in ("cash", "bank", "upi", "card", "other_tender", "udhaar", "gst_in"):
         return "current_assets"
@@ -230,13 +231,11 @@ async def rate_detail(db: AsyncSession, store_id: uuid.UUID, date_from: date, da
         for r in sales.all()
     ]
     pur_day = f"coalesce(pu.invoice_date, {IST_DAY.format(col='pu.created_at')})"
-    # Central = the vendor's GSTIN is of another state than the store's. A vendor with no GSTIN counts as local.
-    central = "(left(coalesce(v.gst_number,''),2) <> '' and left(coalesce(st.gstin,''),2) <> '' and left(v.gst_number,2) <> left(st.gstin,2))"
+    # Central = between states, as ticked on the bill (else by the two GST numbers; a vendor with none counts as local)
     purchases = await db.execute(
         text(
-            f"""select coalesce(pi.gst_rate,0) rate, {central} central, pu.without_gst,
-                       coalesce(sum(coalesce(pi.net_amount, pi.unit_cost * pi.quantity - coalesce(pi.discount_amount,0)) - coalesce(pi.gst_amount,0)),0) taxable,
-                       coalesce(sum(coalesce(pi.gst_amount,0)),0) gst
+            f"""select coalesce(pi.gst_rate,0) rate, {inter_state_sql()} central, pu.without_gst,
+                       coalesce(sum({PURCHASE_ACCOUNT}),0) taxable, coalesce(sum(coalesce(pi.gst_amount,0)),0) gst
                 from purchase_items pi join purchases pu on pu.id = pi.purchase_id join vendors v on v.id = pu.vendor_id join stores st on st.id = pu.store_id
                 where pu.store_id = :sid and pi.warehouse_id is null and {pur_day} between :d1 and :d2 group by 1, 2, 3"""
         ),

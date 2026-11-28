@@ -576,6 +576,12 @@ class PurchaseCreate(BaseModel):
     without_gst: bool = False
     # The rates on this bill include GST: it is taken out first, and discounts apply to the value before GST
     rate_includes_gst: bool = False
+    # Between states (IGST). Left out, the vendor's and the store's GST numbers decide.
+    inter_state: bool | None = None
+    reverse_charge: bool = False  # the buyer pays the GST to the government; the vendor is owed the bill without it
+    input_credit: bool = True  # false: this GST cannot be claimed back, so it is a cost
+    gst_before_discount: bool = False  # the discount does not lower the GST
+    cash_discount_after_gst: bool = False  # the discount is a cash discount taken after GST
     items: list[PurchaseItemIn]
 
 
@@ -590,6 +596,11 @@ class PurchaseOut(BaseModel):
     notes: list[str] = []  # what else happened (price changes made or waiting for approval, cost prices updated)
     without_gst: bool = False
     rate_includes_gst: bool = False
+    inter_state: bool | None = None
+    reverse_charge: bool = False
+    input_credit: bool = True
+    gst_before_discount: bool = False
+    cash_discount_after_gst: bool = False
 
 
 # ---------------------------------------------------------------------------

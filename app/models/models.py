@@ -623,6 +623,12 @@ class Purchase(Base):
     without_gst: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
     # The rates on this bill already have GST in them (unit_cost is then the rate as typed, GST included).
     rate_includes_gst: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+    # The bill's "Taxes & Levies": see services/purchase_bill.py. inter_state None = judged by the two GST numbers.
+    inter_state: Mapped[bool | None] = mapped_column(Boolean)
+    reverse_charge: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+    input_credit: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true")  # false: the GST cannot be claimed back
+    gst_before_discount: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+    cash_discount_after_gst: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
     created_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
@@ -651,7 +657,9 @@ class PurchaseItem(Base):
     cess_amount: Mapped[float] = mapped_column(Numeric(12, 2), default=0)
     surcharge_rate: Mapped[float] = mapped_column(Numeric(5, 2), default=0)
     surcharge_amount: Mapped[float] = mapped_column(Numeric(12, 2), default=0)
-    net_amount: Mapped[float | None] = mapped_column(Numeric(12, 2))  # amount - discount + GST + cess + surcharge
+    net_amount: Mapped[float | None] = mapped_column(Numeric(12, 2))  # goods after discount + GST + cess + surcharge
+    taxable_amount: Mapped[float | None] = mapped_column(Numeric(12, 2))  # what GST was charged on (None on older lines)
+    cash_discount: Mapped[float] = mapped_column(Numeric(12, 2), default=0, server_default="0")  # the part of the discount taken after GST
     warehouse_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("warehouses.id"))  # None = into the store
 
 
